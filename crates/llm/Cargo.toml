@@ -1,0 +1,29 @@
+[package]
+name = "swarmbot-llm"
+description = "LLM backend port and adapters: OpenAI-compatible HTTP (SSE + tool calls), ACP agent harnesses (opencode / Claude Code / Codex), CLI harnesses, and a deterministic Fake for tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+swarmbot-contracts = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+url = { workspace = true }
+http = { workspace = true }
+chrono = { workspace = true }
+# The ACP adapter group-kills its agent child (`killpg`) so an `npx` wrapper
+# cannot outlive the connection as an orphan (D5.6).
+nix = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

@@ -1,0 +1,153 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/contracts",
+    "crates/llm",
+    "crates/tools",
+    "crates/mcp",
+    "crates/core",
+    "crates/store",
+    "crates/node-protocol",
+    "crates/client",
+    "crates/brain",
+    "crates/node",
+    "crates/cli",
+    "crates/ui",
+]
+# The GPUI desktop app is heavy to build (blade/naga/cosmic-text). Work that does
+# not touch the UI stays fast: plain `cargo build`/`cargo test` skip it, while
+# `cargo build --workspace` and `scripts/check.sh` still cover everything.
+default-members = [
+    "crates/contracts",
+    "crates/llm",
+    "crates/tools",
+    "crates/mcp",
+    "crates/core",
+    "crates/store",
+    "crates/node-protocol",
+    "crates/client",
+    "crates/brain",
+    "crates/node",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://example.invalid/swarmbot"
+
+[workspace.dependencies]
+# --- internal crates -------------------------------------------------------
+swarmbot-contracts = { path = "crates/contracts", version = "0.1.0" }
+swarmbot-llm = { path = "crates/llm", version = "0.1.0" }
+swarmbot-tools = { path = "crates/tools", version = "0.1.0" }
+swarmbot-mcp = { path = "crates/mcp", version = "0.1.0" }
+swarmbot-core = { path = "crates/core", version = "0.1.0" }
+swarmbot-store = { path = "crates/store", version = "0.1.0" }
+swarmbot-node-protocol = { path = "crates/node-protocol", version = "0.1.0" }
+swarmbot-client = { path = "crates/client", version = "0.1.0" }
+
+# --- async runtime / services ---------------------------------------------
+tokio = { version = "1.54", features = [
+    "rt-multi-thread",
+    "rt",
+    "macros",
+    "sync",
+    "time",
+    "process",
+    "signal",
+    "io-util",
+    "io-std",
+    "fs",
+    "net",
+] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1.92"
+futures = "0.3"
+futures-util = "0.3"
+
+# --- http / websockets -----------------------------------------------------
+axum = { version = "0.8.9", features = ["ws", "http1", "json", "macros"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["trace", "cors"] }
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls",
+] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+eventsource-stream = "0.2.3"
+ureq = { version = "3.5.1", features = ["json"] }
+tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+url = "2.5.8"
+http = "1.5"
+
+# --- serde / errors / ids --------------------------------------------------
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+uuid = { version = "1.29.1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.23.1"
+hex = "0.4.3"
+
+# --- storage ---------------------------------------------------------------
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+
+# --- crypto / node protocol ------------------------------------------------
+ed25519-dalek = { version = "3.0", features = ["rand_core", "pem"] }
+sha2 = "0.11.1"
+# Pinned to 0.9: gpui requires rand ^0.9, one version in the tree keeps the
+# build smaller and the RNG behaviour uniform.
+rand = "0.9"
+rand_core = "0.9"
+
+# --- tools / filesystem / process -----------------------------------------
+jsonschema = "0.60.2"
+globset = "0.4.21"
+ignore = "0.4.34"
+walkdir = "2.5.0"
+regex = "1.13.1"
+similar = "3.2.1"
+nix = { version = "0.31.3", features = ["signal", "process"] }
+libc = "0.2.191"
+signal-hook = "0.4.6"
+dirs = "7.0.0"
+
+# --- logging / cli ---------------------------------------------------------
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+crossterm = "0.29.0"
+
+toml = "1.2"
+
+# --- mcp -------------------------------------------------------------------
+rmcp = { version = "3.9.0", features = ["server", "transport-io", "transport-streamable-http-server"] }
+
+# --- ui --------------------------------------------------------------------
+gpui = { version = "=0.2.2", default-features = false, features = [
+    "font-kit",
+    "wayland",
+] }
+pulldown-cmark = { version = "0.13.6", default-features = false }
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+# gpui 0.2.2 → gpui_http_client → zed-async-tar → xattr 0.2 does not compile
+# against a modern libc (ENOATTR moved to ENODATA on Linux). `xattr` is an
+# optional dependency of zed-async-tar, but its `default` feature enables it and
+# a downstream workspace cannot turn that off, so we carry a one-line-patched
+# copy. See vendor/xattr/VENDORED.md.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }

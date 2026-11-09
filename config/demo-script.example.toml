@@ -1,0 +1,85 @@
+# A scripted `run` for the four-bot demo team (config/team.example.toml).
+#
+#   swarmbot run "find out what changed under src/ and give me a verdict" \
+#       --group Team --backend fake --script config/demo-script.example.toml
+#
+# One [[turns]] entry per model turn, consumed IN ORDER by the named bot's own
+# backend. Loading a script gives every scripted bot a fake backend of its own
+# (`fake-lead`, `fake-scout`, …), so each bot's queue is independent and the
+# order below is per bot, not global: bots woken in parallel can never pop a turn
+# that was written for somebody else. Bots the script does not name stay on the
+# shared `fake` backend, which is fine because nothing is ever queued for them.
+# See docs/decisions.md D9.15 for why the split exists.
+#
+# The rule that makes a script work: a turn WITH tool calls makes the runner ask
+# the model again, so every tool-call turn is followed by a text-only turn for the
+# SAME bot — that text-only turn ends the round, and the bot then waits for the
+# result instead of inventing one. `arguments` is arbitrary TOML, converted to the
+# JSON a tool call carries.
+#
+# The story (a real division of labour, ending in the lead's verdict):
+#   1. the owner asks the lead;
+#   2. the lead hands the search to scout (handoff_task);
+#   3. scout, working in its own DM task, messages the lead an early read
+#      (message_bot) and then finishes with the finding — which becomes the task
+#      result delivered back to the group;
+#   4. the lead takes its own summary task (start_task);
+#   5. the lead's task produces the verdict, and the lead writes the final answer.
+
+# --- 1. Lead, group turn, round 1: delegate the search to scout. ---------------
+# No `@scout` in the text: a mention in a posted group reply would wake scout a
+# second time and desynchronize the queue.
+[[turns]]
+bot = "lead"
+reasoning = "The owner wants a verdict; searching under src/ is scout's job, not mine."
+text = "On it — handing the search to scout."
+[[turns.tool_calls]]
+name = "handoff_task"
+arguments = { to = "scout", title = "find what changed under src/", task = "list the files that changed under src/ and say whether anything looks risky", context = "the owner asked for a final verdict" }
+
+# --- 2. Lead, group turn, round 2: no tool call, so the turn ends and the lead
+# waits for scout's result instead of guessing it.
+[[turns]]
+bot = "lead"
+text = "I have asked scout; I will report when the result lands."
+
+# --- 3. Scout, DM task turn, round 1: report an early read back to the lead. ---
+[[turns]]
+bot = "scout"
+[[turns.tool_calls]]
+name = "message_bot"
+arguments = { to = "lead", text = "early read: three files changed under src/, nothing destructive so far" }
+
+# --- 4. Scout, DM task turn, round 2: the finding. This text becomes the task
+# result delivered back to the lead in the group.
+[[turns]]
+bot = "scout"
+text = "Three files changed: src/config.rs, src/render.rs, src/main.rs. No destructive commands in the diff."
+
+# --- 5. Lead, DM turn (woken by scout's message_bot): acknowledge. -------------
+[[turns]]
+bot = "lead"
+text = "Noted — I will fold scout's early read into the verdict."
+
+# --- 6. Lead, group turn (the task result), round 1: take the summary task. ----
+[[turns]]
+bot = "lead"
+text = "Scout's finding is in — starting the summary task."
+[[turns.tool_calls]]
+name = "start_task"
+arguments = { title = "write the final verdict", brief = "summarize what changed under src/ and give the owner a verdict" }
+
+# --- 7. Lead, group turn, round 2: end the turn; the task runs in the lead's DM.
+[[turns]]
+bot = "lead"
+text = "The summary task is running; I will report when it lands."
+
+# --- 8. Lead, DM task turn: its text becomes the summary task's result. --------
+[[turns]]
+bot = "lead"
+text = "Verdict: three files changed under src/ (config.rs, render.rs, main.rs); no destructive commands; safe to keep."
+
+# --- 9. Lead, group turn (its own task result): the final answer to the owner. --
+[[turns]]
+bot = "lead"
+text = "Done. Scout found three changed files under src/ and nothing risky; the summary task confirms it. Verdict: safe to keep."

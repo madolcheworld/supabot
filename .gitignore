@@ -1,0 +1,27 @@
+# Build artifacts
+/target
+**/target
+
+# Workspace-local cargo home (seeded by reflink from ~/.cargo, see scripts/env.sh)
+/.cargo-home
+
+# Scratch dirs (verification installs, agent XDG dirs, check logs)
+/.tmp-*
+
+# Prototype runtime state: databases, transcripts, workspaces, secrets, audit logs
+/data
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Never commit credentials
+secrets.json
+*.pem
+.env
+.env.*

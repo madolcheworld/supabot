@@ -1,0 +1,24 @@
+[package]
+name = "swarmbot-client"
+description = "Blocking brain API client (REST + live WebSocket) shared by the CLI and the GPUI desktop app."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Compiles `src/testing.rs` (the stub brain) so downstream crates can test
+# against a canned, loopback-only brain. Never enable this in a shipped build.
+test-support = []
+
+[dependencies]
+swarmbot-contracts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# `cookies` gives the agent the cookie jar `login()` needs: the brain sets a
+# session cookie on POST /api/session and every later request must carry it.
+ureq = { workspace = true, features = ["cookies"] }
+tungstenite = { workspace = true }
+url = { workspace = true }

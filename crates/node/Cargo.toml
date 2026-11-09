@@ -1,0 +1,56 @@
+[package]
+name = "swarmbot-node"
+description = "The hands: a node daemon that pairs with a brain and executes fs/shell RPCs under its own policy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "swarmbot-node"
+path = "src/main.rs"
+
+[lib]
+name = "swarmbot_node"
+path = "src/lib.rs"
+
+[dependencies]
+swarmbot-contracts = { workspace = true }
+swarmbot-node-protocol = { workspace = true }
+swarmbot-tools = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+dirs = { workspace = true }
+url = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
+# Two additions over the scaffold's list, both already in `[workspace.dependencies]`
+# and already compiled by `brain`/`llm`/`cli`, so they add no package to the graph:
+# `reqwest` because pairing is a real `POST /node/pair` that has to work over
+# `https://` too (a hand-rolled TCP client could not), and `toml` because the
+# node's own config file is `<data>/node.toml`.
+reqwest = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+swarmbot-brain = { path = "../brain" }
+# `tests/real_brain.rs` composes a real brain in process and scripts its model:
+# `ScriptedTurn`/`FakeBackend` live in `swarmbot-llm`, already in
+# `[workspace.dependencies]` and already compiled by `brain`, so this adds no
+# package to the graph.
+swarmbot-llm = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tempfile = "3"

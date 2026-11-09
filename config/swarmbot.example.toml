@@ -1,0 +1,156 @@
+# SwarmBot brain configuration.
+#
+# Copy to `<data-dir>/config.toml` (the default data dir is ./data) or point the
+# brain at it with `--config`. Every value here can also come from the
+# environment (`SWARMBOT_…`) or the CLI, and the CLI wins.
+#
+# Secrets are never written here: a backend names the environment variable its
+# key lives in, or the key is stored in `<data>/secrets.json` (mode 0600).
+
+# Where the brain keeps everything: swarmbot.sqlite, transcripts/, workspaces/,
+# audit/, secrets.json, owner-token.
+data_dir = "data"
+
+# Public listener: REST, the live WebSocket and the node gateway. Loopback only
+# by default — reach it from elsewhere through a reverse proxy or a tailnet,
+# not by binding 0.0.0.0.
+public_addr = "127.0.0.1:8787"
+
+# Internal listener: the MCP gateway the CLI harnesses connect to.
+# `None`/absent disables it.
+internal_addr = "127.0.0.1:0"
+
+# Shown in the one-time login URL printed at first boot.
+# public_origin = "https://brain.example.com"
+
+# Bots that do not name a backend use this one. `fake` always exists, so a
+# brain with no credentials at all still runs the offline demo.
+default_backend = "fake"
+
+[[backends]]
+id = "fake"
+kind = "fake"
+model = "fake"
+
+# A real gateway. The 402 `no_provider_under_bid` that api.inferhub.dev answers
+# a bid-less call with is a gateway parameter, not something this code should
+# invent: put whatever the gateway asks for in `extra_body` and it is merged
+# verbatim into every request (last, so it wins).
+#
+# [[backends]]
+# id = "inferhub"
+# kind = "openai_compat"
+# base_url = "https://api.inferhub.dev/v1"
+# api_key_env = "INFERHUB_API_KEY"
+# model = "ali/qwen3.8-flash"
+# timeout_secs = 180
+# max_retries = 3
+# [backends.extra_body]
+# max_bid_per_mtok = 0.5          # ← the gateway's own parameter name goes here
+# [backends.extra_headers]
+# X-Example = "value"
+
+# The owner's own Claude login, reached through `claude -p` with our tools
+# mounted as an MCP server. No API key: it uses the CLI's own session.
+#
+# [[backends]]
+# id = "claude"
+# kind = "claude_cli"
+# model = "sonnet"
+# [backends.options]
+# binary = "claude"               # resolved from PATH when absent
+# # config_dir = "/home/me/.claude-work"
+
+# Any agent that speaks the Agent Client Protocol (JSON-RPC 2.0 over stdio):
+# opencode (native), Claude Code and Codex (through Zed's adapters). One
+# adapter, three configurations — only the command differs. The agent runs its
+# OWN tools under its OWN sandbox; SwarmBot's policy engine does not gate
+# them. Our intervention point is the ACP permission ask, answered per
+# `permission_mode` below. `probe` = spawn + initialize + session/new, and
+# costs no model call.
+#
+# [[backends]]
+# id = "opencode"
+# kind = "acp"
+# [backends.options]
+# command = "opencode"            # the agent binary to spawn
+# args = ["acp"]                  # its ACP mode
+# models_command = ["opencode", "models"]   # fallback model lister for agents
+#                                   # whose ACP server advertises no model state
+# [backends.options.model_env]      # pin the picked model inside the child for
+# OPENCODE_CONFIG_CONTENT = '{"model":"{model}"}'  # agents that accept no ACP
+#                                   # model selection; one process per model
+# # cwd = "/home/me/projects"     # session working dir; default: the brain's
+# # permission_mode = "reject"    # "reject" (default): refuse every permission
+#                                 #   ask — the agent reads and answers but
+#                                 #   changes nothing.
+#                                 # "allow": pick the agent's allow-ONCE option
+#                                 #   per action. An explicit opt-in; *_always
+#                                 #   options are never chosen, so no blanket
+#                                 #   grant outlives a turn.
+# # env = { OPENCODE_CONFIG = "/home/me/.config/opencode-work" }
+# # opencode ignores ACP model selection (it advertises no model list), so a
+# # per-bot model override will not reach it; pin its model through its own
+# # config channel instead:
+# # env = { OPENCODE_CONFIG_CONTENT = "{\"model\":\"inferhub/ali/qwen3.8-max-0902\"}" }
+# # inherit_env = false           # scrub the child's env down to a whitelist
+# # timeout_secs = 180            # ← inherited from the kind defaults: for acp
+#                                 #   this is the IDLE timeout — silence longer
+#                                 #   than this fails the turn (a streaming
+#                                 #   agent may run much longer)
+#
+# [[backends]]
+# id = "claude"
+# kind = "acp"
+# # api_key_env = "ANTHROPIC_API_KEY"  # optional: without it the adapter uses
+#                                      # the owner's own `claude` login; with it
+#                                      # the resolved key is injected into the
+#                                      # child's environment (never argv/logs)
+# [backends.options]
+# command = "claude-code-acp"     # npm i -g @zed-industries/claude-code-acp
+# # command = "npx"               # alternative without a global install:
+# # args = ["-y", "@zed-industries/claude-code-acp"]
+#
+# [[backends]]
+# id = "codex"
+# kind = "acp"
+# [backends.options]
+# command = "codex-acp"           # npm i -g @zed-industries/codex-acp
+
+[settings]
+bot_messaging = true              # the global kill switch for bot-to-bot tools
+max_hops = 8                      # a delegation chain stops here
+max_tool_rounds = 32              # tool calls inside one turn
+max_running_tasks_per_bot = 3     # queue depth: a bot runs one turn at a time
+max_task_restarts = 2
+approval_expiry_secs = 600        # an unattended card expires after 10 minutes
+auto_approve_read_only = true
+transcript_mirror = true          # append every entry to transcripts/*.jsonl
+compact_at_fraction = 0.6         # compact a session past 60% of its context
+
+# Brain-side ceilings. A node's own ceiling always wins by minimum, so this can
+# only ever tighten what a remote machine does.
+[settings.safety]
+default = "ask"
+[settings.safety.surfaces]
+read_file = "always"
+write_file = "ask"
+edit_file = "ask"
+shell = "ask"
+
+# The team. `config/team.example.toml` is the same thing on its own; a team can
+# also be created later through the API or the UI. Provisioning is idempotent, so
+# a restart does not duplicate a bot or a group.
+#
+# [team]
+# [[team.bots]]
+# name = "lead"
+# label = "Lead"
+# instructions = "You lead the team: break work up, hand it out, write the final answer."
+# backend = "fake"
+# color = "#599ce7"
+#
+# [[team.groups]]
+# title = "Team"
+# members = ["lead", "scout"]
+# lead = "lead"
