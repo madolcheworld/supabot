@@ -371,11 +371,26 @@ pub fn entry_row(
             )
             .into_any_element(),
         EntryKind::Notice(notice) => {
+            if s.is_dismissed(&entry.id) {
+                return div().into_any_element();
+            }
             if notice.level == NoticeLevel::Error {
+                let id = entry.id.clone();
+                let state_h = state.clone();
+                let on_close = move |cx: &mut gpui::App| {
+                    state_h.update(cx, |st, cx| {
+                        st.dismiss_entry(&id);
+                        cx.notify();
+                    });
+                };
                 div()
                     .w_full()
                     .py_2()
-                    .child(render_bot_failed_banner(Some(&notice.text)))
+                    .child(render_bot_failed_banner(
+                        Some(entry.id.as_str()),
+                        Some(&notice.text),
+                        Some(Box::new(on_close)),
+                    ))
                     .into_any_element()
             } else {
                 let color = match notice.level {
@@ -829,8 +844,6 @@ pub fn mock_conversation_view() -> gpui::Stateful<gpui::Div> {
         // Today 11:40 AM
         .child(centered_time_str("Today 11:40 AM"))
         .child(user_pill_str("hello"))
-        // Error banner at bottom
-        .child(render_bot_failed_banner(None))
 }
 
 fn centered_time_str(text: &str) -> gpui::Div {
@@ -857,9 +870,38 @@ fn user_pill_str(text: &str) -> gpui::Div {
     )
 }
 
+/// Callback invoked when a collapsible or dismissible banner close button is clicked.
+pub type CloseCallback = Box<dyn Fn(&mut gpui::App) + 'static>;
+
 /// The soft-red warning banner shown when a bot fails to respond, matching the screenshot.
-pub fn render_bot_failed_banner(detail: Option<&str>) -> gpui::Div {
+pub fn render_bot_failed_banner(
+    id: Option<&str>,
+    detail: Option<&str>,
+    on_close: Option<CloseCallback>,
+) -> gpui::Div {
     let subtitle = detail.unwrap_or("Something went wrong while generating the reply. Try again.");
+    let close_id = SharedString::from(format!("close-banner-{}", id.unwrap_or("default")));
+
+    let mut close_btn = div()
+        .id(close_id)
+        .cursor_pointer()
+        .p_1()
+        .rounded_md()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .hover(|h| {
+            h.bg(rgb(theme::SURFACE_RAISED))
+                .text_color(rgb(theme::TEXT))
+        })
+        .child("✕");
+
+    if let Some(on_close) = on_close {
+        close_btn = close_btn.on_click(move |_, _, cx: &mut gpui::App| {
+            cx.stop_propagation();
+            on_close(cx);
+        });
+    }
+
     div()
         .w_full()
         .my_2()
@@ -893,16 +935,7 @@ pub fn render_bot_failed_banner(detail: Option<&str>) -> gpui::Div {
                         .child(subtitle.to_string()),
                 ),
         )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(div().cursor_pointer().child("⛶"))
-                .child(div().cursor_pointer().child("✕")),
-        )
+        .child(close_btn)
 }
 
 #[cfg(test)]

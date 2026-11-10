@@ -111,6 +111,7 @@ pub fn render(
                     bits::button(&pill_label, pill_tone)
                         .id(SharedString::from(format!("bot-switch-{}", member_bot.id)))
                         .on_click(move |_, _, cx: &mut gpui::App| {
+                            cx.stop_propagation();
                             let mut fetch: Option<String> = None;
                             state_h.update(cx, |s, cx| {
                                 s.menu_bot = Some(m_id_clone.clone());
@@ -180,6 +181,7 @@ pub fn render(
                         .hover(|h| h.bg(rgb(theme::SURFACE)))
                 })
                 .on_click(move |_, _, cx: &mut gpui::App| {
+                    cx.stop_propagation();
                     let mut fetch: Option<String> = None;
                     state_h.update(cx, |s, cx| {
                         s.menu_backend = Some(backend_id.clone());
@@ -295,6 +297,7 @@ pub fn render(
                     .hover(|h| h.bg(rgb(theme::SURFACE)))
             })
             .on_click(move |_, _, cx: &mut gpui::App| {
+                cx.stop_propagation();
                 search_def.update(cx, |input, cx| input.clear(cx));
                 let _ = commands_def.send(Command::SetBotBackend {
                     bot: bot_id_def.clone(),
@@ -365,7 +368,8 @@ pub fn render(
                             .id(SharedString::from(format!(
                                 "provider-retry-{backend_retry}"
                             )))
-                            .on_click(move |_, _, _: &mut gpui::App| {
+                            .on_click(move |_, _, cx: &mut gpui::App| {
+                                cx.stop_propagation();
                                 let _ = commands_retry
                                     .send(Command::FetchModels(backend_retry.clone()));
                             }),
@@ -422,6 +426,7 @@ pub fn render(
                                     .hover(|h| h.bg(rgb(theme::SURFACE)))
                             })
                             .on_click(move |_, _, cx: &mut gpui::App| {
+                                cx.stop_propagation();
                                 search_row
                                     .update(cx, |input, cx| input.set_content(&model_id_click, cx));
                                 let _ = commands_click.send(Command::SetBotBackend {
@@ -509,6 +514,7 @@ pub fn render(
             .child(
                 div()
                     .id("provider-menu-card")
+                    .occlude()
                     .absolute()
                     .top(theme::space::HEADER_H + px(4.0))
                     .left(px(16.0))
@@ -524,7 +530,9 @@ pub fn render(
                     .flex()
                     .flex_col()
                     .gap_2p5()
-                    .on_click(|_, _, _| {})
+                    .on_click(|_, _, cx| {
+                        cx.stop_propagation();
+                    })
                     // Header
                     .child(
                         div()
@@ -569,6 +577,7 @@ pub fn render(
                                         h.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT))
                                     })
                                     .on_click(move |_, _, cx: &mut gpui::App| {
+                                        cx.stop_propagation();
                                         state_close.update(cx, |s, cx| {
                                             s.bot_menu_open = false;
                                             s.menu_bot = None;
@@ -631,6 +640,7 @@ pub fn render(
                                         bits::button("Reset", Tone::Ghost)
                                             .id("provider-clear-model")
                                             .on_click(move |_, _, cx: &mut gpui::App| {
+                                                cx.stop_propagation();
                                                 search_clear
                                                     .update(cx, |input, cx| input.clear(cx));
                                                 state_clear.update(cx, |s, cx| {
@@ -643,6 +653,7 @@ pub fn render(
                                         bits::button("Apply", Tone::Primary)
                                             .id("provider-apply")
                                             .on_click(move |_, _, cx: &mut gpui::App| {
+                                                cx.stop_propagation();
                                                 let typed = search_apply
                                                     .read(cx)
                                                     .content()

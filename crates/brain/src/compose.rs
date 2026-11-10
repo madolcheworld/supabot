@@ -124,7 +124,8 @@ pub fn parts(
     )];
     roots.extend(extra_roots);
 
-    let policy = Arc::new(PathPolicy::with_default_deny(roots.clone()));
+    let policy =
+        Arc::new(PathPolicy::with_default_deny(roots.clone()).with_workspaces_root(&workspaces));
     // The local node adopts the brain's ceilings: there is no second operator here
     // to be stricter than.
     let engine = Arc::new(PolicyEngine::from_settings(
@@ -197,6 +198,25 @@ mod tests {
                 .resolve(Path::new("/etc/passwd"), dir.path(), false)
                 .is_err()
         );
+
+        // Per-bot workspace isolation: alice cannot touch bob's workspace
+        let alice_dir = dir.path().join("workspaces/alice");
+        let bob_dir = dir.path().join("workspaces/bob");
+        std::fs::create_dir_all(&alice_dir).expect("mkdir alice");
+        std::fs::create_dir_all(&bob_dir).expect("mkdir bob");
+        assert!(
+            mine.policy
+                .resolve(Path::new("file.txt"), &alice_dir, false)
+                .is_ok()
+        );
+        let sibling_err = mine
+            .policy
+            .resolve(&bob_dir.join("file.txt"), &alice_dir, false)
+            .expect_err("sibling workspace is refused");
+        assert!(matches!(
+            sibling_err,
+            swarmbot_contracts::ToolError::PathDenied { reason, .. } if reason == "outside bot workspace"
+        ));
 
         // The engine carries the brain's ceilings, unchanged.
         assert_eq!(

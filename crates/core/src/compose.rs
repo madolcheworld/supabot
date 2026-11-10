@@ -101,7 +101,8 @@ fn parts_for(
     )];
     roots.extend(extra_roots);
 
-    let policy = Arc::new(PathPolicy::with_default_deny(roots.clone()));
+    let policy =
+        Arc::new(PathPolicy::with_default_deny(roots.clone()).with_workspaces_root(&workspaces));
     // The local node adopts the brain's ceilings: there is no second operator
     // here to be stricter than.
     let engine = Arc::new(PolicyEngine::from_settings(
@@ -126,6 +127,23 @@ fn parts_for(
 pub fn workspaces_root(config: &BrainConfig, data_dir: &Path) -> PathBuf {
     let _ = config;
     data_dir.join("workspaces")
+}
+
+/// Ensure a bot's workspace directory, `.spool` directory, and initial `MEMORY.md` exist.
+pub fn ensure_bot_workspace(
+    workspaces_root: &Path,
+    bot_name: &str,
+) -> Result<PathBuf, DomainError> {
+    let workspace = workspaces_root.join(bot_name);
+    std::fs::create_dir_all(&workspace)
+        .map_err(|err| DomainError::internal(format!("cannot create the workspace: {err}")))?;
+    let spool_dir = workspace.join(".spool");
+    let _ = std::fs::create_dir_all(&spool_dir);
+    let memory_file = workspace.join("MEMORY.md");
+    if !memory_file.exists() {
+        let _ = std::fs::write(&memory_file, "");
+    }
+    Ok(workspace)
 }
 
 #[cfg(test)]
@@ -163,6 +181,23 @@ mod tests {
             .expect("a local node");
         assert!(node.can("shell"));
         assert_eq!(node.roots.len(), 1, "the workspaces root");
+
+        // Every provisioned bot has its isolated workspace with MEMORY.md and .spool/
+        for bot in &bots {
+            let ws = dir.path().join("workspaces").join(&bot.name);
+            assert!(ws.is_dir(), "workspace for @{} exists", bot.name);
+            assert!(
+                ws.join(".spool").is_dir(),
+                ".spool for @{} exists",
+                bot.name
+            );
+            assert!(
+                ws.join("MEMORY.md").is_file(),
+                "MEMORY.md for @{} exists",
+                bot.name
+            );
+        }
+
         swarm.shutdown().await;
     }
 

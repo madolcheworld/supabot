@@ -258,11 +258,17 @@ impl Swarm {
 
     /// The team a config describes. Idempotent, so a restart does not duplicate.
     pub fn provision_team(&self) -> Result<Vec<Bot>, DomainError> {
-        let Some(team) = self.config.team.clone() else {
-            return self.bots.list();
+        let bots = if let Some(team) = self.config.team.clone() {
+            self.bots
+                .provision_team(&team, &self.config.default_backend, &self.conversations)?
+        } else {
+            self.bots.list()?
         };
-        self.bots
-            .provision_team(&team, &self.config.default_backend, &self.conversations)
+        let ws_root = self.workspaces_root();
+        for bot in &bots {
+            let _ = crate::compose::ensure_bot_workspace(&ws_root, &bot.name);
+        }
+        Ok(bots)
     }
 
     /// A runner per bot that does not have one yet.

@@ -786,11 +786,8 @@ async fn execute_turn(
     let store = Arc::clone(&env.store);
     let mut session = Session::load(store.as_ref(), bot_id)?;
 
-    let workspace = env.workspaces_root.join(&bot.name);
-    std::fs::create_dir_all(&workspace)
-        .map_err(|err| DomainError::internal(format!("cannot create the workspace: {err}")))?;
+    let workspace = crate::compose::ensure_bot_workspace(&env.workspaces_root, &bot.name)?;
     let spool_dir = workspace.join(".spool");
-    std::fs::create_dir_all(&spool_dir).ok();
 
     let node = store
         .get_node(&bot.host_node())?

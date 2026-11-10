@@ -535,6 +535,46 @@ mod tests {
     }
 
     #[test]
+    fn dismissed_entry_is_removed_and_cannot_be_re_upserted_or_restored_by_snapshot() {
+        let conversation = Conversation::direct(BotId::new());
+        let entry = Entry::bot_message(conversation.id.clone(), 1, BotId::new(), "err", None);
+        let id = entry.id.clone();
+        let mut state = drive(vec![
+            LiveEvent::ConversationUpsert {
+                cursor: LiveCursor::new(1, 1),
+                conversation: conversation.clone(),
+            },
+            LiveEvent::EntryUpsert {
+                cursor: LiveCursor::new(1, 2),
+                entry: entry.clone(),
+            },
+        ]);
+        assert_eq!(state.entries(&conversation.id).len(), 1);
+
+        // Dismiss the entry
+        state.dismiss_entry(&id);
+        assert!(state.is_dismissed(&id));
+        assert_eq!(state.entries(&conversation.id).len(), 0);
+
+        // Re-upserting the same entry must do nothing
+        apply(
+            &mut state,
+            LiveEvent::EntryUpsert {
+                cursor: LiveCursor::new(1, 3),
+                entry: entry.clone(),
+            },
+        );
+        assert_eq!(state.entries(&conversation.id).len(), 0);
+
+        // Snapshot containing the dismissed entry must filter it out
+        apply(
+            &mut state,
+            snapshot_with(vec![entry], vec![conversation.clone()]),
+        );
+        assert_eq!(state.entries(&conversation.id).len(), 0);
+    }
+
+    #[test]
     fn unread_counts_background_conversations_and_resets_on_open() {
         let a = Conversation::direct(BotId::new());
         let b = Conversation::direct(BotId::new());

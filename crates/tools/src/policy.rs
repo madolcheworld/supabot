@@ -196,6 +196,7 @@ struct ResolvedRoot {
 pub struct PathPolicy {
     roots: Vec<ResolvedRoot>,
     deny: Vec<PathBuf>,
+    workspaces_root: Option<PathBuf>,
 }
 
 impl PathPolicy {
@@ -222,7 +223,28 @@ impl PathPolicy {
                 normalize(&make_absolute(&expanded))
             })
             .collect();
-        Self { roots, deny }
+        Self {
+            roots,
+            deny,
+            workspaces_root: None,
+        }
+    }
+
+    /// Designate a directory containing per-bot workspaces.
+    ///
+    /// When set, any path resolving inside this directory is checked against
+    /// the caller's own workspace (`cwd`): a bot whose `cwd` is `<workspaces>/alice`
+    /// may not read or write inside `<workspaces>/bob` or `<workspaces>` itself.
+    pub fn with_workspaces_root(mut self, workspaces: impl Into<PathBuf>) -> Self {
+        let path = workspaces.into();
+        let expanded = expand_home(&path).unwrap_or(path);
+        self.workspaces_root = Some(normalize(&make_absolute(&expanded)));
+        self
+    }
+
+    /// The workspaces root, if set.
+    pub fn workspaces_root(&self) -> Option<&Path> {
+        self.workspaces_root.as_deref()
     }
 
     /// Roots plus [`PathPolicy::default_deny_list`]: what a node daemon and
@@ -301,6 +323,23 @@ impl PathPolicy {
                 path: display,
                 reason: "deny-list".into(),
             });
+        }
+
+        // Enforce per-bot workspace isolation if a workspaces root is designated.
+        if let Some(ws_root) = &self.workspaces_root {
+            let in_workspaces = resolved == *ws_root || resolved.starts_with(ws_root);
+            if in_workspaces {
+                let normalized_cwd = normalize(&make_absolute(cwd));
+                if let Some(bot_ws) = bot_workspace_root(ws_root, &normalized_cwd) {
+                    let in_own_workspace = resolved == bot_ws || resolved.starts_with(&bot_ws);
+                    if !in_own_workspace {
+                        return Err(ToolError::PathDenied {
+                            path: display,
+                            reason: "outside bot workspace".into(),
+                        });
+                    }
+                }
+            }
         }
 
         // Longest matching root wins, so a read-only root nested inside a
@@ -392,6 +431,20 @@ fn normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Extracts the bot's root workspace directory under `ws_root`, if `cwd` is inside `ws_root`.
+///
+/// For example, if `ws_root` is `/data/workspaces` and `cwd` is `/data/workspaces/alice/sub`,
+/// the bot's workspace root is `/data/workspaces/alice`.
+/// If `cwd` is `/data/workspaces` itself or outside `ws_root`, returns `None`.
+fn bot_workspace_root(ws_root: &Path, cwd: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = cwd.strip_prefix(ws_root)
+        && let Some(first_component) = relative.components().next()
+    {
+        return Some(ws_root.join(first_component));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +738,110 @@ mod tests {
             .resolve(&inner.join("lib.rs"), tmp.path(), true)
             .expect_err("the nested root is read-only");
         assert!(matches!(err, ToolError::PathDenied { .. }));
+    }
+
+    #[test]
+    fn bot_cannot_access_sibling_workspace() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspaces = tmp.path().join("workspaces");
+        let alice_ws = workspaces.join("alice");
+        let bob_ws = workspaces.join("bob");
+        std::fs::create_dir_all(&alice_ws).expect("mkdir alice");
+        std::fs::create_dir_all(&bob_ws).expect("mkdir bob");
+        std::fs::write(bob_ws.join("secret.txt"), "shh").expect("write secret");
+        std::fs::write(alice_ws.join("notes.txt"), "hello").expect("write notes");
+
+        let policy =
+            PathPolicy::new(vec![rw(&workspaces)], Vec::new()).with_workspaces_root(&workspaces);
+
+        // Alice can access her own notes
+        let alice_file = policy
+            .resolve(Path::new("notes.txt"), &alice_ws, false)
+            .expect("own workspace is accessible");
+        assert_eq!(
+            alice_file,
+            alice_ws.canonicalize().expect("canon").join("notes.txt")
+        );
+
+        // Alice cannot access bob's files via relative path traversal
+        let err_rel = policy
+            .resolve(Path::new("../bob/secret.txt"), &alice_ws, false)
+            .expect_err("sibling workspace is forbidden");
+        let (_, reason) = denied_parts(&err_rel);
+        assert_eq!(reason, "outside bot workspace");
+
+        // Alice cannot access bob's files via absolute path
+        let err_abs = policy
+            .resolve(&bob_ws.join("secret.txt"), &alice_ws, false)
+            .expect_err("sibling workspace absolute path is forbidden");
+        let (_, reason) = denied_parts(&err_abs);
+        assert_eq!(reason, "outside bot workspace");
+
+        // Alice cannot access the parent workspaces directory
+        let err_parent = policy
+            .resolve(Path::new(".."), &alice_ws, false)
+            .expect_err("parent workspaces directory is forbidden");
+        let (_, reason) = denied_parts(&err_parent);
+        assert_eq!(reason, "outside bot workspace");
+    }
+
+    #[test]
+    fn bot_can_access_shared_operator_roots_while_sibling_is_blocked() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspaces = tmp.path().join("workspaces");
+        let alice_ws = workspaces.join("alice");
+        let bob_ws = workspaces.join("bob");
+        let project_dir = tmp.path().join("project");
+        std::fs::create_dir_all(&alice_ws).expect("mkdir alice");
+        std::fs::create_dir_all(&bob_ws).expect("mkdir bob");
+        std::fs::create_dir_all(&project_dir).expect("mkdir project");
+        std::fs::write(project_dir.join("main.rs"), "fn main() {}").expect("write main");
+
+        let policy = PathPolicy::new(
+            vec![
+                rw(&workspaces),
+                NodeRoot::read_write("project", project_dir.display().to_string()),
+            ],
+            Vec::new(),
+        )
+        .with_workspaces_root(&workspaces);
+
+        // Alice can access the shared operator root
+        let shared_file = policy
+            .resolve(&project_dir.join("main.rs"), &alice_ws, false)
+            .expect("shared project root is accessible");
+        assert!(shared_file.starts_with(project_dir.canonicalize().expect("canon")));
+
+        // But Alice still cannot access Bob's workspace
+        let err = policy
+            .resolve(&bob_ws.join("file.txt"), &alice_ws, false)
+            .expect_err("bob's workspace remains blocked");
+        let (_, reason) = denied_parts(&err);
+        assert_eq!(reason, "outside bot workspace");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_escape_to_sibling_workspace_is_blocked() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspaces = tmp.path().join("workspaces");
+        let alice_ws = workspaces.join("alice");
+        let bob_ws = workspaces.join("bob");
+        std::fs::create_dir_all(&alice_ws).expect("mkdir alice");
+        std::fs::create_dir_all(&bob_ws).expect("mkdir bob");
+        std::fs::write(bob_ws.join("secret.txt"), "secret").expect("write secret");
+
+        // Symlink inside alice pointing to bob
+        std::os::unix::fs::symlink(&bob_ws, alice_ws.join("link_to_bob")).expect("symlink");
+
+        let policy =
+            PathPolicy::new(vec![rw(&workspaces)], Vec::new()).with_workspaces_root(&workspaces);
+
+        let err = policy
+            .resolve(Path::new("link_to_bob/secret.txt"), &alice_ws, false)
+            .expect_err("symlink escaping to sibling is blocked");
+        let (_, reason) = denied_parts(&err);
+        assert_eq!(reason, "outside bot workspace");
     }
 
     // -- destructive patterns ------------------------------------------------

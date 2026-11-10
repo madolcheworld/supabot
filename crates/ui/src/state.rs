@@ -148,6 +148,8 @@ pub struct AppState {
     pub expanded: HashSet<EntryId>,
     /// Tool-call results shown in full rather than truncated.
     pub expanded_full: HashSet<EntryId>,
+    /// Entries (such as error notices) dismissed by the user.
+    pub dismissed: HashSet<EntryId>,
 }
 
 impl AppState {
@@ -195,6 +197,7 @@ impl AppState {
             toast: None,
             expanded: HashSet::new(),
             expanded_full: HashSet::new(),
+            dismissed: HashSet::new(),
         }
     }
 
@@ -217,6 +220,17 @@ impl AppState {
     pub fn toggle_full(&mut self, id: &EntryId) {
         if !self.expanded_full.remove(id) {
             self.expanded_full.insert(id.clone());
+        }
+    }
+
+    pub fn is_dismissed(&self, id: &EntryId) -> bool {
+        self.dismissed.contains(id)
+    }
+
+    pub fn dismiss_entry(&mut self, id: &EntryId) {
+        self.dismissed.insert(id.clone());
+        for entries in self.entries.values_mut() {
+            entries.retain(|e| &e.id != id);
         }
     }
 
@@ -448,6 +462,9 @@ impl AppState {
     /// times. A lower `revision` than what is already stored is ignored as a
     /// stale/reordered write rather than clobbering newer text.
     pub fn upsert_entry(&mut self, entry: Entry) -> bool {
+        if self.dismissed.contains(&entry.id) {
+            return false;
+        }
         let list = self
             .entries
             .entry(entry.conversation_id.clone())
@@ -483,6 +500,7 @@ impl AppState {
     /// Replace a conversation's entries wholesale (used when a snapshot or a
     /// per-conversation `tail` arrives).
     pub fn set_entries(&mut self, id: ConversationId, mut entries: Vec<Entry>) {
+        entries.retain(|e| !self.dismissed.contains(&e.id));
         entries.sort_by_key(|e| e.seq);
         entries.dedup_by(|a, b| a.id == b.id);
         self.entries.insert(id, entries);
