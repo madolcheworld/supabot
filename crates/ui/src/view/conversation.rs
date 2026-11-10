@@ -136,6 +136,150 @@ pub fn header(
         (title.clone(), theme::hex("#8b5cf6"), 'W')
     };
 
+    let direct_pill = direct_bot.as_ref().map(|bot| {
+        let state_h = state.clone();
+        let input_h = model_input.clone();
+        let commands_menu = commands.clone();
+        let menu_bot_id = bot.id.clone();
+        let menu_backend = bot.backend.clone();
+        let current_model = bot.model.clone();
+
+        let model_display = match &bot.model {
+            Some(model) => format!("{model} ▾"),
+            None => format!("{} ▾", bot.backend),
+        };
+        let is_open_for_this =
+            s.bot_menu_open && s.menu_bot.as_ref().is_none_or(|id| id == &bot.id);
+
+        div()
+            .id("provider-menu-toggle")
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .px_2()
+            .py(px(1.5))
+            .rounded_full()
+            .border_1()
+            .text_xs()
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .when(is_open_for_this, |d| {
+                d.bg(rgb(0xede9fe))
+                    .border_color(rgb(0xc4b5fd))
+                    .text_color(rgb(0x6d28d9))
+            })
+            .when(!is_open_for_this, |d| {
+                d.bg(rgb(0xf3f4f6))
+                    .border_color(rgb(0xe5e7eb))
+                    .text_color(rgb(0x374151))
+                    .hover(|h| h.bg(rgb(0xe5e7eb)))
+            })
+            .on_click(move |_, _, cx: &mut gpui::App| {
+                let mut opening = false;
+                let mut fetch: Option<String> = None;
+                state_h.update(cx, |s, cx| {
+                    let was_open =
+                        s.bot_menu_open && s.menu_bot.as_ref().is_none_or(|id| id == &menu_bot_id);
+                    s.bot_menu_open = !was_open;
+                    opening = s.bot_menu_open;
+                    if opening {
+                        s.menu_bot = Some(menu_bot_id.clone());
+                        s.menu_backend = Some(menu_backend.clone());
+                        s.menu_model = current_model.clone();
+                        if !s.models.contains_key(&menu_backend) {
+                            fetch = Some(menu_backend.clone());
+                        }
+                    } else {
+                        s.menu_bot = None;
+                    }
+                    cx.notify();
+                });
+                if opening {
+                    let initial_text = current_model.clone().unwrap_or_default();
+                    input_h.update(cx, |input, cx| input.set_content(&initial_text, cx));
+                    let _ = commands_menu.send(Command::FetchBackends);
+                    if let Some(backend) = fetch {
+                        let _ = commands_menu.send(Command::FetchModels(backend));
+                    }
+                }
+            })
+            .child(model_display)
+    });
+
+    let group_pill = if direct_bot.is_none() && !members.is_empty() {
+        let target_bot_id = s.menu_bot.as_ref().or_else(|| match &conversation.kind {
+            swarmbot_contracts::ConversationKind::Group { lead, .. } => Some(lead),
+            _ => members.first(),
+        });
+        target_bot_id.and_then(|id| s.bot(id)).map(|bot| {
+            let state_h = state.clone();
+            let input_h = model_input.clone();
+            let commands_menu = commands.clone();
+            let menu_bot_id = bot.id.clone();
+            let menu_backend = bot.backend.clone();
+            let current_model = bot.model.clone();
+
+            let model_display = match &bot.model {
+                Some(model) => format!("{}: {model} ▾", bot.name),
+                None => format!("{}: {} ▾", bot.name, bot.backend),
+            };
+            let is_open_for_this = s.bot_menu_open && s.menu_bot.as_ref() == Some(&bot.id);
+
+            div()
+                .id("group-provider-menu-toggle")
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .px_2()
+                .py(px(1.5))
+                .rounded_full()
+                .border_1()
+                .text_xs()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .when(is_open_for_this, |d| {
+                    d.bg(rgb(0xede9fe))
+                        .border_color(rgb(0xc4b5fd))
+                        .text_color(rgb(0x6d28d9))
+                })
+                .when(!is_open_for_this, |d| {
+                    d.bg(rgb(0xf3f4f6))
+                        .border_color(rgb(0xe5e7eb))
+                        .text_color(rgb(0x374151))
+                        .hover(|h| h.bg(rgb(0xe5e7eb)))
+                })
+                .on_click(move |_, _, cx: &mut gpui::App| {
+                    let mut opening = false;
+                    let mut fetch: Option<String> = None;
+                    state_h.update(cx, |s, cx| {
+                        let was_open = s.bot_menu_open && s.menu_bot.as_ref() == Some(&menu_bot_id);
+                        s.bot_menu_open = !was_open;
+                        opening = s.bot_menu_open;
+                        if opening {
+                            s.menu_bot = Some(menu_bot_id.clone());
+                            s.menu_backend = Some(menu_backend.clone());
+                            s.menu_model = current_model.clone();
+                            if !s.models.contains_key(&menu_backend) {
+                                fetch = Some(menu_backend.clone());
+                            }
+                        } else {
+                            s.menu_bot = None;
+                        }
+                        cx.notify();
+                    });
+                    if opening {
+                        let initial_text = current_model.clone().unwrap_or_default();
+                        input_h.update(cx, |input, cx| input.set_content(&initial_text, cx));
+                        let _ = commands_menu.send(Command::FetchBackends);
+                        if let Some(backend) = fetch {
+                            let _ = commands_menu.send(Command::FetchModels(backend));
+                        }
+                    }
+                })
+                .child(model_display)
+        })
+    } else {
+        None
+    };
+
     div()
         .h(theme::space::HEADER_H)
         .flex_none()
@@ -153,11 +297,19 @@ pub fn header(
                 .flex_col()
                 .child(
                     div()
-                        .text_base()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(rgb(theme::TEXT))
-                        .truncate()
-                        .child(bot_label),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_base()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(rgb(theme::TEXT))
+                                .truncate()
+                                .child(bot_label),
+                        )
+                        .children(direct_pill)
+                        .children(group_pill),
                 )
                 .child(
                     div()
@@ -188,123 +340,6 @@ pub fn header(
                         }),
                 ),
         )
-        .children(direct_bot.as_ref().map(|bot| {
-            // The provider menu configures exactly this one bot; opening it
-            // seeds the selection from the bot and fetches the model list.
-            let state_h = state.clone();
-            let input_h = model_input.clone();
-            let commands_menu = commands.clone();
-            let menu_bot_id = bot.id.clone();
-            let menu_backend = bot.backend.clone();
-            let current_model = bot.model.clone();
-
-            let provider_label = match &bot.model {
-                Some(model) => format!("provider: {} · {}", bot.backend, model),
-                None => format!("provider: {}", bot.backend),
-            };
-            let is_open_for_this =
-                s.bot_menu_open && s.menu_bot.as_ref().is_none_or(|id| id == &bot.id);
-            let tone = if is_open_for_this {
-                Tone::Primary
-            } else {
-                Tone::Ghost
-            };
-
-            bits::button(&provider_label, tone)
-                .id("provider-menu-toggle")
-                .on_click(move |_, _, cx: &mut gpui::App| {
-                    let mut opening = false;
-                    let mut fetch: Option<String> = None;
-                    state_h.update(cx, |s, cx| {
-                        let was_open = s.bot_menu_open
-                            && s.menu_bot.as_ref().is_none_or(|id| id == &menu_bot_id);
-                        s.bot_menu_open = !was_open;
-                        opening = s.bot_menu_open;
-                        if opening {
-                            s.menu_bot = Some(menu_bot_id.clone());
-                            s.menu_backend = Some(menu_backend.clone());
-                            s.menu_model = current_model.clone();
-                            if !s.models.contains_key(&menu_backend) {
-                                fetch = Some(menu_backend.clone());
-                            }
-                        } else {
-                            s.menu_bot = None;
-                        }
-                        cx.notify();
-                    });
-                    if opening {
-                        let initial_text = current_model.clone().unwrap_or_default();
-                        input_h.update(cx, |input, cx| input.set_content(&initial_text, cx));
-                        // The left column is the brain's backend list, which
-                        // the Settings screen otherwise owns; refresh it here
-                        // so the menu never opens onto an empty column.
-                        let _ = commands_menu.send(Command::FetchBackends);
-                        if let Some(backend) = fetch {
-                            let _ = commands_menu.send(Command::FetchModels(backend));
-                        }
-                    }
-                })
-        }))
-        .children(if direct_bot.is_none() && !members.is_empty() {
-            let target_bot_id = s.menu_bot.as_ref().or_else(|| match &conversation.kind {
-                swarmbot_contracts::ConversationKind::Group { lead, .. } => Some(lead),
-                _ => members.first(),
-            });
-            let target_bot = target_bot_id.and_then(|id| s.bot(id));
-            target_bot.map(|bot| {
-                let state_h = state.clone();
-                let input_h = model_input.clone();
-                let commands_menu = commands.clone();
-                let menu_bot_id = bot.id.clone();
-                let menu_backend = bot.backend.clone();
-                let current_model = bot.model.clone();
-
-                let provider_label = match &bot.model {
-                    Some(model) => format!("@{} provider: {} · {}", bot.name, bot.backend, model),
-                    None => format!("@{} provider: {}", bot.name, bot.backend),
-                };
-                let is_open_for_this = s.bot_menu_open && s.menu_bot.as_ref() == Some(&bot.id);
-                let tone = if is_open_for_this {
-                    Tone::Primary
-                } else {
-                    Tone::Ghost
-                };
-
-                bits::button(&provider_label, tone)
-                    .id("group-provider-menu-toggle")
-                    .on_click(move |_, _, cx: &mut gpui::App| {
-                        let mut opening = false;
-                        let mut fetch: Option<String> = None;
-                        state_h.update(cx, |s, cx| {
-                            let was_open =
-                                s.bot_menu_open && s.menu_bot.as_ref() == Some(&menu_bot_id);
-                            s.bot_menu_open = !was_open;
-                            opening = s.bot_menu_open;
-                            if opening {
-                                s.menu_bot = Some(menu_bot_id.clone());
-                                s.menu_backend = Some(menu_backend.clone());
-                                s.menu_model = current_model.clone();
-                                if !s.models.contains_key(&menu_backend) {
-                                    fetch = Some(menu_backend.clone());
-                                }
-                            } else {
-                                s.menu_bot = None;
-                            }
-                            cx.notify();
-                        });
-                        if opening {
-                            let initial_text = current_model.clone().unwrap_or_default();
-                            input_h.update(cx, |input, cx| input.set_content(&initial_text, cx));
-                            let _ = commands_menu.send(Command::FetchBackends);
-                            if let Some(backend) = fetch {
-                                let _ = commands_menu.send(Command::FetchModels(backend));
-                            }
-                        }
-                    })
-            })
-        } else {
-            None
-        })
         .child(div().flex_1())
         .child(tiles)
         .child(stop)

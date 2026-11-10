@@ -150,6 +150,13 @@ pub fn spawn(args: &Args) -> Result<SpawnedBrain, SpawnError> {
         if let Some(team) = find_team_file() {
             command.arg("--team").arg(&team);
         }
+    } else {
+        if let Some(team) = find_team_file() {
+            command.arg("--team").arg(&team);
+        }
+        if let Some(config) = find_config_file() {
+            command.arg("--config").arg(&config);
+        }
     }
 
     let argv: Vec<String> = std::iter::once(bin.display().to_string())
@@ -238,13 +245,31 @@ fn find_team_file() -> Option<PathBuf> {
         if relative.exists() {
             return Some(relative.to_path_buf());
         }
-        if let Ok(exe) = std::env::current_exe() {
-            // exe = <root>/target/<profile>/swarmbot-ui
-            if let Some(root) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
-                let candidate_path = root.join(candidate);
-                if candidate_path.exists() {
-                    return Some(candidate_path);
-                }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(root) = exe.parent().and_then(Path::parent).and_then(Path::parent)
+        {
+            let candidate_path = root.join(candidate);
+            if candidate_path.exists() {
+                return Some(candidate_path);
+            }
+        }
+    }
+    None
+}
+
+/// Find the config file (e.g. `config/swarmbot.toml`) to pass to `--config`.
+fn find_config_file() -> Option<PathBuf> {
+    for candidate in &["config/swarmbot.toml", "config/swarmbot.example.toml"] {
+        let relative = Path::new(candidate);
+        if relative.exists() {
+            return Some(relative.to_path_buf());
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(root) = exe.parent().and_then(Path::parent).and_then(Path::parent)
+        {
+            let candidate_path = root.join(candidate);
+            if candidate_path.exists() {
+                return Some(candidate_path);
             }
         }
     }

@@ -61,7 +61,7 @@ pub fn render(
     search: &Entity<TextInput>,
     commands: &Sender<Command>,
     cx: &gpui::App,
-) -> Option<gpui::Div> {
+) -> Option<gpui::AnyElement> {
     if !s.bot_menu_open {
         return None;
     }
@@ -328,6 +328,9 @@ pub fn render(
                 let state_h = state.clone();
                 let search_row = search.clone();
                 let model_id_click = model.id.clone();
+                let commands_click = commands.clone();
+                let bot_id_click = bot.id.clone();
+                let backend_click = selected_backend.clone();
                 list =
                     list.child(
                         div()
@@ -342,12 +345,23 @@ pub fn render(
                             .py_1()
                             .rounded_md()
                             .cursor_pointer()
-                            .when(is_picked, |d| d.bg(rgb(theme::SURFACE)))
+                            .when(is_picked, |d| d.bg(rgb(0xede9fe)))
+                            .when(!is_picked, |d| d.hover(|h| h.bg(rgb(theme::SURFACE))))
                             .on_click(move |_, _, cx: &mut gpui::App| {
                                 search_row
                                     .update(cx, |input, cx| input.set_content(&model_id_click, cx));
+                                let _ = commands_click.send(Command::SetBotBackend {
+                                    bot: bot_id_click.clone(),
+                                    backend: backend_click.clone(),
+                                });
+                                let _ = commands_click.send(Command::SetBotModel {
+                                    bot: bot_id_click.clone(),
+                                    model: Some(model_id_click.clone()),
+                                });
                                 state_h.update(cx, |s, cx| {
                                     s.menu_model = Some(model_id_click.clone());
+                                    s.bot_menu_open = false;
+                                    s.menu_bot = None;
                                     cx.notify();
                                 });
                             })
@@ -398,21 +412,39 @@ pub fn render(
     let state_clear = state.clone();
     let search_clear = search.clone();
     let state_close = state.clone();
+    let state_backdrop = state.clone();
 
     Some(
         div()
+            .id("provider-menu-backdrop")
             .absolute()
-            .top(theme::space::HEADER_H)
-            .left(px(12.0))
-            .w(px(620.0))
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(theme::BORDER))
-            .bg(rgb(theme::SURFACE_RAISED))
-            .p_3()
-            .flex()
-            .flex_col()
-            .gap_2()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_click(move |_, _, cx: &mut gpui::App| {
+                state_backdrop.update(cx, |s, cx| {
+                    s.bot_menu_open = false;
+                    s.menu_bot = None;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .id("provider-menu-card")
+                    .absolute()
+                    .top(theme::space::HEADER_H + px(4.0))
+                    .left(px(52.0))
+                    .w(px(560.0))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .bg(rgb(0xffffff))
+                    .shadow_lg()
+                    .p_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .on_click(|_, _, _| {})
             .child(
                 div()
                     .text_sm()
@@ -509,6 +541,8 @@ pub fn render(
                             }),
                     ),
             ),
+        )
+        .into_any_element(),
     )
 }
 
