@@ -1,52 +1,38 @@
-# SwarmBot Brain Configuration with Pre-configured Providers
+# SwarmBot Brain Configuration with Installed ACP Providers
 data_dir = "data"
 public_addr = "127.0.0.1:8787"
-default_backend = "fake"
+default_backend = "opencode"
 
-# 1. Deterministic Fake Backend (for offline testing & development)
+# 1. OpenCode (Native ACP Agent installed on this machine)
+[[backends]]
+id = "opencode"
+kind = "acp"
+[backends.options]
+command = "opencode"
+args = ["acp"]
+models_command = ["opencode", "models"]
+[backends.options.model_env]
+OPENCODE_CONFIG_CONTENT = '{"model":"{model}"}'
+
+# 2. Claude Code (via ACP adapter)
+[[backends]]
+id = "claude"
+kind = "acp"
+[backends.options]
+command = "claude-code-acp"
+
+# 3. Codex (via ACP adapter)
+[[backends]]
+id = "codex"
+kind = "acp"
+[backends.options]
+command = "codex-acp"
+
+# 4. Deterministic Fake Backend (for offline testing & fallback)
 [[backends]]
 id = "fake"
 kind = "fake"
 model = "fake"
-
-# 2. Ollama (Local free inference, no API key needed)
-[[backends]]
-id = "ollama"
-kind = "openai_compat"
-base_url = "http://localhost:11434/v1"
-model = "llama3"
-
-# 3. OpenAI (GPT-4o, GPT-4o-mini)
-[[backends]]
-id = "openai"
-kind = "openai_compat"
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-model = "gpt-4o"
-
-# 4. OpenRouter (Access to Claude 3.5, Gemini 1.5, DeepSeek, etc.)
-[[backends]]
-id = "openrouter"
-kind = "openai_compat"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-model = "anthropic/claude-3.5-sonnet"
-
-# 5. Groq (Fast Llama 3.3 inference)
-[[backends]]
-id = "groq"
-kind = "openai_compat"
-base_url = "https://api.groq.com/openai/v1"
-api_key_env = "GROQ_API_KEY"
-model = "llama-3.3-70b-versatile"
-
-# 6. DeepSeek (DeepSeek Chat & DeepSeek Reasoner)
-[[backends]]
-id = "deepseek"
-kind = "openai_compat"
-base_url = "https://api.deepseek.com/v1"
-api_key_env = "DEEPSEEK_API_KEY"
-model = "deepseek-chat"
 
 [settings]
 bot_messaging = true
