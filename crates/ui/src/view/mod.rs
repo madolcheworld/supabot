@@ -74,8 +74,7 @@ impl Root {
         let composer = cx.new(|cx| Composer::new(state.clone(), commands.clone(), cx));
         let palette = cx.new(|cx| Palette::new(state.clone(), commands.clone(), cx));
         let login_input = cx.new(|cx| TextInput::new("one-time login token", cx).secure());
-        let provider_model =
-            cx.new(|cx| TextInput::new("Search models or enter custom model ID...", cx));
+        let provider_model = cx.new(|cx| TextInput::new("Search or enter model ID...", cx));
         let routine_name = cx.new(|cx| TextInput::new("Routine name (e.g. Daily Standup)", cx));
         let routine_prompt = cx.new(|cx| TextInput::new("Prompt for the bot…", cx).multiline());
         let focus_handle = cx.focus_handle();

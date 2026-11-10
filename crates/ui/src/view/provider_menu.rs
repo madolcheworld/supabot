@@ -22,7 +22,7 @@
 
 use std::sync::mpsc::Sender;
 
-use gpui::{Entity, SharedString, div, prelude::*, px, rgb};
+use gpui::{Entity, SharedString, div, prelude::*, px, relative, rgb};
 use swarmbot_client::ModelOption;
 
 use crate::proto::Command;
@@ -90,7 +90,7 @@ pub fn render(
     // --- optional bot switcher for group conversations ---------------------
     let mut bot_switcher: Option<gpui::Div> = None;
     if let swarmbot_contracts::ConversationKind::Group { members, .. } = &conversation.kind {
-        let mut row = div().flex().items_center().gap_1().flex_wrap();
+        let mut row = div().flex().items_center().gap_1p5().flex_wrap();
         for m_id in members {
             if let Some(member_bot) = s.bot(m_id) {
                 let is_active_bot = member_bot.id == bot.id;
@@ -142,7 +142,7 @@ pub fn render(
     }
 
     // --- left column: providers -------------------------------------------
-    let mut providers = div().w(px(230.0)).flex().flex_col().gap_1();
+    let mut providers = div().w(px(130.0)).flex_none().flex().flex_col().gap_1();
     let has_real = s
         .backends
         .iter()
@@ -169,10 +169,16 @@ pub fn render(
                 .items_center()
                 .gap_2()
                 .px_2()
-                .py_1()
-                .rounded_md()
+                .py(px(5.0))
+                .rounded_lg()
                 .cursor_pointer()
-                .when(is_selected, |d| d.bg(rgb(theme::SURFACE)))
+                .when(is_selected, |d| {
+                    d.bg(rgb(0xede9fe)).text_color(rgb(0x6d28d9))
+                })
+                .when(!is_selected, |d| {
+                    d.text_color(rgb(theme::TEXT))
+                        .hover(|h| h.bg(rgb(theme::SURFACE)))
+                })
                 .on_click(move |_, _, cx: &mut gpui::App| {
                     let mut fetch: Option<String> = None;
                     state_h.update(cx, |s, cx| {
@@ -196,19 +202,33 @@ pub fn render(
                     } else {
                         theme::BORDER
                     },
-                    px(8.0),
+                    px(7.0),
                 ))
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
+                        .truncate()
                         .text_sm()
-                        .text_color(rgb(theme::TEXT))
+                        .font_weight(if is_selected {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::NORMAL
+                        })
                         .child(backend.id.clone()),
                 )
                 .child(bits::badge(
                     backend_kind_label(backend.kind),
-                    theme::SURFACE_RAISED,
-                    theme::TEXT_MUTED,
+                    if is_selected {
+                        0xddd6fe
+                    } else {
+                        theme::SURFACE_RAISED
+                    },
+                    if is_selected {
+                        0x5b21b6
+                    } else {
+                        theme::TEXT_MUTED
+                    },
                 )),
         );
     }
@@ -223,30 +243,37 @@ pub fn render(
     let listed = s.models.get(&selected_backend);
     let mut models_col = div()
         .flex_1()
+        .min_w_0()
         .flex()
         .flex_col()
-        .gap_1()
-        .child(bits::section_label(&format!(
-            "MODELS OF `{selected_backend}`"
-        )))
+        .gap_1p5()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(bits::section_label(&format!("MODELS · {selected_backend}"))),
+        )
         .child(search.clone());
 
-    // Fixed height, not max: the footer buttons (Apply/Clear/Close) must not
-    // jump when the list goes from "loading" to one row to three hundred —
-    // a moving target is exactly what makes this menu mis-clickable.
     let mut list = div()
         .id("provider-model-list")
         .w_full()
-        .h(px(240.0))
+        .min_w_0()
+        .h(px(220.0))
         .overflow_y_scroll()
+        .overflow_x_hidden()
         .flex()
         .flex_col()
-        .gap_1();
+        .gap_0p5();
 
     // Default option at the top of the model list:
     let is_default_picked = effective_model.is_none();
     let state_def = state.clone();
     let search_def = search.clone();
+    let commands_def = commands.clone();
+    let bot_id_def = bot.id.clone();
+    let backend_def = selected_backend.clone();
     list = list.child(
         div()
             .id(SharedString::from(format!(
@@ -257,14 +284,30 @@ pub fn render(
             .items_center()
             .gap_2()
             .px_2()
-            .py_1()
-            .rounded_md()
+            .py(px(5.0))
+            .rounded_lg()
             .cursor_pointer()
-            .when(is_default_picked, |d| d.bg(rgb(theme::SURFACE)))
+            .when(is_default_picked, |d| {
+                d.bg(rgb(0xede9fe)).text_color(rgb(0x6d28d9))
+            })
+            .when(!is_default_picked, |d| {
+                d.text_color(rgb(theme::TEXT))
+                    .hover(|h| h.bg(rgb(theme::SURFACE)))
+            })
             .on_click(move |_, _, cx: &mut gpui::App| {
                 search_def.update(cx, |input, cx| input.clear(cx));
+                let _ = commands_def.send(Command::SetBotBackend {
+                    bot: bot_id_def.clone(),
+                    backend: backend_def.clone(),
+                });
+                let _ = commands_def.send(Command::SetBotModel {
+                    bot: bot_id_def.clone(),
+                    model: None,
+                });
                 state_def.update(cx, |s, cx| {
                     s.menu_model = None;
+                    s.bot_menu_open = false;
+                    s.menu_bot = None;
                     cx.notify();
                 });
             })
@@ -274,14 +317,20 @@ pub fn render(
                 } else {
                     theme::BORDER
                 },
-                px(8.0),
+                px(7.0),
             ))
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .text_sm()
-                    .text_color(rgb(theme::TEXT))
-                    .child("(Default) Use backend's configured model"),
+                    .font_weight(if is_default_picked {
+                        gpui::FontWeight::SEMIBOLD
+                    } else {
+                        gpui::FontWeight::NORMAL
+                    })
+                    .truncate()
+                    .child("(Default) Backend default model"),
             ),
     );
 
@@ -289,10 +338,11 @@ pub fn render(
         None => {
             list = list.child(
                 div()
+                    .py_2()
                     .text_xs()
                     .italic()
                     .text_color(rgb(theme::TEXT_DIM))
-                    .child("loading the model list…"),
+                    .child("Loading available models…"),
             );
         }
         Some(Err(reason)) => {
@@ -303,11 +353,12 @@ pub fn render(
                     .flex()
                     .flex_col()
                     .gap_1()
+                    .py_1()
                     .child(
                         div()
                             .text_xs()
                             .text_color(rgb(theme::DANGER))
-                            .child(format!("could not load the model list: {reason}")),
+                            .child(format!("Could not load models: {reason}")),
                     )
                     .child(
                         bits::button("Retry", Tone::Ghost)
@@ -318,31 +369,28 @@ pub fn render(
                                 let _ = commands_retry
                                     .send(Command::FetchModels(backend_retry.clone()));
                             }),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::TEXT_DIM))
-                            .child("You can type any model ID in the box above to use it."),
                     ),
             );
         }
         Some(Ok(mlist)) if mlist.models.is_empty() => {
-            list = list.child(div().text_xs().text_color(rgb(theme::TEXT_DIM)).child(
-                "this backend advertises no model list over ACP — set `options.models_command` \
-                 (e.g. opencode models) to list them from the agent's own CLI, type a \
-                 model id in the box above, or select (Default) above.",
-            ));
+            list = list.child(
+                div()
+                    .py_2()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_DIM))
+                    .child("No models advertised over ACP — type a model ID above or select (Default)."),
+            );
         }
         Some(Ok(mlist)) => {
             let visible = filter_models(&query, &mlist.models);
             if visible.is_empty() && !query.is_empty() {
                 list = list.child(
                     div()
+                        .py_2()
                         .text_xs()
                         .text_color(rgb(theme::TEXT_DIM))
                         .child(format!(
-                            "no model in list matches “{query}” — will apply as custom model ID"
+                            "No model matches “{query}” — will apply as custom model ID"
                         )),
                 );
             }
@@ -365,11 +413,14 @@ pub fn render(
                             .items_center()
                             .gap_2()
                             .px_2()
-                            .py_1()
-                            .rounded_md()
+                            .py(px(5.0))
+                            .rounded_lg()
                             .cursor_pointer()
-                            .when(is_picked, |d| d.bg(rgb(0xede9fe)))
-                            .when(!is_picked, |d| d.hover(|h| h.bg(rgb(theme::SURFACE))))
+                            .when(is_picked, |d| d.bg(rgb(0xede9fe)).text_color(rgb(0x6d28d9)))
+                            .when(!is_picked, |d| {
+                                d.text_color(rgb(theme::TEXT))
+                                    .hover(|h| h.bg(rgb(theme::SURFACE)))
+                            })
                             .on_click(move |_, _, cx: &mut gpui::App| {
                                 search_row
                                     .update(cx, |input, cx| input.set_content(&model_id_click, cx));
@@ -394,18 +445,25 @@ pub fn render(
                                 } else {
                                     theme::BORDER
                                 },
-                                px(8.0),
+                                px(7.0),
                             ))
                             .child(
                                 div()
                                     .flex_1()
+                                    .min_w_0()
                                     .text_sm()
-                                    .text_color(rgb(theme::TEXT))
+                                    .font_weight(if is_picked {
+                                        gpui::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui::FontWeight::NORMAL
+                                    })
+                                    .truncate()
                                     .child(model.id.clone()),
                             )
                             .children(model.label.as_ref().filter(|l| **l != model.id).map(
                                 |label| {
                                     div()
+                                        .flex_shrink_0()
                                         .text_xs()
                                         .text_color(rgb(theme::TEXT_DIM))
                                         .child(label.clone())
@@ -419,12 +477,9 @@ pub fn render(
 
     // --- footer: what Apply will do ----------------------------------------
     let summary = match &effective_model {
-        Some(model) => format!("provider `{selected_backend}` · model `{model}`"),
-        None => format!("provider `{selected_backend}` · model: the backend's default"),
+        Some(model) => format!("{selected_backend} / {model}"),
+        None => format!("{selected_backend} (default model)"),
     };
-    // A list read from the agent's own CLI (or no list at all from an agent
-    // without ACP model state) is informational: a pick is recorded but the
-    // agent may keep its own configured model. Say so loudly.
     let pick_may_not_reach = matches!(listed, Some(Ok(mlist)) if !mlist.authoritative);
     let bot_id_apply = bot.id.clone();
     let backend_apply = selected_backend.clone();
@@ -456,116 +511,165 @@ pub fn render(
                     .id("provider-menu-card")
                     .absolute()
                     .top(theme::space::HEADER_H + px(4.0))
-                    .left(px(52.0))
-                    .w(px(560.0))
-                    .rounded_xl()
+                    .left(px(16.0))
+                    .w(px(430.0))
+                    .max_w(relative(0.92))
+                    .overflow_hidden()
+                    .rounded_2xl()
                     .border_1()
-                    .border_color(rgb(theme::BORDER))
+                    .border_color(rgb(0xe5e7eb))
                     .bg(rgb(0xffffff))
-                    .shadow_lg()
-                    .p_3()
+                    .shadow_2xl()
+                    .p_3p5()
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap_2p5()
                     .on_click(|_, _, _| {})
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(theme::TEXT))
-                    .child(format!("Provider & model for @{}", bot.name)),
-            )
-            .child(div().text_xs().text_color(rgb(theme::TEXT_DIM)).child(
-                "Left: which configured backend runs this bot. Right: the models that \
-                         backend advertises. Takes effect on the next message.",
-            ))
-            .children(bot_switcher)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_3()
+                    // Header
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(bits::section_label("PROVIDER"))
-                            .child(providers),
-                    )
-                    .child(models_col),
-            )
-            .child(div().w_full().h(px(1.0)).bg(rgb(theme::BORDER)))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .child(summary),
-            )
-            .when(
-                pick_may_not_reach && effective_model.is_some(),
-                |d| {
-                    d.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::WARNING))
+                            .items_center()
+                            .justify_between()
                             .child(
-                                "warning: this backend does not accept model selection over ACP — the list is informational and the agent may keep its own configured model (opencode does). To make picks reach it, set options.model_env (e.g. OPENCODE_CONFIG_CONTENT = {model-template}) in the brain config.",
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(theme::TEXT))
+                                            .child("Model & Provider"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py(px(1.0))
+                                            .rounded_full()
+                                            .bg(rgb(0xede9fe))
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(rgb(0x6d28d9))
+                                            .child(format!("@{}", bot.name)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("provider-menu-close")
+                                    .cursor_pointer()
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .rounded_md()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .hover(|h| {
+                                        h.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT))
+                                    })
+                                    .on_click(move |_, _, cx: &mut gpui::App| {
+                                        state_close.update(cx, |s, cx| {
+                                            s.bot_menu_open = false;
+                                            s.menu_bot = None;
+                                            cx.notify();
+                                        });
+                                    })
+                                    .child("✕ Close"),
                             ),
                     )
-                },
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
+                    .children(bot_switcher)
+                    // Two Columns
                     .child(
-                        bits::button("Apply", Tone::Primary)
-                            .id("provider-apply")
-                            .on_click(move |_, _, cx: &mut gpui::App| {
-                                let typed = search_apply.read(cx).content().trim().to_string();
-                                let final_model = (!typed.is_empty()).then_some(typed);
-                                let _ = commands_apply.send(Command::SetBotBackend {
-                                    bot: bot_id_apply.clone(),
-                                    backend: backend_apply.clone(),
-                                });
-                                let _ = commands_apply.send(Command::SetBotModel {
-                                    bot: bot_id_apply.clone(),
-                                    model: final_model,
-                                });
-                                state_apply.update(cx, |s, cx| {
-                                    s.bot_menu_open = false;
-                                    s.menu_bot = None;
-                                    cx.notify();
-                                });
-                            }),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_3()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1p5()
+                                    .child(bits::section_label("PROVIDER"))
+                                    .child(providers),
+                            )
+                            .child(div().w(px(1.0)).bg(rgb(0xf3f4f6)))
+                            .child(models_col),
                     )
+                    .when(pick_may_not_reach && effective_model.is_some(), |d| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::WARNING))
+                                .child("Note: model selection is informational on this ACP agent."),
+                        )
+                    })
+                    .child(div().w_full().h(px(1.0)).bg(rgb(0xf3f4f6)))
+                    // Footer
                     .child(
-                        bits::button("Reset to default", Tone::Ghost)
-                            .id("provider-clear-model")
-                            .on_click(move |_, _, cx: &mut gpui::App| {
-                                search_clear.update(cx, |input, cx| input.clear(cx));
-                                state_clear.update(cx, |s, cx| {
-                                    s.menu_model = None;
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        bits::button("Close", Tone::Ghost)
-                            .id("provider-menu-close")
-                            .on_click(move |_, _, cx: &mut gpui::App| {
-                                state_close.update(cx, |s, cx| {
-                                    s.bot_menu_open = false;
-                                    s.menu_bot = None;
-                                    cx.notify();
-                                });
-                            }),
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .child(summary),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        bits::button("Reset", Tone::Ghost)
+                                            .id("provider-clear-model")
+                                            .on_click(move |_, _, cx: &mut gpui::App| {
+                                                search_clear
+                                                    .update(cx, |input, cx| input.clear(cx));
+                                                state_clear.update(cx, |s, cx| {
+                                                    s.menu_model = None;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    )
+                                    .child(
+                                        bits::button("Apply", Tone::Primary)
+                                            .id("provider-apply")
+                                            .on_click(move |_, _, cx: &mut gpui::App| {
+                                                let typed = search_apply
+                                                    .read(cx)
+                                                    .content()
+                                                    .trim()
+                                                    .to_string();
+                                                let final_model =
+                                                    (!typed.is_empty()).then_some(typed);
+                                                let _ =
+                                                    commands_apply.send(Command::SetBotBackend {
+                                                        bot: bot_id_apply.clone(),
+                                                        backend: backend_apply.clone(),
+                                                    });
+                                                let _ = commands_apply.send(Command::SetBotModel {
+                                                    bot: bot_id_apply.clone(),
+                                                    model: final_model,
+                                                });
+                                                state_apply.update(cx, |s, cx| {
+                                                    s.bot_menu_open = false;
+                                                    s.menu_bot = None;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    ),
+                            ),
                     ),
-            ),
-        )
-        .into_any_element(),
+            )
+            .into_any_element(),
     )
 }
 

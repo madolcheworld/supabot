@@ -163,6 +163,7 @@ pub fn header(
             .cursor_pointer()
             .flex()
             .items_center()
+            .max_w(px(220.0))
             .px_2()
             .py(px(1.5))
             .rounded_full()
@@ -209,7 +210,7 @@ pub fn header(
                     }
                 }
             })
-            .child(model_display)
+            .child(div().truncate().child(model_display))
     });
 
     let group_pill = if direct_bot.is_none() && !members.is_empty() {
@@ -243,6 +244,7 @@ pub fn header(
                 .cursor_pointer()
                 .flex()
                 .items_center()
+                .max_w(px(220.0))
                 .px_2()
                 .py(px(1.5))
                 .rounded_full()
@@ -288,7 +290,7 @@ pub fn header(
                         }
                     }
                 })
-                .child(model_display)
+                .child(div().truncate().child(model_display))
         })
     } else {
         None

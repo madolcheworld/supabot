@@ -291,8 +291,11 @@ fn bot_item(
                         .flex()
                         .items_center()
                         .justify_between()
+                        .gap_2()
                         .child(
                             div()
+                                .flex_1()
+                                .min_w_0()
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(rgb(theme::TEXT))
@@ -301,6 +304,7 @@ fn bot_item(
                         )
                         .child(
                             div()
+                                .flex_shrink_0()
                                 .text_xs()
                                 .text_color(rgb(theme::TEXT_DIM))
                                 .child(time.to_string()),
