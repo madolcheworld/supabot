@@ -22,7 +22,9 @@ export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib64}"
 # otherwise fall back to Mesa llvmpipe software rasterizer to keep headless/sandboxed
 # sessions deterministic.
 if [ -z "${VK_ICD_FILENAMES:-}" ]; then
-    if [ -e /dev/nvidia0 ] && [ -f /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json ]; then
+    if [ -e /dev/nvidia0 ] && [ -f /usr/share/vulkan/icd.d/nvidia_icd.json ]; then
+        export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/nvidia_icd.json"
+    elif [ -e /dev/nvidia0 ] && [ -f /usr/share/vulkan/icd.d/nvidia_icd.x86_64.json ]; then
         export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json"
     elif [ -f /usr/share/vulkan/icd.d/lvp_icd.x86_64.json ]; then
         export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
