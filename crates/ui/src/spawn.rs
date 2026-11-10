@@ -233,16 +233,18 @@ fn listen_addr(args: &Args) -> Result<String, SpawnError> {
 /// the current dir and to the workspace root inferred from the executable path
 /// (`target/<profile>/swarmbot-ui` → up three). `None` when it is not present.
 fn find_team_file() -> Option<PathBuf> {
-    let relative = Path::new("config/team.example.toml");
-    if relative.exists() {
-        return Some(relative.to_path_buf());
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        // exe = <root>/target/<profile>/swarmbot-ui
-        if let Some(root) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
-            let candidate = root.join("config/team.example.toml");
-            if candidate.exists() {
-                return Some(candidate);
+    for candidate in &["config/team.waypoint.toml", "config/team.example.toml"] {
+        let relative = Path::new(candidate);
+        if relative.exists() {
+            return Some(relative.to_path_buf());
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            // exe = <root>/target/<profile>/swarmbot-ui
+            if let Some(root) = exe.parent().and_then(Path::parent).and_then(Path::parent) {
+                let candidate_path = root.join(candidate);
+                if candidate_path.exists() {
+                    return Some(candidate_path);
+                }
             }
         }
     }
