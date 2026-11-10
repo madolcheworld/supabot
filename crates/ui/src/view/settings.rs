@@ -98,7 +98,20 @@ fn backends_section(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
             ),
     );
 
-    if s.backends.is_empty() {
+    let has_real = s
+        .backends
+        .iter()
+        .any(|b| b.id != "fake" && b.kind != BackendKind::Fake);
+    let visible_backends: Vec<_> = if has_real {
+        s.backends
+            .iter()
+            .filter(|b| b.id != "fake" && b.kind != BackendKind::Fake)
+            .collect()
+    } else {
+        s.backends.iter().collect()
+    };
+
+    if visible_backends.is_empty() {
         return section.child(
             div()
                 .text_sm()
@@ -107,7 +120,7 @@ fn backends_section(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
         );
     }
 
-    for backend in &s.backends {
+    for backend in visible_backends {
         let probe = s
             .probes
             .as_ref()

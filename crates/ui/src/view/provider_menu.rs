@@ -71,10 +71,21 @@ pub fn render(
         .as_ref()
         .and_then(|id| s.bot(id).cloned())
         .or_else(|| dm_bot(s, conversation))?;
-    let selected_backend = s
-        .menu_backend
-        .clone()
-        .unwrap_or_else(|| bot.backend.clone());
+    let selected_backend = s.menu_backend.clone().unwrap_or_else(|| {
+        if bot.backend == "fake"
+            && s.backends
+                .iter()
+                .any(|b| b.id != "fake" && b.kind != swarmbot_contracts::BackendKind::Fake)
+        {
+            s.backends
+                .iter()
+                .find(|b| b.id != "fake" && b.kind != swarmbot_contracts::BackendKind::Fake)
+                .map(|b| b.id.clone())
+                .unwrap_or_else(|| bot.backend.clone())
+        } else {
+            bot.backend.clone()
+        }
+    });
 
     // --- optional bot switcher for group conversations ---------------------
     let mut bot_switcher: Option<gpui::Div> = None;
@@ -132,7 +143,19 @@ pub fn render(
 
     // --- left column: providers -------------------------------------------
     let mut providers = div().w(px(230.0)).flex().flex_col().gap_1();
-    for backend in &s.backends {
+    let has_real = s
+        .backends
+        .iter()
+        .any(|b| b.id != "fake" && b.kind != swarmbot_contracts::BackendKind::Fake);
+    let visible_backends: Vec<_> = if has_real {
+        s.backends
+            .iter()
+            .filter(|b| b.id != "fake" && b.kind != swarmbot_contracts::BackendKind::Fake)
+            .collect()
+    } else {
+        s.backends.iter().collect()
+    };
+    for backend in visible_backends {
         let is_current = backend.id == bot.backend;
         let is_selected = backend.id == selected_backend;
         let backend_id = backend.id.clone();

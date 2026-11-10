@@ -28,11 +28,6 @@ kind = "acp"
 [backends.options]
 command = "codex-acp"
 
-# 4. Deterministic Fake Backend (for offline testing & fallback)
-[[backends]]
-id = "fake"
-kind = "fake"
-model = "fake"
 
 [settings]
 bot_messaging = true

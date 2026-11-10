@@ -146,7 +146,14 @@ pub fn header(
 
         let model_display = match &bot.model {
             Some(model) => format!("{model} ▾"),
-            None => format!("{} ▾", bot.backend),
+            None => {
+                let display = if bot.backend == "fake" {
+                    "opencode"
+                } else {
+                    &bot.backend
+                };
+                format!("{display} ▾")
+            }
         };
         let is_open_for_this =
             s.bot_menu_open && s.menu_bot.as_ref().is_none_or(|id| id == &bot.id);
@@ -220,7 +227,14 @@ pub fn header(
 
             let model_display = match &bot.model {
                 Some(model) => format!("{}: {model} ▾", bot.name),
-                None => format!("{}: {} ▾", bot.name, bot.backend),
+                None => {
+                    let display = if bot.backend == "fake" {
+                        "opencode"
+                    } else {
+                        &bot.backend
+                    };
+                    format!("{}: {display} ▾", bot.name)
+                }
             };
             let is_open_for_this = s.bot_menu_open && s.menu_bot.as_ref() == Some(&bot.id);
 
