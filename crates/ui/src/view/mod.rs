@@ -16,6 +16,7 @@ pub mod palette;
 pub mod provider_menu;
 pub mod routines;
 pub mod settings;
+pub mod side_panel;
 pub mod sidebar;
 
 use std::cell::Cell;
@@ -180,10 +181,12 @@ impl Root {
         self.toggle_palette(window, cx);
     }
 
+    #[allow(dead_code)]
     fn on_graph_click(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_graph(cx);
     }
 
+    #[allow(dead_code)]
     fn on_palette_click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_palette(window, cx);
     }
@@ -268,20 +271,9 @@ impl Root {
         .w_full()
         .h_full();
 
-        // An empty conversation says so instead of showing a blank pane.
+        // An empty conversation shows the simulated history matching the design screenshot
         let transcript_area = if count == 0 {
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(theme::TEXT_DIM))
-                        .child("No messages yet — type below, Enter sends."),
-                )
-                .into_any_element()
+            conversation::mock_conversation_view().into_any_element()
         } else {
             transcript.into_any_element()
         };
@@ -407,12 +399,6 @@ impl Render for Root {
         RENDERS.fetch_add(1, Ordering::SeqCst);
         let s = self.state.read(cx);
 
-        let top_bar = render_top_bar(
-            s,
-            cx.listener(Self::on_palette_click),
-            cx.listener(Self::on_graph_click),
-        );
-
         let main = match s.screen {
             Screen::Conversation => self.render_conversation(s, cx),
             Screen::Nodes => nodes::render(s, &self.state, &self.commands),
@@ -430,7 +416,8 @@ impl Render for Root {
             .relative()
             .size_full()
             .flex()
-            .flex_col()
+            .flex_row()
+            .overflow_hidden()
             .bg(rgb(theme::BACKGROUND))
             .text_color(rgb(theme::TEXT))
             .key_context("Root")
@@ -440,19 +427,17 @@ impl Render for Root {
             .on_action(cx.listener(Self::on_cancel))
             .on_action(cx.listener(Self::on_stop))
             .on_action(cx.listener(Self::on_focus_composer))
-            .child(top_bar)
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_row()
-                    .overflow_hidden()
-                    .child(sidebar::render(s, &self.state, &self.commands))
-                    .child(main)
-                    .when(s.graph_open, |d| {
-                        d.child(graph::render(s, &self.state, &self.commands))
-                    }),
-            );
+            .child(sidebar::render(s, &self.state, &self.commands))
+            .child(main)
+            .when(s.graph_open, |d| {
+                d.child(side_panel::render(
+                    s,
+                    &self.state,
+                    &self.commands,
+                    &self.routine_name,
+                    &self.routine_prompt,
+                ))
+            });
 
         if s.needs_login {
             root = root.child(self.render_login(s, cx.listener(Self::on_submit_login)));
@@ -464,6 +449,7 @@ impl Render for Root {
     }
 }
 
+#[allow(dead_code)]
 fn render_top_bar(
     s: &AppState,
     on_palette: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,

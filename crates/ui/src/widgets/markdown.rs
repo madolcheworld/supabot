@@ -334,7 +334,7 @@ fn render_block(block: &MdBlock, ids: &mut usize) -> Div {
                 .font_weight(FontWeight::BOLD)
                 .text_color(rgb(theme::TEXT))
         }
-        MdBlock::Paragraph { spans } => inline_row(spans, ids).text_color(rgb(theme::TEXT)),
+        MdBlock::Paragraph { spans } => inline_row(spans, ids),
         MdBlock::Code { text, .. } => div().w_full().child(
             div()
                 .id(next_id(ids, "md-code-block"))

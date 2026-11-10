@@ -19,7 +19,7 @@ use crate::actions::{SelectNext, SelectPrev, Send as SendAction};
 use crate::proto::Command;
 use crate::state::AppState;
 use crate::theme;
-use crate::widgets::bits::{self, Tone};
+use crate::widgets::bits;
 use crate::widgets::text_input::TextInput;
 
 /// The `@token` currently being typed, if the caret sits in one. Returns the byte
@@ -130,7 +130,7 @@ impl Composer {
     pub fn new(state: Entity<AppState>, commands: Sender<Command>, cx: &mut Context<Self>) -> Self {
         let disabled = !state.read(cx).conn.is_online();
         let input = cx.new(|cx| {
-            TextInput::new("Message…  ( @ to mention )", cx)
+            TextInput::new("Message Waypoint", cx)
                 .multiline()
                 .disabled(disabled)
         });
@@ -299,7 +299,7 @@ impl Composer {
 
 impl gpui::Render for Composer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (online, reason) = {
+        let (online, _reason) = {
             let s = self.state.read(cx);
             (s.conn.is_online(), s.conn.label())
         };
@@ -313,10 +313,10 @@ impl gpui::Render for Composer {
             .flex()
             .flex_col()
             .gap_1()
-            .border_t_1()
-            .border_color(rgb(theme::BORDER))
-            .bg(rgb(theme::SURFACE))
-            .p_2();
+            .bg(rgb(theme::BACKGROUND))
+            .px_4()
+            .pb_4()
+            .pt_1();
 
         // Mention picker, above the field.
         if let Some(picker) = &self.picker {
@@ -325,10 +325,10 @@ impl gpui::Render for Composer {
                 .w_full()
                 .max_h(px(180.0))
                 .overflow_y_scroll()
-                .rounded_md()
+                .rounded_xl()
                 .border_1()
-                .border_color(rgb(theme::ACCENT))
-                .bg(rgb(theme::SURFACE_RAISED))
+                .border_color(rgb(theme::BORDER))
+                .bg(rgb(0xffffff))
                 .p_1()
                 .flex()
                 .flex_col()
@@ -352,20 +352,20 @@ impl gpui::Render for Composer {
                         .gap_2()
                         .px_2()
                         .py_1()
-                        .rounded_sm()
+                        .rounded_lg()
                         .cursor_pointer()
-                        .when(selected, |d| d.bg(rgb(theme::ACCENT)))
-                        .child(bits::avatar(color, bits::initial(&label), px(18.0)))
+                        .when(selected, |d| d.bg(rgb(theme::SURFACE_RAISED)))
+                        .child(bits::avatar(color, bits::initial(&label), px(20.0)))
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(rgb(if selected { 0xffffff } else { theme::TEXT }))
+                                .text_color(rgb(theme::TEXT))
                                 .child(format!("@{}", bot.map(|b| b.name).unwrap_or_default())),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(if selected { 0xdfe7ff } else { theme::TEXT_DIM }))
+                                .text_color(rgb(theme::TEXT_MUTED))
                                 .child(label),
                         ),
                 );
@@ -373,43 +373,61 @@ impl gpui::Render for Composer {
             body = body.child(popup);
         }
 
-        body = body.child(self.input.clone());
+        // Floating rounded pill bar matching screenshot
+        let pill = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2p5()
+            .py_1p5()
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb(0xffffff))
+            .child(
+                // Left circular + button
+                div()
+                    .size(px(30.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(rgb(0xf3f4f6))
+                    .cursor_pointer()
+                    .hover(|h| h.bg(rgb(0xe5e7eb)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .text_lg()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child("+"),
+            )
+            .child(
+                // Center text input field
+                div().flex_1().min_w_0().px_1().child(self.input.clone()),
+            )
+            .child(
+                // Right circular black microphone / send button
+                div()
+                    .id("composer-send")
+                    .size(px(30.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(rgb(0x000000))
+                    .cursor_pointer()
+                    .hover(|h| h.bg(rgb(0x222222)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(0xffffff))
+                    .text_xs()
+                    .child(if online { "🎤" } else { "✕" })
+                    .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                        this.send_now(cx);
+                    })),
+            );
 
-        // Footer: hints, or the offline reason, plus Send.
-        let footer = if online {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_DIM))
-                        .child("Enter sends · Shift+Enter newline · @ mentions"),
-                )
-                .child(
-                    bits::button("Send", Tone::Primary)
-                        .id("composer-send")
-                        .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
-                            this.send_now(cx);
-                        })),
-                )
-        } else {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .text_xs()
-                        .text_color(rgb(theme::DANGER))
-                        .child(format!("disabled — {reason}")),
-                )
-                .child(bits::disabled_button("Send"))
-        };
-        body.child(footer)
+        body.child(pill)
     }
 }
 

@@ -12,36 +12,42 @@
 use gpui::{Hsla, Rgba, rgb};
 use swarmbot_contracts::Bot;
 
-/// Main pane background (`#1b1d21`).
-pub const BACKGROUND: u32 = 0x1b1d21;
-/// Sidebar / recessed surface (`#15171a`).
-pub const SURFACE: u32 = 0x15171a;
-/// A raised card surface, between `SURFACE` and `BACKGROUND`.
-pub const SURFACE_RAISED: u32 = 0x20242a;
-/// Separators and hairline borders (`#2a2d33`).
-pub const BORDER: u32 = 0x2a2d33;
-/// Primary text (`#e6e6e6`).
-pub const TEXT: u32 = 0xe6e6e6;
-/// Secondary text and labels (`#8b9099`).
-pub const TEXT_MUTED: u32 = 0x8b9099;
-/// Status text, timestamps (`#6c737d`).
-pub const TEXT_DIM: u32 = 0x6c737d;
-/// Primary action / accent (`#2f6fdb`).
-pub const ACCENT: u32 = 0x2f6fdb;
-/// Accent hover, a little lighter.
-pub const ACCENT_HOVER: u32 = 0x3d7ff0;
-/// Destructive / error / denied.
-pub const DANGER: u32 = 0xe5484d;
-/// Success / online / allow.
-pub const SUCCESS: u32 = 0x30a46c;
-/// Warning / queued / expiry soon.
-pub const WARNING: u32 = 0xf5a524;
-/// Owner bubble background (the human's own messages).
-pub const OWNER_BUBBLE: u32 = 0x2b3a55;
-/// Bot bubble background (a neutral slate the author colour tints).
-pub const BOT_BUBBLE: u32 = 0x23272e;
+/// Main pane background (`#ffffff`).
+pub const BACKGROUND: u32 = 0xffffff;
+/// Sidebar / recessed surface (`#f7f7f8`).
+pub const SURFACE: u32 = 0xf7f7f8;
+/// A raised card surface, between `SURFACE` and `BACKGROUND` (`#ececee`).
+pub const SURFACE_RAISED: u32 = 0xececee;
+/// Separators and hairline borders (`#e5e7eb`).
+pub const BORDER: u32 = 0xe5e7eb;
+/// Primary text (`#111827`).
+pub const TEXT: u32 = 0x111827;
+/// Secondary text and labels (`#6b7280`).
+pub const TEXT_MUTED: u32 = 0x6b7280;
+/// Status text, timestamps (`#9ca3af`).
+pub const TEXT_DIM: u32 = 0x9ca3af;
+/// Primary action / accent (`#2563eb`).
+pub const ACCENT: u32 = 0x2563eb;
+/// Accent hover, a little darker.
+pub const ACCENT_HOVER: u32 = 0x1d4ed8;
+/// Destructive / error / denied (`#ef4444`).
+pub const DANGER: u32 = 0xef4444;
+/// Success / online / allow (`#10b981`).
+pub const SUCCESS: u32 = 0x10b981;
+/// Warning / queued / expiry soon (`#f59e0b`).
+pub const WARNING: u32 = 0xf59e0b;
+/// Owner bubble background (solid black `#000000` like in the screenshot).
+pub const OWNER_BUBBLE: u32 = 0x000000;
+/// Bot bubble background (a clean soft grey `#f3f4f6`).
+pub const BOT_BUBBLE: u32 = 0xf3f4f6;
 /// Monospace code / tool-output background.
-pub const CODE_BG: u32 = 0x111318;
+pub const CODE_BG: u32 = 0xf3f4f6;
+/// Soft red/blush alert banner background (`#fef2f2`).
+pub const NOTICE_ERROR_BG: u32 = 0xfef2f2;
+/// Soft red/blush alert banner border (`#fecdd3`).
+pub const NOTICE_ERROR_BORDER: u32 = 0xfecdd3;
+/// Soft red/blush alert banner text (`#991b1b`).
+pub const NOTICE_ERROR_FG: u32 = 0x991b1b;
 
 /// Parse a `#rrggbb` (or `rrggbb`) string into a GPUI [`Rgba`].
 ///
@@ -126,8 +132,8 @@ pub mod space {
     pub const SM: Pixels = px(8.0);
     pub const MD: Pixels = px(12.0);
     pub const LG: Pixels = px(16.0);
-    pub const SIDEBAR_W: Pixels = px(248.0);
+    pub const SIDEBAR_W: Pixels = px(280.0);
     pub const GRAPH_W: Pixels = px(320.0);
-    pub const AVATAR: Pixels = px(26.0);
-    pub const HEADER_H: Pixels = px(52.0);
+    pub const AVATAR: Pixels = px(32.0);
+    pub const HEADER_H: Pixels = px(56.0);
 }

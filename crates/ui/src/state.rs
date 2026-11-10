@@ -187,7 +187,7 @@ impl AppState {
             screen: Screen::default(),
             open_conversation: None,
             open_task: None,
-            graph_open: false,
+            graph_open: true,
             palette_open: false,
             needs_login: false,
             login_error: None,

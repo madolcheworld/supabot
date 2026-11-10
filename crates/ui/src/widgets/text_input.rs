@@ -32,8 +32,8 @@ use crate::actions::{
 use crate::theme;
 
 /// Caret colour, and the selection highlight base (drawn at reduced opacity).
-const CARET: u32 = 0xf0f0f0;
-const SELECTION_BG: u32 = 0x2f6fdb;
+const CARET: u32 = 0x111827;
+const SELECTION_BG: u32 = 0xbfdbfe;
 /// The bullet a `secure` field shows per character (U+2022, 3 bytes in UTF-8).
 const MASK: char = '\u{2022}';
 const MASK_LEN: usize = 3;

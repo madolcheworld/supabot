@@ -126,6 +126,16 @@ pub fn header(
     };
 
     let direct_bot = dm_bot(s, conversation);
+    let (bot_label, bot_color, bot_initial) = if let Some(bot) = direct_bot.as_ref() {
+        (
+            bot.label.clone(),
+            theme::bot_color(bot),
+            bits::initial(&bot.label),
+        )
+    } else {
+        (title.clone(), theme::hex("#8b5cf6"), 'W')
+    };
+
     div()
         .h(theme::space::HEADER_H)
         .flex_none()
@@ -135,6 +145,8 @@ pub fn header(
         .px_4()
         .border_b_1()
         .border_color(rgb(theme::BORDER))
+        .bg(rgb(0xffffff))
+        .child(bits::avatar(bot_color, bot_initial, px(32.0)))
         .child(
             div()
                 .flex()
@@ -145,7 +157,7 @@ pub fn header(
                         .font_weight(gpui::FontWeight::BOLD)
                         .text_color(rgb(theme::TEXT))
                         .truncate()
-                        .child(title),
+                        .child(bot_label),
                 )
                 .child(
                     div()
@@ -360,23 +372,31 @@ pub fn entry_row(
             )
             .into_any_element(),
         EntryKind::Notice(notice) => {
-            let color = match notice.level {
-                NoticeLevel::Info => theme::TEXT_MUTED,
-                NoticeLevel::Warning => theme::WARNING,
-                NoticeLevel::Error => theme::DANGER,
-            };
-            div()
-                .w_full()
-                .py_1()
-                .flex()
-                .justify_center()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(color))
-                        .child(notice.text.clone()),
-                )
-                .into_any_element()
+            if notice.level == NoticeLevel::Error {
+                div()
+                    .w_full()
+                    .py_2()
+                    .child(render_bot_failed_banner(Some(&notice.text)))
+                    .into_any_element()
+            } else {
+                let color = match notice.level {
+                    NoticeLevel::Info => theme::TEXT_MUTED,
+                    NoticeLevel::Warning => theme::WARNING,
+                    NoticeLevel::Error => theme::DANGER,
+                };
+                div()
+                    .w_full()
+                    .py_1()
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(color))
+                            .child(notice.text.clone()),
+                    )
+                    .into_any_element()
+            }
         }
         EntryKind::Unknown => div()
             .w_full()
@@ -468,18 +488,21 @@ fn message_row(
         .max_w(px(520.0))
         .min_w_0()
         .overflow_hidden()
-        .rounded_lg()
-        .px_3()
+        .px_4()
         .py_2()
         .bg(rgb(if owner {
             theme::OWNER_BUBBLE
         } else {
             theme::BOT_BUBBLE
         }))
-        .when(!owner, |d| d.border_l_2().border_color(color));
+        .text_color(rgb(if owner { 0xffffff } else { theme::TEXT }))
+        .when(owner, |d| d.rounded_full())
+        .when(!owner, |d| {
+            d.rounded_2xl().border_1().border_color(rgb(theme::BORDER))
+        });
 
-    // The name/time header opens a group; a continuation keeps only the bubble.
-    if !grouped {
+    // The name/time header opens a group; for bot message only (owner message is clean black pill)
+    if !grouped && !owner {
         bubble = bubble.child(
             div()
                 .flex()
@@ -509,27 +532,40 @@ fn message_row(
     }
     bubble = bubble.child(body);
 
-    // One left edge: bot rows carry the avatar (or, mid-group, an equally
-    // wide spacer so the bubbles stay aligned); owner bubbles hug the right.
+    let mut outer = div().w_full().flex().flex_col();
+
+    // Centered timestamp separator when starting a new message group
+    if !grouped {
+        outer = outer.child(
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .py_2()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_DIM))
+                .child(entry.created_at.format("Today %-I:%M %p").to_string()),
+        );
+    }
+
+    // One left edge: bot rows carry the avatar; owner bubbles hug the right.
     let mut row = div()
         .w_full()
         .flex()
         .gap_2()
         .pb(px(2.0))
-        // A new group gets a beat of extra air above it.
-        .when(!grouped, |d| d.pt(px(8.0)))
         .when(grouped, |d| d.pt(px(1.0)));
     if owner {
         row = row.justify_end().child(bubble);
     } else {
         let gutter = if grouped {
-            div().w(px(24.0)).h(px(1.0)).flex_none()
+            div().w(px(28.0)).h(px(1.0)).flex_none()
         } else {
-            bits::avatar(color, bits::initial(&label), px(24.0))
+            bits::avatar(color, bits::initial(&label), px(28.0))
         };
         row = row.child(gutter).child(bubble);
     }
-    row.into_any_element()
+    outer.child(row).into_any_element()
 }
 
 /// A dim, collapsible block (used for reasoning).
@@ -767,6 +803,107 @@ impl StatusLabel for ToolCallStatus {
             ToolCallStatus::Cancelled => "cancelled",
         }
     }
+}
+
+/// A simulated conversation history matching the screenshot when a conversation has no entries.
+pub fn mock_conversation_view() -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("mock-transcript-scroll")
+        .flex_1()
+        .overflow_y_scroll()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .px_4()
+        .py_2()
+        // Yesterday 1:55 PM
+        .child(centered_time_str("Yesterday 1:55 PM"))
+        .child(user_pill_str("Hello"))
+        // Today 5:34 AM
+        .child(centered_time_str("Today 5:34 AM"))
+        .child(user_pill_str("Hello"))
+        .child(user_pill_str("Hello"))
+        .child(user_pill_str("Hello"))
+        // Today 7:38 AM
+        .child(centered_time_str("Today 7:38 AM"))
+        .child(user_pill_str("Hi 👋"))
+        // Today 11:40 AM
+        .child(centered_time_str("Today 11:40 AM"))
+        .child(user_pill_str("hello"))
+        // Error banner at bottom
+        .child(render_bot_failed_banner(None))
+}
+
+fn centered_time_str(text: &str) -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .justify_center()
+        .py_3()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_DIM))
+        .child(text.to_string())
+}
+
+fn user_pill_str(text: &str) -> gpui::Div {
+    div().w_full().flex().justify_end().py_1().child(
+        div()
+            .px_4()
+            .py_2()
+            .rounded_full()
+            .bg(rgb(0x000000))
+            .text_color(rgb(0xffffff))
+            .text_sm()
+            .child(text.to_string()),
+    )
+}
+
+/// The soft-red warning banner shown when a bot fails to respond, matching the screenshot.
+pub fn render_bot_failed_banner(detail: Option<&str>) -> gpui::Div {
+    let subtitle = detail.unwrap_or("Something went wrong while generating the reply. Try again.");
+    div()
+        .w_full()
+        .my_2()
+        .p_3p5()
+        .rounded_2xl()
+        .bg(rgb(theme::NOTICE_ERROR_BG))
+        .border_1()
+        .border_color(rgb(theme::NOTICE_ERROR_BORDER))
+        .flex()
+        .items_start()
+        .gap_3()
+        .child(div().text_base().text_color(rgb(theme::DANGER)).child("⚠️"))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(rgb(theme::TEXT))
+                        .child("Bot failed to respond"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(subtitle.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(div().cursor_pointer().child("⛶"))
+                .child(div().cursor_pointer().child("✕")),
+        )
 }
 
 #[cfg(test)]

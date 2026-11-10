@@ -68,21 +68,110 @@ pub fn disabled_button(label: &str) -> Div {
         .child(label.to_string())
 }
 
-/// An avatar tile: a rounded colour square with the bot's initial.
+/// An avatar tile: a rounded squircle with cute bot eyes or initials.
 pub fn avatar(color: Rgba, initial: char, size: Pixels) -> Div {
-    let font = size * 0.52;
+    let font = size * 0.46;
+    let eye_size = (size * 0.12).max(px(3.0));
+    let eye_gap = (size * 0.16).max(px(4.0));
+
+    if initial == 'X' || initial == 'x' {
+        div()
+            .size(size)
+            .flex_none()
+            .rounded_full()
+            .bg(rgb(0x111111))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(font)
+            .font_weight(FontWeight::BOLD)
+            .text_color(rgb(0xffffff))
+            .child("✕")
+    } else if initial == '?' {
+        div()
+            .size(size)
+            .flex_none()
+            .rounded_xl()
+            .bg(color)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(font)
+            .font_weight(FontWeight::BOLD)
+            .text_color(rgb(0xffffff))
+            .child("?")
+    } else {
+        // Cute bot squircle face with two bright white cartoon eyes
+        div()
+            .size(size)
+            .flex_none()
+            .rounded_xl()
+            .bg(color)
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(eye_gap)
+            .child(div().size(eye_size).rounded_full().bg(rgb(0xffffff)))
+            .child(div().size(eye_size).rounded_full().bg(rgb(0xffffff)))
+    }
+}
+
+/// A circular user avatar with initials (e.g. "GT").
+pub fn user_avatar(initials: &str, size: Pixels) -> Div {
     div()
         .size(size)
         .flex_none()
-        .rounded_md()
-        .bg(color)
+        .rounded_full()
+        .bg(rgb(0xe5e7eb))
         .flex()
         .items_center()
         .justify_center()
-        .text_size(font)
+        .text_size(size * 0.44)
         .font_weight(FontWeight::BOLD)
-        .text_color(rgb(0x101216))
-        .child(initial.to_string())
+        .text_color(rgb(0x374151))
+        .child(initials.to_string())
+}
+
+/// A computer monitor icon for the bot screen card.
+pub fn monitor_icon() -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .child(
+            div()
+                .w(px(32.0))
+                .h(px(22.0))
+                .rounded_sm()
+                .border_2()
+                .border_color(rgb(0x9ca3af))
+                .bg(rgb(0xffffff)),
+        )
+        .child(div().w(px(4.0)).h(px(4.0)).bg(rgb(0x9ca3af)))
+        .child(
+            div()
+                .w(px(16.0))
+                .h(px(2.0))
+                .rounded_full()
+                .bg(rgb(0x9ca3af)),
+        )
+}
+
+/// A circular green checkmark/clock icon for routines.
+pub fn routine_icon() -> Div {
+    div()
+        .size(px(16.0))
+        .flex_none()
+        .rounded_full()
+        .border_1()
+        .border_color(rgb(0x10b981))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(9.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(rgb(0x10b981))
+        .child("✓")
 }
 
 /// A small round status dot (online/offline, presence).

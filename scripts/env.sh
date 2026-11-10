@@ -13,7 +13,7 @@ set -euo pipefail
 # (`cp -a --reflink=auto`), so nothing is re-downloaded and the original stays
 # untouched (copy-on-write). Remove this line to use the global ~/.cargo.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export CARGO_HOME="${CARGO_HOME:-$ROOT/.cargo-home}"
+export CARGO_HOME="$ROOT/.cargo-home"
 
 export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib64}"
 
