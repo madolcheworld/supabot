@@ -626,6 +626,29 @@ impl Rig {
             .expect("the transcript reads")
     }
 
+    /// Wait until the conversation transcript matches a predicate, or panic with `desc`.
+    async fn wait_for_transcript<F>(
+        &self,
+        dm: &ConversationId,
+        desc: &str,
+        predicate: F,
+    ) -> Vec<Entry>
+    where
+        F: Fn(&[Entry]) -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + BUDGET;
+        loop {
+            let entries = self.entries(dm);
+            if predicate(&entries) {
+                return entries;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("transcript never satisfied `{desc}` within {BUDGET:?}: {entries:?}");
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     // -- the node's audit log -------------------------------------------------
 
     /// `<tmp>/node/audit/<node id>.jsonl`, once it holds at least `count`
@@ -901,9 +924,18 @@ async fn the_nodes_own_never_ceiling_refuses_what_the_brain_allowed() {
     fake.push_turn(ScriptedTurn::text("done"));
     rig.send_message(&dm, &bot, "read marker.txt, then cat it")
         .await;
+    let entries = rig
+        .wait_for_transcript(&dm, "read_file completed and shell finished", |entries| {
+            let read_ok = entries.iter().any(|e| {
+                matches!(&e.kind, EntryKind::ToolCall(c) if c.tool == "read_file" && c.status == ToolCallStatus::Completed)
+            });
+            let shell_done = entries.iter().any(|e| {
+                matches!(&e.kind, EntryKind::ToolCall(c) if c.tool == "shell" && c.status != ToolCallStatus::Running)
+            });
+            read_ok && shell_done
+        })
+        .await;
     rig.settle().await;
-
-    let entries = rig.entries(&dm);
 
     // `read_file` still crosses and completes: the refusal is per-surface, on
     // the same socket, in the same turn.

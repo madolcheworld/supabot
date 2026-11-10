@@ -19,8 +19,6 @@ pub fn render(
     _routine_prompt: &Entity<TextInput>,
 ) -> gpui::Div {
     let state_toggle = state.clone();
-    let state_settings = state.clone();
-    let commands_settings = commands.clone();
 
     // Determine target bot name
     let bot_name = if let Some(conv) = s.open_conversation() {
@@ -44,7 +42,7 @@ pub fn render(
         .bg(rgb(0xffffff))
         .border_l_1()
         .border_color(rgb(theme::BORDER))
-        // 1. Top action & window controls
+        // 1. Top action bar: toggle sidebar button
         .child(
             div()
                 .h(theme::space::HEADER_H)
@@ -52,58 +50,21 @@ pub fn render(
                 .flex()
                 .items_center()
                 .justify_end()
-                .gap_3()
                 .px_4()
-                // Settings gear
-                .child(
-                    div()
-                        .id("settings-btn")
-                        .cursor_pointer()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .text_base()
-                        .hover(|h| h.text_color(rgb(theme::TEXT)))
-                        .child("⚙")
-                        .on_click(move |_, _, cx: &mut gpui::App| {
-                            state_settings.update(cx, |st, cx| {
-                                st.screen = if st.screen == Screen::Settings {
-                                    Screen::Conversation
-                                } else {
-                                    Screen::Settings
-                                };
-                                cx.notify();
-                            });
-                            let _ = commands_settings.send(Command::FetchSettings);
-                        }),
-                )
-                // Sidebar collapse icon
                 .child(
                     div()
                         .id("collapse-btn")
                         .cursor_pointer()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .hover(|h| h.text_color(rgb(theme::TEXT)))
-                        .child(">> |")
+                        .p_1()
+                        .rounded_md()
+                        .hover(|h| h.bg(rgb(theme::SURFACE_RAISED)))
+                        .child(bits::sidebar_icon(true))
                         .on_click(move |_, _, cx: &mut gpui::App| {
                             state_toggle.update(cx, |st, cx| {
                                 st.graph_open = false;
                                 cx.notify();
                             });
                         }),
-                )
-                .child(div().h(px(14.0)).w(px(1.0)).bg(rgb(theme::BORDER)))
-                // Window controls: minimize, maximize, close
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .text_sm()
-                        .child(div().cursor_pointer().child("—"))
-                        .child(div().cursor_pointer().child("□"))
-                        .child(div().cursor_pointer().child("✕")),
                 ),
         )
         // 2. Scrollable content: Bot Screen Card + Routines Section

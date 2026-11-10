@@ -109,6 +109,17 @@ async fn internal_listener_health_check() {
     assert_eq!(val["version"], json!(env!("CARGO_PKG_VERSION")));
 }
 
+#[tokio::test]
+async fn internal_listener_writes_mcp_config_file() {
+    let brain = RunningInternalBrain::start().await;
+    let mcp_cfg_path = brain._tempdir.path().join("swarmbot-mcp.json");
+    assert!(mcp_cfg_path.exists(), "mcp config file should be written");
+    let content = std::fs::read_to_string(&mcp_cfg_path).expect("read mcp config");
+    let val: Value = serde_json::from_str(&content).expect("parse mcp config json");
+    let expected_url = brain.url("/mcp");
+    assert_eq!(val["mcpServers"]["swarmbot"]["url"], json!(expected_url));
+}
+
 fn parse_sse_or_json(text: &str) -> Value {
     if text.contains("data:") {
         for line in text.lines() {

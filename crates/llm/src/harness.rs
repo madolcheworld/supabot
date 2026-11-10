@@ -234,8 +234,18 @@ impl LlmBackend for ClaudeCli {
             cmd.arg("--resume").arg(sid);
         }
 
-        if self.spec.option_str("mcp_config_path").is_some() || self.mcp_config_path.exists() {
-            cmd.arg("--mcp-config").arg(&self.mcp_config_path);
+        let mcp_cfg =
+            if self.spec.option_str("mcp_config_path").is_some() || self.mcp_config_path.exists() {
+                Some(self.mcp_config_path.clone())
+            } else if let Some(data_dir) = self.spec.option_str("data_dir").map(PathBuf::from)
+                && data_dir.join("swarmbot-mcp.json").exists()
+            {
+                Some(data_dir.join("swarmbot-mcp.json"))
+            } else {
+                None
+            };
+        if let Some(ref path) = mcp_cfg {
+            cmd.arg("--mcp-config").arg(path);
         }
 
         let model = if !request.model.trim().is_empty() && request.model != "default" {

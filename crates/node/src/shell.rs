@@ -1,38 +1,22 @@
 //! The streaming `shell.exec` runner, and the process-group bookkeeping that
 //! makes "nothing survives the call" true on a socket.
 //!
-//! # Why this is not `LocalExecutor`
+//! # Relationship with `swarmbot_tools`
 //!
 //! Every `fs.*` call in this crate goes through [`swarmbot_tools::LocalExecutor`]
-//! so the local and remote paths cannot drift. `shell.exec` cannot: the
-//! executor answers with **one** buffered [`ToolResult`](swarmbot_contracts::ToolResult)
-//! (`exit=<code>` plus stdout/stderr sections), and a socket needs incremental
-//! chunks, a real pid and a real process-group id in `Started`, and an `Exit`
-//! chunk that says how the run ended. The implementation function that does the
-//! work, `swarmbot_tools::handlers::shell::exec_shell`, is `pub(crate)`, so it
-//! cannot be called from here.
+//! so the local and remote paths cannot drift. `shell.exec` streams incremental
+//! chunks over the wire, and both sides now share the same process-spawning
+//! invariants, environment scrubbing allowlist, and process group lifecycle
+//! from [`swarmbot_tools::handlers::shell`]:
 //!
-//! [`run_streaming`] therefore mirrors it, and **these are the things that must
-//! stay in sync** if either side changes:
+//! 1. `build_shell_command` (`sh -c <command>` with `stdin` null, both output pipes captured,
+//!    `process_group(0)`, `kill_on_drop(true)`);
+//! 2. `ENV_ALLOWLIST` and fallback `PATH`;
+//! 3. `kill_process_group` and `process_group_gone`;
+//! 4. `EXIT_GRACE`, `DRAIN_TIMEOUT`, and `SETTLE` timing constants;
+//! 5. `DEFAULT_SHELL_TIMEOUT_MS`, `MAX_SHELL_TIMEOUT_MS`, and `SHELL_OUTPUT_LIMIT_BYTES`.
 //!
-//! 1. `sh -c <command>` with `stdin` null and both output pipes captured;
-//! 2. `process_group(0)` **and** `kill_on_drop(true)` — one `killpg` then
-//!    reaches every grandchild, and the child dies even if this process panics
-//!    between spawn and the explicit kill (decision D5.6);
-//! 3. the environment is cleared, then re-filled from the same allowlist
-//!    ([`ENV_ALLOWLIST`]) plus a fallback `PATH`, then the caller's explicit
-//!    `env` (decision D5.7 — the node process inherits the owner's shell
-//!    profile and possibly secrets, and a model-typed command line must not be
-//!    one `env` away from them);
-//! 4. the timeout is clamped to `1..=MAX_SHELL_TIMEOUT_MS`, and a timeout,
-//!    an interrupt or a dead socket kills the **group**, not just the leader;
-//! 5. after a normal exit, background children holding the pipes open get a
-//!    short grace period and are then killed, because a call that returns must
-//!    not leave anything attached to it;
-//! 6. output is capped per stream ([`SHELL_OUTPUT_LIMIT_BYTES`]); what exceeds
-//!    the cap is spilled to a file instead of vanishing.
-//!
-//! What is genuinely new here is the wire half: chunks through a
+//! What is wire-specific here is the streaming half: chunks through a
 //! [`ChunkSink`](swarmbot_node_protocol::ChunkSink), whose `send` awaits the brain's Ack
 //! and is therefore the back-pressure that keeps a chatty command from
 //! outrunning the socket; one emitter task, because the mux allows a single
@@ -52,7 +36,6 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -67,72 +50,17 @@ use tokio_util::sync::CancellationToken;
 use swarmbot_node_protocol::rpc::{OutputStream, ShellChunk};
 use swarmbot_node_protocol::{ChunkSink, ProtocolError};
 
-/// Re-exported from `swarmbot_tools` so the two shells cannot disagree about
-/// how long a bot command may run.
-pub use swarmbot_tools::handlers::shell::{DEFAULT_SHELL_TIMEOUT_MS, MAX_SHELL_TIMEOUT_MS};
+/// Re-exported from `swarmbot_tools` so the daemon and local runner share
+/// identical execution and process isolation primitives.
+pub use swarmbot_tools::handlers::shell::{
+    DEFAULT_SHELL_TIMEOUT_MS, DRAIN_TIMEOUT, ENV_ALLOWLIST, EXIT_GRACE, FALLBACK_PATH,
+    MAX_SHELL_TIMEOUT_MS, SETTLE, build_shell_command, kill_process_group, process_group_gone,
+};
 
-/// The only variables a child inherits, plus whatever the caller passed
-/// explicitly. Must match `swarmbot_tools::handlers::shell::ENV_ALLOWLIST`,
-/// which is private there; see the module docs, item 3.
-pub const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"];
-
-/// `PATH` for a daemon started from init, which exports none: without it even
-/// `ls` fails and the model cannot diagnose why.
-pub const FALLBACK_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-
-/// After a *normal* exit, this long for background children to release the
-/// pipes before the group is killed.
-const EXIT_GRACE: Duration = Duration::from_millis(500);
-/// After a kill, this long for the pumps to observe EOF.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-/// After killing a group whose pipes were held open, let the pumps flush.
-const SETTLE: Duration = Duration::from_millis(200);
 /// Un-forwarded chunks allowed between the pumps and the emitter. Small on
 /// purpose: the emitter awaits the brain's Ack per chunk, so a large buffer
 /// would only move the back-pressure into memory.
 const EMIT_QUEUE: usize = 32;
-
-/// Kill a whole process group. Returns `true` when the group is gone
-/// afterwards, which includes "was already gone" (`ESRCH`) — the outcome the
-/// caller wanted either way.
-pub fn kill_process_group(pgid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pgid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: `killpg` only signals processes in the named group, and the id
-    // came from a child this process spawned with `process_group(0)`.
-    let rc = unsafe { libc::killpg(pid, libc::SIGKILL) };
-    if rc == 0 {
-        return true;
-    }
-    let errno = std::io::Error::last_os_error();
-    if errno.raw_os_error() == Some(libc::ESRCH) {
-        // Already empty: the goal, not a failure.
-        return true;
-    }
-    tracing::warn!(pgid, %errno, "killpg failed; the process group may still be running");
-    false
-}
-
-/// Is a process group gone? `killpg(pgid, 0)` answering `ESRCH` — the check the
-/// tests use and the one an operator would run.
-pub fn process_group_gone(pgid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pgid) else {
-        return true;
-    };
-    if pid <= 0 {
-        return true;
-    }
-    // SAFETY: signal 0 performs no action; it only sets errno.
-    let rc = unsafe { libc::killpg(pid, 0) };
-    if rc == 0 {
-        return false;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-}
 
 /// Every process group this node has started, so a shutdown can kill them all
 /// even if a handler's future was leaked rather than dropped.
@@ -384,27 +312,7 @@ pub async fn run_streaming(
         options.output_limit_bytes
     };
 
-    let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
-    cmd.env_clear();
-    for key in ENV_ALLOWLIST {
-        if let Ok(value) = std::env::var(key) {
-            cmd.env(key, value);
-        }
-    }
-    if std::env::var_os("PATH").is_none() {
-        cmd.env("PATH", FALLBACK_PATH);
-    }
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
+    let mut cmd = build_shell_command(command, cwd, env);
 
     let mut child = cmd.spawn().map_err(|error| ShellFailure::Spawn {
         reason: format!("(cwd {}): {error}", cwd.display()),

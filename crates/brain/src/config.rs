@@ -84,6 +84,11 @@ impl Paths {
     pub fn audit(&self) -> PathBuf {
         self.root.join("audit")
     }
+
+    /// The MCP server configuration file for Claude CLI or ACP harnesses.
+    pub fn mcp_config(&self) -> PathBuf {
+        self.root.join("swarmbot-mcp.json")
+    }
 }
 
 /// The daemon's command line.

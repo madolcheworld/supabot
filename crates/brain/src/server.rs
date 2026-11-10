@@ -294,6 +294,7 @@ pub async fn serve(
         tokio::spawn(async move {
             if let Ok(addr) = listener.local_addr() {
                 info!(listener = %addr, "the internal listener is up: the MCP gateway");
+                write_mcp_config(&serving.config.paths, &addr);
             }
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move { serving.wait_for_shutdown().await })
@@ -326,6 +327,29 @@ pub async fn serve(
         "the listeners have stopped"
     );
     Ok(())
+}
+
+/// Write the MCP client configuration file for CLI harnesses on this machine.
+fn write_mcp_config(paths: &crate::config::Paths, addr: &std::net::SocketAddr) {
+    let mcp_url = format!("http://{addr}/mcp");
+    let json_val = serde_json::json!({
+        "mcpServers": {
+            "swarmbot": {
+                "url": mcp_url
+            }
+        }
+    });
+    let target = paths.mcp_config();
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_string_pretty(&json_val) {
+        if let Err(err) = std::fs::write(&target, content) {
+            debug!(path = %target.display(), %err, "could not write MCP config file");
+        } else {
+            info!(path = %target.display(), "wrote MCP harness configuration");
+        }
+    }
 }
 
 /// Wait for the first stop request: a signal, or the API's shutdown flag.

@@ -46,21 +46,21 @@ pub const MAX_SHELL_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 
 /// The only variables a child inherits. Everything else — API keys, node
 /// keys, `DATABASE_URL`, the owner's shell profile — stays in the brain.
-const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"];
+pub const ENV_ALLOWLIST: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"];
 
 /// `PATH` for processes that do not export one (daemons started from init):
 /// without it even `ls` would fail and the model could not diagnose why.
-const FALLBACK_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub const FALLBACK_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// After a *normal* exit, give background children this long to release the
 /// output pipes before the group is killed (see the module docs).
-const EXIT_GRACE: Duration = Duration::from_millis(500);
+pub const EXIT_GRACE: Duration = Duration::from_millis(500);
 /// After a kill, this long for the readers to see EOF before we take whatever
 /// they captured so far.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// After killing a group whose pipes were held open, let the pumps finish
 /// flushing into the shared captures before snapshotting.
-const SETTLE: Duration = Duration::from_millis(200);
+pub const SETTLE: Duration = Duration::from_millis(200);
 
 pub fn spec() -> ToolSpec {
     ToolSpec::new(
@@ -236,52 +236,61 @@ async fn pump<R: AsyncRead + Unpin + 'static>(mut reader: R, sink: Arc<Capture>)
     }
 }
 
-/// Kill the child's whole process group. `pid` is the group id because the
-/// child was spawned with `process_group(0)`.
-fn kill_group(pid: Option<u32>) {
+/// Kill a whole process group. Returns `true` when the group is gone
+/// afterwards, which includes "was already gone" (`ESRCH`) — the outcome the
+/// caller wanted either way.
+pub fn kill_process_group(pgid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pgid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
-    let Some(pid) = pid else { return };
-    let Ok(pgid) = i32::try_from(pid) else {
-        return;
-    };
-    if let Err(error) = killpg(Pid::from_raw(pgid), Signal::SIGKILL) {
-        // ESRCH just means the group is already gone — the outcome we want.
-        tracing::debug!(pid, %error, "killpg: process group already gone");
+    match killpg(Pid::from_raw(pid), Signal::SIGKILL) {
+        Ok(_) => true,
+        Err(nix::errno::Errno::ESRCH) => true,
+        Err(error) => {
+            tracing::warn!(pgid, %error, "killpg failed; process group may still be running");
+            false
+        }
     }
 }
 
-/// Await both pumps, tolerating already-finished or absent tasks.
-async fn join_pumps(stdout: Option<JoinHandle<()>>, stderr: Option<JoinHandle<()>>) {
-    let left = async {
-        if let Some(task) = stdout {
-            let _ = task.await;
-        }
+/// Is a process group gone? `killpg(pgid, 0)` answering `ESRCH` — the check the
+/// tests use and the one an operator would run.
+pub fn process_group_gone(pgid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pgid) else {
+        return true;
     };
-    let right = async {
-        if let Some(task) = stderr {
-            let _ = task.await;
-        }
-    };
-    tokio::join!(left, right);
+    if pid <= 0 {
+        return true;
+    }
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+    match killpg(Pid::from_raw(pid), None) {
+        Ok(_) => false,
+        Err(nix::errno::Errno::ESRCH) => true,
+        Err(_) => false,
+    }
 }
 
-/// The shared implementation, used by the handler (local node) and by
-/// [`crate::LocalExecutor`] (node daemon) so both behave identically.
-/// `cwd` must already be resolved through the executing node's path policy,
-/// and `command` must already have passed the approval gate.
-pub(crate) async fn exec_shell(
+/// Kill the child's whole process group if a pid is present.
+fn kill_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        let _ = kill_process_group(pid);
+    }
+}
+
+/// Build the standard `sh -c` command with process isolation, environment scrubbing,
+/// and allowlisted variables. Shared by local and daemon runners so execution invariants
+/// cannot drift.
+pub fn build_shell_command(
     command: &str,
     cwd: &Path,
-    timeout_ms: u64,
     extra_env: &BTreeMap<String, String>,
-    cancel: &CancellationToken,
-) -> Result<ToolResult, ToolError> {
-    // The hard cap applies on every path in, including a NodeCall from a
-    // remote brain that never saw the schema.
-    let timeout = Duration::from_millis(timeout_ms.clamp(1, MAX_SHELL_TIMEOUT_MS));
-    let started = std::time::Instant::now();
-
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
         .arg(command)
@@ -310,6 +319,41 @@ pub(crate) async fn exec_shell(
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
+    cmd
+}
+
+/// Await both pumps, tolerating already-finished or absent tasks.
+async fn join_pumps(stdout: Option<JoinHandle<()>>, stderr: Option<JoinHandle<()>>) {
+    let left = async {
+        if let Some(task) = stdout {
+            let _ = task.await;
+        }
+    };
+    let right = async {
+        if let Some(task) = stderr {
+            let _ = task.await;
+        }
+    };
+    tokio::join!(left, right);
+}
+
+/// The shared implementation, used by the handler (local node) and by
+/// [`crate::LocalExecutor`] (node daemon) so both behave identically.
+/// `cwd` must already be resolved through the executing node's path policy,
+/// and `command` must already have passed the approval gate.
+pub async fn exec_shell(
+    command: &str,
+    cwd: &Path,
+    timeout_ms: u64,
+    extra_env: &BTreeMap<String, String>,
+    cancel: &CancellationToken,
+) -> Result<ToolResult, ToolError> {
+    // The hard cap applies on every path in, including a NodeCall from a
+    // remote brain that never saw the schema.
+    let timeout = Duration::from_millis(timeout_ms.clamp(1, MAX_SHELL_TIMEOUT_MS));
+    let started = std::time::Instant::now();
+
+    let mut cmd = build_shell_command(command, cwd, extra_env);
 
     let mut child = cmd.spawn().map_err(|error| {
         ToolError::failed(format!(

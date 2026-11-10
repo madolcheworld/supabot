@@ -179,6 +179,28 @@ pub fn dot(color: u32, size: Pixels) -> Div {
     div().size(size).flex_none().rounded_full().bg(rgb(color))
 }
 
+/// An icon representing the right sidebar panel (box layout with a right pane).
+pub fn sidebar_icon(open: bool) -> Div {
+    div()
+        .w(px(16.0))
+        .h(px(14.0))
+        .rounded(px(2.5))
+        .border_1()
+        .border_color(rgb(theme::TEXT_MUTED))
+        .flex()
+        .flex_row()
+        .overflow_hidden()
+        .child(div().flex_1().h_full().bg(rgb(0xffffff)))
+        .child(div().w(px(1.0)).h_full().bg(rgb(theme::BORDER)))
+        .child(
+            div()
+                .w(px(4.0))
+                .h_full()
+                .when(open, |d| d.bg(rgb(theme::TEXT_MUTED)))
+                .when(!open, |d| d.bg(rgb(theme::SURFACE))),
+        )
+}
+
 /// A pill badge (an unread count, a capability count, a status chip).
 pub fn badge(label: impl Into<SharedString>, bg: u32, fg: u32) -> Div {
     div()

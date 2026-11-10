@@ -20,12 +20,12 @@ use crate::proto::Command;
 use crate::state::AppState;
 use crate::theme;
 use crate::view::cards::{self, CardView};
-use crate::widgets::bits::{self, Tone};
+use crate::widgets::bits;
 use crate::widgets::markdown;
 use crate::widgets::text_input::TextInput;
 
-/// The conversation header: title, member tiles, the live activity line, Stop,
-/// and — for a DM — the provider button that opens [`super::provider_menu`].
+/// The conversation header: title, the live activity line, provider button,
+/// and the sidebar toggle button when the right panel is collapsed.
 pub fn header(
     s: &AppState,
     state: &Entity<AppState>,
@@ -47,59 +47,6 @@ pub fn header(
     let conv_id = conversation.id.clone();
     let members = s.members(&conv_id);
 
-    // Member avatar tiles.
-    let mut tiles = div().flex().items_center().gap_1();
-    for bot_id in &members {
-        if let Some(bot) = s.bot(bot_id) {
-            let bot_id_c = bot.id.clone();
-            let bot_backend_c = bot.backend.clone();
-            let bot_model_c = bot.model.clone();
-            let state_h = state.clone();
-            let input_h = model_input.clone();
-            let commands_menu = commands.clone();
-            let is_menu_active = s.bot_menu_open && s.menu_bot.as_ref() == Some(&bot.id);
-            tiles = tiles.child(
-                div()
-                    .id(SharedString::from(format!("member-tile-{}", bot.id)))
-                    .cursor_pointer()
-                    .when(is_menu_active, |d| {
-                        d.rounded_md().border_1().border_color(rgb(theme::ACCENT))
-                    })
-                    .on_click(move |_, _, cx: &mut gpui::App| {
-                        let mut fetch: Option<String> = None;
-                        state_h.update(cx, |s, cx| {
-                            let was_this_bot =
-                                s.bot_menu_open && s.menu_bot.as_ref() == Some(&bot_id_c);
-                            if was_this_bot {
-                                s.bot_menu_open = false;
-                                s.menu_bot = None;
-                            } else {
-                                s.bot_menu_open = true;
-                                s.menu_bot = Some(bot_id_c.clone());
-                                s.menu_backend = Some(bot_backend_c.clone());
-                                s.menu_model = bot_model_c.clone();
-                                if !s.models.contains_key(&bot_backend_c) {
-                                    fetch = Some(bot_backend_c.clone());
-                                }
-                            }
-                            cx.notify();
-                        });
-                        let initial = bot_model_c.clone().unwrap_or_default();
-                        input_h.update(cx, |input, cx| input.set_content(&initial, cx));
-                        let _ = commands_menu.send(Command::FetchBackends);
-                        if let Some(backend) = fetch {
-                            let _ = commands_menu.send(Command::FetchModels(backend));
-                        }
-                    })
-                    .child(bits::avatar(
-                        theme::bot_color(bot),
-                        bits::initial(&bot.label),
-                        px(20.0),
-                    )),
-            );
-        }
-    }
-
     // The live "Handling…" line, from a running turn in this conversation.
     let running = s.running_turn(&conv_id).is_some();
     let activity = s
@@ -109,21 +56,6 @@ pub fn header(
             _ => None,
         })
         .unwrap_or_else(|| "Handling…".to_string());
-
-    // Stop button: meaningful only while a turn runs and we are connected.
-    let can_stop = running && s.conn.is_online();
-    let stop = if can_stop {
-        let commands = commands.clone();
-        let conv = conv_id.clone();
-        bits::button("Stop", Tone::Danger)
-            .id(SharedString::from(format!("stop-{conv_id}")))
-            .on_click(move |_, _, _| {
-                let _ = commands.send(Command::Interrupt(conv.clone()));
-            })
-            .into_any_element()
-    } else {
-        bits::disabled_button("Stop").into_any_element()
-    };
 
     let direct_bot = dm_bot(s, conversation);
     let (bot_label, bot_color, bot_initial) = if let Some(bot) = direct_bot.as_ref() {
@@ -357,8 +289,24 @@ pub fn header(
                 ),
         )
         .child(div().flex_1())
-        .child(tiles)
-        .child(stop)
+        .when(!s.graph_open, |d| {
+            let state_toggle = state.clone();
+            d.child(
+                div()
+                    .id("open-sidebar-btn")
+                    .cursor_pointer()
+                    .p_1()
+                    .rounded_md()
+                    .hover(|h| h.bg(rgb(theme::SURFACE_RAISED)))
+                    .child(bits::sidebar_icon(false))
+                    .on_click(move |_, _, cx: &mut gpui::App| {
+                        state_toggle.update(cx, |st, cx| {
+                            st.graph_open = true;
+                            cx.notify();
+                        });
+                    }),
+            )
+        })
 }
 
 /// The single bot of a direct conversation, when this is one. The provider
