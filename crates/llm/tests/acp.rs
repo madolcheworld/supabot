@@ -1286,3 +1286,71 @@ async fn model_env_makes_a_silent_agent_authoritative() {
         "with model_env a pick reaches the agent via its child env"
     );
 }
+
+#[tokio::test]
+async fn each_bot_cwd_gets_its_own_connection_and_session_cwd() {
+    struct CapturingCwd {
+        launches: Arc<Mutex<Vec<Option<std::path::PathBuf>>>>,
+        transport: ScriptedAgentTransport,
+    }
+    #[async_trait::async_trait]
+    impl AcpTransport for CapturingCwd {
+        async fn spawn(&self, launch: &AgentLaunch) -> Result<AgentHandle, String> {
+            self.launches
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(launch.cwd.clone());
+            self.transport.spawn(launch).await
+        }
+    }
+
+    let (transport, log) = ScriptedAgentTransport::new(Behavior::Normal);
+    let launches = Arc::new(Mutex::new(Vec::new()));
+    let backend = AcpAgent::with_transport(
+        acp_spec(Map::new()),
+        None,
+        Arc::new(CapturingCwd {
+            launches: Arc::clone(&launches),
+            transport,
+        }),
+    )
+    .expect("a valid spec builds");
+
+    let ws_a = std::env::temp_dir().join("swarmbot-test-ws-alpha");
+    let ws_b = std::env::temp_dir().join("swarmbot-test-ws-beta");
+    for ws in [&ws_a, &ws_b, &ws_a] {
+        let (tx, rx) = mpsc::channel(32);
+        let events = collect_events(rx);
+        let mut req = ChatRequest::new("", "You are a bot.");
+        req.messages.push(ChatMessage::user("hi"));
+        req.cwd = Some(ws.clone());
+        backend
+            .chat(req, tx, CancellationToken::new())
+            .await
+            .expect("turn completes");
+        events.await.expect("joined");
+    }
+
+    let launches = launches.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(
+        launches.len(),
+        2,
+        "two workspaces reuse their own agent processes"
+    );
+    assert_eq!(launches[0].as_ref(), Some(&ws_a));
+    assert_eq!(launches[1].as_ref(), Some(&ws_b));
+
+    let cwds: Vec<String> = logged(&log)
+        .into_iter()
+        .filter(|entry| entry.get("method").and_then(Value::as_str) == Some("session/new"))
+        .filter_map(|entry| entry["params"]["cwd"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        cwds,
+        vec![
+            ws_a.to_string_lossy().to_string(),
+            ws_b.to_string_lossy().to_string(),
+            ws_a.to_string_lossy().to_string(),
+        ]
+    );
+}

@@ -9,12 +9,12 @@
 
 use serde_json::Value;
 use swarmbot_client::{
-    BackendProbe, BackendView, ClientError, Health, NewRoutineRequest, PairingCode, SentMessage,
-    SessionAction, TaskDetail,
+    BackendProbe, BackendView, ClientError, Health, NewBotRequest, NewRoutineRequest, PairingCode,
+    SentMessage, SessionAction, TaskDetail,
 };
 use swarmbot_contracts::{
-    BotId, Conversation, ConversationId, Decision, EntryId, LiveEvent, NodeId, NodeInfo, RequestId,
-    Routine, RoutineId, RoutineRun, RuntimeRequest, Settings, Task, TaskId,
+    Bot, BotId, Conversation, ConversationId, Decision, EntryId, LiveEvent, NodeId, NodeInfo,
+    RequestId, Routine, RoutineId, RoutineRun, RuntimeRequest, Settings, Task, TaskId,
 };
 
 /// An owner credential in transit: the value behind `--token`,
@@ -91,6 +91,9 @@ pub enum Command {
         members: Vec<BotId>,
         lead: Option<BotId>,
     },
+    CreateBot(NewBotRequest),
+    DeleteBot(BotId),
+    DeleteGroup(ConversationId),
     BotSession {
         id: String,
         action: SessionAction,
@@ -169,6 +172,15 @@ pub enum CommandResult {
     CancelTask(Result<Task, ClientError>),
     TaskDetail(Result<TaskDetail, ClientError>),
     CreateGroup(Result<Conversation, ClientError>),
+    CreateBot(Result<Bot, ClientError>),
+    DeleteBot {
+        bot: BotId,
+        result: Result<(), ClientError>,
+    },
+    DeleteGroup {
+        conversation: ConversationId,
+        result: Result<(), ClientError>,
+    },
     BotSession(Result<usize, ClientError>),
     Pairing(Result<PairingCode, ClientError>),
     RevokeNode(Result<(), ClientError>),

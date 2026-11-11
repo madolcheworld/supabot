@@ -27,14 +27,15 @@ use std::time::Duration;
 
 use gpui::{
     App, ClickEvent, Context, Entity, FocusHandle, Focusable, ListAlignment, ListState, Render,
-    Window, div, list, prelude::*, px, rgb,
+    SharedString, Window, div, list, prelude::*, px, rgb,
 };
+use swarmbot_client::NewBotRequest;
 use swarmbot_contracts::{EntryId, EntryKind, FormField, RequestId};
 
 use crate::RENDERS;
 use crate::actions::{CancelOverlay, FocusComposer, StopTurn, ToggleGraph, TogglePalette};
 use crate::proto::{Command, SecretToken};
-use crate::state::{AppState, ConnectionState, Screen};
+use crate::state::{AppState, ConnectionState, DeleteTarget, Screen};
 use crate::theme;
 use crate::view::cards::CardView;
 use crate::view::composer::Composer;
@@ -53,6 +54,10 @@ pub struct Root {
     provider_model: Entity<TextInput>,
     routine_name: Entity<TextInput>,
     routine_prompt: Entity<TextInput>,
+    group_title_input: Entity<TextInput>,
+    bot_handle_input: Entity<TextInput>,
+    bot_label_input: Entity<TextInput>,
+    bot_instructions_input: Entity<TextInput>,
     cards: HashMap<EntryId, Entity<CardView>>,
     transcript: ListState,
     /// Interior mutability so the transcript can reset its item count from a
@@ -77,6 +82,11 @@ impl Root {
         let provider_model = cx.new(|cx| TextInput::new("Search or enter model ID...", cx));
         let routine_name = cx.new(|cx| TextInput::new("Routine name (e.g. Daily Standup)", cx));
         let routine_prompt = cx.new(|cx| TextInput::new("Prompt for the bot…", cx).multiline());
+        let group_title_input = cx.new(|cx| TextInput::new("Group title (e.g. Team Chat)", cx));
+        let bot_handle_input = cx.new(|cx| TextInput::new("handle (e.g. researcher)", cx));
+        let bot_label_input = cx.new(|cx| TextInput::new("Display name (e.g. Researcher)", cx));
+        let bot_instructions_input =
+            cx.new(|cx| TextInput::new("Instructions / role for this bot…", cx).multiline());
         let focus_handle = cx.focus_handle();
         let observe = cx.observe(&state, |this, _, cx| {
             this.sync_cards(cx);
@@ -94,6 +104,10 @@ impl Root {
             provider_model,
             routine_name,
             routine_prompt,
+            group_title_input,
+            bot_handle_input,
+            bot_label_input,
+            bot_instructions_input,
             cards: HashMap::new(),
             transcript,
             transcript_count: Cell::new(0),
@@ -191,6 +205,27 @@ impl Root {
     }
 
     fn on_cancel(&mut self, _: &CancelOverlay, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).confirm_delete.is_some() {
+            self.state.update(cx, |s, cx| {
+                s.confirm_delete = None;
+                cx.notify();
+            });
+            return;
+        }
+        if self.state.read(cx).create_bot_open {
+            self.state.update(cx, |s, cx| {
+                s.create_bot_open = false;
+                cx.notify();
+            });
+            return;
+        }
+        if self.state.read(cx).create_group_open {
+            self.state.update(cx, |s, cx| {
+                s.create_group_open = false;
+                cx.notify();
+            });
+            return;
+        }
         if self.state.read(cx).bot_menu_open {
             self.state.update(cx, |s, cx| {
                 s.bot_menu_open = false;
@@ -270,9 +305,79 @@ impl Root {
         .w_full()
         .h_full();
 
-        // An empty conversation shows the simulated history matching the design screenshot
-        let transcript_area = if count == 0 {
-            conversation::mock_conversation_view().into_any_element()
+        let transcript_area = if s.open_conversation().is_none() {
+            let state_h = self.state.clone();
+            let commands_h = self.commands.clone();
+            let headline = if s.bots.is_empty() {
+                "No bots in your team yet"
+            } else {
+                "No conversation selected"
+            };
+            let hint = if s.bots.is_empty() {
+                "Add a bot to start chatting, or add 2+ bots to form a group."
+            } else {
+                "Select a bot or group from the left sidebar, or add a new bot."
+            };
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .child(
+                    div()
+                        .text_base()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(headline),
+                )
+                .child(div().text_sm().text_color(rgb(theme::TEXT_DIM)).child(hint))
+                .child(
+                    div()
+                        .id("empty-add-bot-btn")
+                        .px_4()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(rgb(theme::ACCENT))
+                        .hover(|h| h.bg(rgb(theme::ACCENT_HOVER)))
+                        .cursor_pointer()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(theme::BACKGROUND))
+                        .child("+ Add Bot")
+                        .on_click(move |_, _, cx: &mut App| {
+                            state_h.update(cx, |st, cx| {
+                                st.create_bot_open = true;
+                                st.create_group_open = false;
+                                cx.notify();
+                            });
+                            let _ = commands_h.send(Command::FetchBackends);
+                        }),
+                )
+                .into_any_element()
+        } else if count == 0 {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child("No messages yet"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_DIM))
+                        .child("Send a message below to start chatting."),
+                )
+                .into_any_element()
         } else {
             transcript.into_any_element()
         };
@@ -385,6 +490,792 @@ impl Root {
                     ),
             )
     }
+
+    fn render_create_tabs(&self, active_is_bot: bool) -> gpui::Div {
+        let state_bot = self.state.clone();
+        let commands_bot = self.commands.clone();
+        let state_group = self.state.clone();
+
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .p_1()
+            .rounded_xl()
+            .bg(rgb(theme::SURFACE_RAISED))
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .child(
+                div()
+                    .id("modal-tab-add-bot")
+                    .flex_1()
+                    .py_1p5()
+                    .rounded_lg()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .when(active_is_bot, |d| {
+                        d.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BACKGROUND))
+                    })
+                    .when(!active_is_bot, |d| {
+                        d.cursor_pointer()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .hover(|h| h.bg(rgb(0xebebee)).text_color(rgb(theme::TEXT)))
+                            .on_click(move |_, _, cx: &mut App| {
+                                state_bot.update(cx, |st, cx| {
+                                    st.create_bot_open = true;
+                                    st.create_group_open = false;
+                                    cx.notify();
+                                });
+                                let _ = commands_bot.send(Command::FetchBackends);
+                            })
+                    })
+                    .child("+ Add Bot"),
+            )
+            .child(
+                div()
+                    .id("modal-tab-create-group")
+                    .flex_1()
+                    .py_1p5()
+                    .rounded_lg()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .when(!active_is_bot, |d| {
+                        d.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BACKGROUND))
+                    })
+                    .when(active_is_bot, |d| {
+                        d.cursor_pointer()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .hover(|h| h.bg(rgb(0xebebee)).text_color(rgb(theme::TEXT)))
+                            .on_click(move |_, _, cx: &mut App| {
+                                state_group.update(cx, |st, cx| {
+                                    st.create_group_open = true;
+                                    st.create_bot_open = false;
+                                    cx.notify();
+                                });
+                            })
+                    })
+                    .child("Create Group"),
+            )
+    }
+
+    fn render_create_group(&self, s: &AppState) -> gpui::Div {
+        let state_h = self.state.clone();
+        let commands = self.commands.clone();
+        let title_input = self.group_title_input.clone();
+        let selected_bots = s.create_group_members.clone();
+        let count = selected_bots.len();
+        let can_create = (swarmbot_contracts::MIN_GROUP_MEMBERS
+            ..=swarmbot_contracts::MAX_GROUP_MEMBERS)
+            .contains(&count);
+
+        let on_close = {
+            let state_h = state_h.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                state_h.update(cx, |st, cx| {
+                    st.create_group_open = false;
+                    cx.notify();
+                });
+            }
+        };
+
+        let on_create = {
+            let state_h = state_h.clone();
+            let commands = commands.clone();
+            let title_input = title_input.clone();
+            let selected_bots = selected_bots.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                let typed = title_input.read(cx).content().trim().to_string();
+                let title = if typed.is_empty() {
+                    "Team Chat".to_string()
+                } else {
+                    typed
+                };
+                let lead = selected_bots.first().cloned();
+                let _ = commands.send(Command::CreateGroup {
+                    title,
+                    members: selected_bots.clone(),
+                    lead,
+                });
+                state_h.update(cx, |st, cx| {
+                    st.create_group_open = false;
+                    cx.notify();
+                });
+            }
+        };
+
+        let mut bot_list = div()
+            .id("create-group-bot-list")
+            .flex_1()
+            .max_h(px(220.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1();
+
+        for bot in &s.bots {
+            let bot_id = bot.id.clone();
+            let checked = selected_bots.contains(&bot_id);
+            let state_h = state_h.clone();
+            let bot_id_c = bot_id.clone();
+            bot_list = bot_list.child(
+                div()
+                    .id(SharedString::from(format!("create-group-bot-{}", bot.id)))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .rounded_xl()
+                    .cursor_pointer()
+                    .bg(if checked {
+                        rgb(theme::SURFACE_RAISED)
+                    } else {
+                        rgb(theme::SURFACE)
+                    })
+                    .hover(|h| h.bg(rgb(0xebebee)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(bits::avatar(
+                                theme::bot_color(bot),
+                                bits::initial(&bot.label),
+                                px(26.0),
+                            ))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(theme::TEXT))
+                                    .child(bot.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .child(format!("@{}", bot.name)),
+                            ),
+                    )
+                    .child(div().text_sm().child(if checked { "✓" } else { "○" }))
+                    .on_click(move |_, _, cx: &mut App| {
+                        let bid = bot_id_c.clone();
+                        state_h.update(cx, |st, cx| {
+                            if let Some(pos) =
+                                st.create_group_members.iter().position(|id| id == &bid)
+                            {
+                                st.create_group_members.remove(pos);
+                            } else if st.create_group_members.len()
+                                < swarmbot_contracts::MAX_GROUP_MEMBERS
+                            {
+                                st.create_group_members.push(bid);
+                            }
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+
+        if s.bots.len() < swarmbot_contracts::MIN_GROUP_MEMBERS {
+            let state_go = self.state.clone();
+            let commands_go = self.commands.clone();
+            let msg = if s.bots.is_empty() {
+                "No bots added yet. Add at least 2 bots to form a group."
+            } else {
+                "Add 1 more bot to form a group chat (minimum 2)."
+            };
+            bot_list = bot_list.child(
+                div()
+                    .p_3()
+                    .rounded_xl()
+                    .bg(rgb(theme::SURFACE_RAISED))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(msg),
+                    )
+                    .child(
+                        div()
+                            .id("group-empty-go-add-bot")
+                            .px_3()
+                            .py_1p5()
+                            .rounded_lg()
+                            .bg(rgb(theme::ACCENT))
+                            .hover(|h| h.bg(rgb(theme::ACCENT_HOVER)))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(theme::BACKGROUND))
+                            .child("+ Add Bot First")
+                            .on_click(move |_, _, cx: &mut App| {
+                                state_go.update(cx, |st, cx| {
+                                    st.create_group_open = false;
+                                    st.create_bot_open = true;
+                                    cx.notify();
+                                });
+                                let _ = commands_go.send(Command::FetchBackends);
+                            }),
+                    ),
+            );
+        }
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w_full()
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.5,
+            })
+            .child(
+                div()
+                    .w(px(460.0))
+                    .max_h(px(540.0))
+                    .rounded_2xl()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .bg(rgb(theme::SURFACE))
+                    .shadow_lg()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(theme::TEXT))
+                                    .child("Create Group Chat"),
+                            )
+                            .child(
+                                div()
+                                    .id("create-group-close")
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .hover(|h| h.text_color(rgb(theme::TEXT)))
+                                    .child("✕")
+                                    .on_click(on_close.clone()),
+                            ),
+                    )
+                    .child(self.render_create_tabs(false))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(format!(
+                                "Select {}-{} bots to collaborate in this room.",
+                                swarmbot_contracts::MIN_GROUP_MEMBERS,
+                                swarmbot_contracts::MAX_GROUP_MEMBERS
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .child("GROUP TITLE"),
+                            )
+                            .child(self.group_title_input.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(theme::TEXT_DIM))
+                            .child(format!("SELECT MEMBERS ({count}/6)")),
+                    )
+                    .child(bot_list)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(theme::BORDER))
+                            .child(
+                                div()
+                                    .id("create-group-cancel")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .hover(|h| h.text_color(rgb(theme::TEXT)))
+                                    .child("Cancel")
+                                    .on_click(on_close),
+                            )
+                            .child(
+                                div()
+                                    .id("create-group-submit")
+                                    .px_4()
+                                    .py_1p5()
+                                    .rounded_lg()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .when(can_create, |d| {
+                                        d.cursor_pointer()
+                                            .bg(rgb(theme::ACCENT))
+                                            .text_color(rgb(theme::BACKGROUND))
+                                            .on_click(on_create)
+                                    })
+                                    .when(!can_create, |d| {
+                                        d.bg(rgb(0xd1d5db)).text_color(rgb(theme::TEXT_DIM))
+                                    })
+                                    .child("Create Group"),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_create_bot(&self, s: &AppState, cx: &App) -> gpui::Div {
+        let state_close = self.state.clone();
+        let on_close = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            state_close.update(cx, |st, cx| {
+                st.create_bot_open = false;
+                cx.notify();
+            });
+        };
+
+        let state_create = self.state.clone();
+        let commands = self.commands.clone();
+        let handle_input = self.bot_handle_input.clone();
+        let label_input = self.bot_label_input.clone();
+        let instructions_input = self.bot_instructions_input.clone();
+        let bot_count = s.bots.len();
+
+        let selected_backend = s
+            .create_bot_backend
+            .as_ref()
+            .filter(|id| s.backends.iter().any(|b| &b.id == *id))
+            .or_else(|| s.backends.first().map(|b| &b.id))
+            .or_else(|| s.bots.first().map(|b| &b.backend))
+            .cloned()
+            .unwrap_or_else(|| "opencode".to_string());
+
+        let live_handle = {
+            let typed = normalize_bot_handle(handle_input.read(cx).content());
+            if typed.is_empty() {
+                normalize_bot_handle(label_input.read(cx).content())
+            } else {
+                typed
+            }
+        };
+        let can_create = !live_handle.is_empty();
+
+        let chosen_backend = selected_backend.clone();
+        let on_create = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            let handle_typed = normalize_bot_handle(handle_input.read(cx).content());
+            let label_raw = label_input.read(cx).content().trim().to_string();
+            let handle = if handle_typed.is_empty() {
+                normalize_bot_handle(&label_raw)
+            } else {
+                handle_typed
+            };
+            let instructions = instructions_input.read(cx).content().trim().to_string();
+
+            if handle.is_empty() {
+                return;
+            }
+            let label = if label_raw.is_empty() {
+                handle.clone()
+            } else {
+                label_raw
+            };
+
+            let colors = [
+                "#8b5cf6", "#f97316", "#ef4444", "#ec4899", "#06b6d4", "#10b981", "#a855f7",
+                "#3b82f6",
+            ];
+            let color = colors[bot_count % colors.len()];
+
+            let mut req = NewBotRequest::new(handle, label, instructions, chosen_backend.clone());
+            req.color = Some(color.to_string());
+
+            let _ = commands.send(Command::CreateBot(req));
+            handle_input.update(cx, |input, cx| input.set_content("", cx));
+            label_input.update(cx, |input, cx| input.set_content("", cx));
+            instructions_input.update(cx, |input, cx| input.set_content("", cx));
+
+            state_create.update(cx, |st, cx| {
+                st.create_bot_open = false;
+                cx.notify();
+            });
+        };
+
+        let mut backend_row = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_1p5()
+            .text_xs()
+            .text_color(rgb(theme::TEXT_DIM))
+            .child("Backend:");
+
+        if s.backends.is_empty() {
+            backend_row = backend_row.child(
+                div()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .bg(rgb(theme::SURFACE_RAISED))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(selected_backend),
+            );
+        } else {
+            for backend in &s.backends {
+                let bid = backend.id.clone();
+                let is_selected = bid == selected_backend;
+                let state_b = self.state.clone();
+                let bid_click = bid.clone();
+                backend_row = backend_row.child(
+                    div()
+                        .id(SharedString::from(format!("create-bot-backend-{bid}")))
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .when(is_selected, |d| {
+                            d.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BACKGROUND))
+                        })
+                        .when(!is_selected, |d| {
+                            d.cursor_pointer()
+                                .bg(rgb(theme::SURFACE_RAISED))
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .hover(|h| h.bg(rgb(0xebebee)).text_color(rgb(theme::TEXT)))
+                                .on_click(move |_, _, cx: &mut App| {
+                                    let chosen = bid_click.clone();
+                                    state_b.update(cx, |st, cx| {
+                                        st.create_bot_backend = Some(chosen);
+                                        cx.notify();
+                                    });
+                                })
+                        })
+                        .child(bid),
+                );
+            }
+        }
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w_full()
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.5,
+            })
+            .child(
+                div()
+                    .w(px(460.0))
+                    .rounded_2xl()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .bg(rgb(theme::SURFACE))
+                    .shadow_lg()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_3p5()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(theme::TEXT))
+                                    .child("Add Bot to Team"),
+                            )
+                            .child(
+                                div()
+                                    .id("create-bot-close")
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .hover(|h| h.text_color(rgb(theme::TEXT)))
+                                    .child("✕")
+                                    .on_click(on_close.clone()),
+                            ),
+                    )
+                    .child(self.render_create_tabs(true))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child("Configure a new autonomous teammate for your workspace."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .child("BOT HANDLE (@NAME, OPTIONAL)"),
+                            )
+                            .child(self.bot_handle_input.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .child("DISPLAY NAME"),
+                            )
+                            .child(self.bot_label_input.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(theme::TEXT_DIM))
+                                    .child("SYSTEM PROMPT / ROLE"),
+                            )
+                            .child(self.bot_instructions_input.clone()),
+                    )
+                    .child(backend_row)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(theme::BORDER))
+                            .child(
+                                div()
+                                    .id("create-bot-cancel")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .hover(|h| h.text_color(rgb(theme::TEXT)))
+                                    .child("Cancel")
+                                    .on_click(on_close),
+                            )
+                            .child(
+                                div()
+                                    .id("create-bot-submit")
+                                    .px_4()
+                                    .py_1p5()
+                                    .rounded_lg()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .when(can_create, |d| {
+                                        d.cursor_pointer()
+                                            .bg(rgb(theme::ACCENT))
+                                            .text_color(rgb(theme::BACKGROUND))
+                                            .on_click(on_create)
+                                    })
+                                    .when(!can_create, |d| {
+                                        d.bg(rgb(0xd1d5db)).text_color(rgb(theme::TEXT_DIM))
+                                    })
+                                    .child("Add Bot"),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_confirm_delete(&self, s: &AppState) -> gpui::Div {
+        let Some(target) = &s.confirm_delete else {
+            return div();
+        };
+
+        let state_close = self.state.clone();
+        let on_close = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            state_close.update(cx, |st, cx| {
+                st.confirm_delete = None;
+                cx.notify();
+            });
+        };
+
+        let state_confirm = self.state.clone();
+        let commands = self.commands.clone();
+        let target_clone = target.clone();
+
+        let (title, message, submit_label) = match &target {
+            DeleteTarget::Bot { label, .. } => (
+                "Delete Bot".to_string(),
+                format!(
+                    "Are you sure you want to delete bot \"{label}\"? Its direct messages and state will be removed."
+                ),
+                "Delete Bot".to_string(),
+            ),
+            DeleteTarget::Group { title, .. } => (
+                "Delete Group".to_string(),
+                format!(
+                    "Are you sure you want to delete group \"{title}\"? All conversation messages will be removed."
+                ),
+                "Delete Group".to_string(),
+            ),
+        };
+
+        let on_confirm = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            match &target_clone {
+                DeleteTarget::Bot { id, .. } => {
+                    let _ = commands.send(Command::DeleteBot(id.clone()));
+                }
+                DeleteTarget::Group { id, .. } => {
+                    let _ = commands.send(Command::DeleteGroup(id.clone()));
+                }
+            }
+            state_confirm.update(cx, |st, cx| {
+                st.confirm_delete = None;
+                cx.notify();
+            });
+        };
+
+        div()
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .w_full()
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::Rgba {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.5,
+            })
+            .child(
+                div()
+                    .w(px(400.0))
+                    .rounded_2xl()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .bg(rgb(theme::SURFACE))
+                    .shadow_lg()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(theme::DANGER))
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .id("confirm-delete-close")
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .hover(|h| h.text_color(rgb(theme::TEXT)))
+                                    .child("✕")
+                                    .on_click(on_close.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(message),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(theme::BORDER))
+                            .child(
+                                div()
+                                    .id("confirm-delete-cancel")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .hover(|h| h.text_color(rgb(theme::TEXT)))
+                                    .child("Cancel")
+                                    .on_click(on_close),
+                            )
+                            .child(
+                                div()
+                                    .id("confirm-delete-submit")
+                                    .px_4()
+                                    .py_1p5()
+                                    .rounded_lg()
+                                    .cursor_pointer()
+                                    .bg(rgb(theme::DANGER))
+                                    .text_color(rgb(0xffffff))
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .child(submit_label)
+                                    .on_click(on_confirm),
+                            ),
+                    ),
+            )
+    }
 }
 
 impl Focusable for Root {
@@ -444,8 +1335,34 @@ impl Render for Root {
         if s.palette_open {
             root = root.child(self.render_palette_overlay());
         }
+        if s.create_group_open {
+            root = root.child(self.render_create_group(s));
+        }
+        if s.create_bot_open {
+            root = root.child(self.render_create_bot(s, cx));
+        }
+        if s.confirm_delete.is_some() {
+            root = root.child(self.render_confirm_delete(s));
+        }
         root
     }
+}
+
+fn normalize_bot_handle(raw: &str) -> String {
+    raw.trim()
+        .to_lowercase()
+        .trim_start_matches('@')
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
 
 #[allow(dead_code)]

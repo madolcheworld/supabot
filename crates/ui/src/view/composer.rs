@@ -75,7 +75,53 @@ pub fn match_members(query: &str, members: &[Bot]) -> Vec<BotId> {
     scored.into_iter().map(|(_, id)| id).collect()
 }
 
-/// Every member mentioned with `@handle` in `text`, de-duplicated, in order.
+/// Check if a word/name appears in `text` on word boundaries, case-insensitively.
+fn contains_word(text: &str, word: &str) -> bool {
+    if word.is_empty() || text.is_empty() {
+        return false;
+    }
+    let word_lower = word.to_lowercase();
+    let text_lower = text.to_lowercase();
+
+    let mut search_from = 0;
+    while let Some(byte_idx) = text_lower[search_from..].find(&word_lower) {
+        let match_start = search_from + byte_idx;
+        let match_end = match_start + word_lower.len();
+
+        let before_ok = if match_start == 0 {
+            true
+        } else {
+            let prev_slice = &text[..match_start];
+            let last_char = prev_slice.chars().last().unwrap();
+            if last_char == '@' {
+                let before_at = &prev_slice[..prev_slice.len() - last_char.len_utf8()];
+                before_at
+                    .chars()
+                    .last()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.')
+            } else {
+                !last_char.is_alphanumeric() && last_char != '_' && last_char != '-'
+            }
+        };
+
+        let after_ok = if match_end >= text.len() {
+            true
+        } else {
+            let next_char = text[match_end..].chars().next().unwrap();
+            !next_char.is_alphanumeric() && next_char != '_' && next_char != '-'
+        };
+
+        if before_ok && after_ok {
+            return true;
+        }
+
+        search_from = match_start + 1;
+    }
+    false
+}
+
+/// Every member mentioned with `@handle` or naturally addressed by name in `text`,
+/// de-duplicated, in order.
 pub fn addressed_bots(text: &str, members: &[Bot]) -> Vec<BotId> {
     let mut out: Vec<BotId> = Vec::new();
     let chars: Vec<(usize, char)> = text.char_indices().collect();
@@ -108,6 +154,16 @@ pub fn addressed_bots(text: &str, members: &[Bot]) -> Vec<BotId> {
         }
         i += 1;
     }
+
+    // Also match natural mentions (bot names or labels on word boundaries)
+    for bot in members {
+        if (contains_word(text, &bot.name) || contains_word(text, &bot.label))
+            && !out.contains(&bot.id)
+        {
+            out.push(bot.id.clone());
+        }
+    }
+
     out
 }
 
@@ -483,5 +539,18 @@ mod tests {
         assert_eq!(got.len(), 2, "a repeated mention is counted once");
         assert!(got.contains(&members[0].id) && got.contains(&members[1].id));
         assert!(addressed_bots("@nobody here", &members).is_empty());
+
+        // Natural name matching without @
+        let natural = addressed_bots("halo scout tolong carikan file", &members);
+        assert_eq!(natural, vec![members[0].id.clone()]);
+
+        let natural_multiple = addressed_bots("halo dev dan scout!", &members);
+        assert_eq!(natural_multiple.len(), 2);
+        assert!(
+            natural_multiple.contains(&members[0].id) && natural_multiple.contains(&members[1].id)
+        );
+
+        // Word boundary avoids substrings
+        assert!(addressed_bots("developer sedang bekerja", &members).is_empty());
     }
 }

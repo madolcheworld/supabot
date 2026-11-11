@@ -4,7 +4,7 @@
 use std::sync::mpsc::Sender;
 
 use gpui::{Entity, SharedString, div, prelude::*, px, rgb};
-use swarmbot_contracts::{BotId, BotStatus};
+use swarmbot_contracts::BotStatus;
 
 use crate::proto::Command;
 use crate::state::{AppState, Screen};
@@ -12,6 +12,7 @@ use crate::theme;
 use crate::widgets::bits::{self, Tone};
 
 pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::Div {
+    let has_unreads = s.unread.values().any(|&u| u > 0);
     div()
         .w(theme::space::SIDEBAR_W)
         .flex_none()
@@ -34,8 +35,8 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
                 .gap_1()
                 .px_2()
                 .py_2()
-                .child(bots_list(s, state))
-                .child(more_unreads_pill()),
+                .child(bots_list(s, state, commands))
+                .when(has_unreads, |d| d.child(more_unreads_pill())),
         )
         // Footer: Plugins + User Profile + Quick navigation
         .child(footer(s, state, commands))
@@ -43,7 +44,7 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
 
 fn header_search(state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::Div {
     let state_group = state.clone();
-    let commands_group = commands.clone();
+    let commands_h = commands.clone();
     div()
         .flex_none()
         .px_3()
@@ -69,13 +70,14 @@ fn header_search(state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::
                 .child(div().text_color(rgb(theme::TEXT_MUTED)).child("Search")),
         )
         .child(
-            // Plus button for new group / conversation
+            // Plus button for adding a bot or creating a group
             div()
                 .id("nav-new-group")
                 .size(px(36.0))
                 .rounded_xl()
                 .bg(rgb(0xebebee))
                 .cursor_pointer()
+                .hover(|h| h.bg(rgb(0xdcdce0)))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -84,52 +86,125 @@ fn header_search(state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .child("+")
                 .on_click(move |_, _, cx: &mut gpui::App| {
-                    let members: Vec<BotId> = {
-                        let st = state_group.read(cx);
-                        st.bots
+                    state_group.update(cx, |st, cx| {
+                        st.create_group_title = "Team Chat".to_string();
+                        st.create_group_members = st
+                            .bots
                             .iter()
                             .take(swarmbot_contracts::MAX_GROUP_MEMBERS)
                             .map(|b| b.id.clone())
-                            .collect()
-                    };
-                    if members.len() >= swarmbot_contracts::MIN_GROUP_MEMBERS {
-                        let lead = members.first().cloned();
-                        let _ = commands_group.send(Command::CreateGroup {
-                            title: "New group".to_string(),
-                            members,
-                            lead,
-                        });
-                    } else {
-                        state_group.update(cx, |st, cx| {
-                            st.toast = Some("a group needs at least 2 bots".to_string());
-                            cx.notify();
-                        });
-                    }
+                            .collect();
+                        if st.bots.len() < swarmbot_contracts::MIN_GROUP_MEMBERS {
+                            st.create_bot_open = true;
+                            st.create_group_open = false;
+                        } else {
+                            st.create_group_open = true;
+                            st.create_bot_open = false;
+                        }
+                        cx.notify();
+                    });
+                    let _ = commands_h.send(Command::FetchBackends);
                 }),
         )
 }
 
-fn bots_list(s: &AppState, state: &Entity<AppState>) -> gpui::Div {
+fn bots_list(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::Div {
     let mut list = div().flex().flex_col().gap_1();
 
-    // If real bots exist from brain/roster, render them with the redesigned styling
+    // 1. Group Channels Section
+    let groups: Vec<&swarmbot_contracts::Conversation> = s
+        .conversations
+        .iter()
+        .filter(|c| c.kind.is_group())
+        .collect();
+    if !groups.is_empty() {
+        list = list.child(
+            div()
+                .px_3()
+                .pt_2()
+                .pb_1()
+                .text_xs()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(theme::TEXT_DIM))
+                .child("GROUPS"),
+        );
+        for group in &groups {
+            let title = s.conversation_title(group);
+            let conv_id = group.id.clone();
+            let selected = s.open_conversation.as_ref() == Some(&conv_id);
+            let preview = s
+                .preview(&conv_id)
+                .unwrap_or_else(|| "No messages yet".to_string());
+            let unread = s.unread(&conv_id);
+            let state_h = state.clone();
+            let conv_c = conv_id.clone();
+
+            let state_del = state.clone();
+            let conv_del = conv_id.clone();
+            let title_del = title.clone();
+
+            list = list.child(bot_item(
+                &format!("group-{}", group.id),
+                &title,
+                theme::hex("#8b5cf6"),
+                '#',
+                "",
+                &preview,
+                unread > 0,
+                selected,
+                false,
+                0,
+                move |cx| {
+                    let conv = conv_c.clone();
+                    state_h.update(cx, |st, cx| {
+                        st.open(conv);
+                        cx.notify();
+                    });
+                },
+                Some(Box::new(move |cx: &mut gpui::App| {
+                    let conv = conv_del.clone();
+                    let t = title_del.clone();
+                    state_del.update(cx, |st, cx| {
+                        st.confirm_delete =
+                            Some(crate::state::DeleteTarget::Group { id: conv, title: t });
+                        cx.notify();
+                    });
+                })),
+            ));
+        }
+    }
+
+    // 2. Direct Messages Section
     if !s.bots.is_empty() {
+        list = list.child(
+            div()
+                .px_3()
+                .pt_2()
+                .pb_1()
+                .text_xs()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(theme::TEXT_DIM))
+                .child("DIRECT MESSAGES"),
+        );
         for (i, bot) in s.bots.iter().enumerate() {
             let (status_text, working, _color) = status_line(&bot.status);
             let dm = bot.direct_conversation_id.clone();
             let selected = s.open_conversation.as_ref() == Some(&dm)
-                || (s.open_conversation.is_none() && i == 0);
+                || (s.open_conversation.is_none() && groups.is_empty() && i == 0);
             let state_h = state.clone();
+            let state_del = state.clone();
             let dm_c = dm.clone();
             let preview = s.preview(&dm).unwrap_or(status_text);
             let unread = s.unread(&dm);
+            let bot_id = bot.id.clone();
+            let bot_label = bot.label.clone();
 
             list = list.child(bot_item(
                 &format!("bot-{}", bot.id),
                 &bot.label,
                 theme::bot_color(bot),
                 bits::initial(&bot.label),
-                "11:40 AM",
+                "",
                 &preview,
                 unread > 0,
                 selected,
@@ -142,114 +217,76 @@ fn bots_list(s: &AppState, state: &Entity<AppState>) -> gpui::Div {
                         cx.notify();
                     });
                 },
-            ));
-        }
-    } else {
-        // Sample bots matching the provided screenshot
-        let samples = [
-            ("Waypoint", "#8b5cf6", 'W', "11:40 AM", "hello", false, true),
-            ("Alfred", "#f97316", 'A', "6:33 AM", "Hello", false, false),
-            ("Parcel", "#ef4444", 'P', "6:19 AM", "Hello", false, false),
-            (
-                "Pulse",
-                "#18181b",
-                'X',
-                "6:01 AM",
-                "Messaged Alfred: Got it. Added ...",
-                false,
-                false,
-            ),
-            (
-                "Capstone Client Com...",
-                "#ec4899",
-                'C',
-                "12:15 PM",
-                "Afternoon Sarah check: 8 call...",
-                true,
-                false,
-            ),
-            (
-                "Credit Card Max",
-                "#06b6d4",
-                'M',
-                "Yesterday",
-                "It's on. Next run is October 1 at ...",
-                false,
-                false,
-            ),
-            (
-                "Capstone Firm Ops",
-                "#f97316",
-                'F',
-                "Yesterday",
-                "Billing: Sep send/pay unknow...",
-                true,
-                false,
-            ),
-            (
-                "Gridiron",
-                "#10b981",
-                'G',
-                "4:16 AM",
-                "You're in both games now — MI...",
-                false,
-                false,
-            ),
-            (
-                "New Bot",
-                "#a855f7",
-                'N',
-                "Yesterday",
-                "Message from Gridiron: MID ...",
-                true,
-                false,
-            ),
-            (
-                "Car...",
-                "#78716c",
-                'C',
-                "Yesterday",
-                "Pos...",
-                false,
-                false,
-            ),
-        ];
-
-        for (i, (name, color_hex, initial, time, preview, unread, active)) in
-            samples.iter().enumerate()
-        {
-            let state_h = state.clone();
-            let name_str = name.to_string();
-            let selected = if s.open_conversation.is_none() {
-                *active
-            } else {
-                false
-            };
-
-            list = list.child(bot_item(
-                &format!("mock-bot-{i}"),
-                name,
-                theme::hex(color_hex),
-                *initial,
-                time,
-                preview,
-                *unread,
-                selected,
-                false,
-                0,
-                move |cx| {
-                    let n = name_str.clone();
-                    state_h.update(cx, |st, cx| {
-                        st.toast = Some(format!("Selected {}", n));
+                Some(Box::new(move |cx: &mut gpui::App| {
+                    let bid = bot_id.clone();
+                    let blab = bot_label.clone();
+                    state_del.update(cx, |st, cx| {
+                        st.confirm_delete = Some(crate::state::DeleteTarget::Bot {
+                            id: bid,
+                            label: blab,
+                        });
                         cx.notify();
                     });
-                },
+                })),
             ));
         }
     }
 
+    if groups.is_empty() && s.bots.is_empty() {
+        let state_add = state.clone();
+        let commands_add = commands.clone();
+        list = list.child(
+            div()
+                .p_4()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child("No bots or groups yet"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_DIM))
+                        .text_center()
+                        .child("Click '+' above to add a bot or create a group."),
+                )
+                .child(
+                    div()
+                        .id("sidebar-empty-add-bot")
+                        .mt_1()
+                        .px_3()
+                        .py_1p5()
+                        .rounded_lg()
+                        .bg(rgb(theme::ACCENT))
+                        .hover(|h| h.bg(rgb(theme::ACCENT_HOVER)))
+                        .cursor_pointer()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(0xffffff))
+                        .child("+ Add Bot")
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            state_add.update(cx, |st, cx| {
+                                st.create_bot_open = true;
+                                st.create_group_open = false;
+                                cx.notify();
+                            });
+                            let _ = commands_add.send(Command::FetchBackends);
+                        }),
+                ),
+        );
+    }
+
     list
 }
+
+type DeleteCallback = Box<dyn Fn(&mut gpui::App) + 'static>;
 
 #[allow(clippy::too_many_arguments)]
 fn bot_item(
@@ -264,6 +301,7 @@ fn bot_item(
     working: bool,
     spinner_phase: usize,
     on_click: impl Fn(&mut gpui::App) + 'static,
+    on_delete: Option<DeleteCallback>,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(SharedString::from(id.to_string()))
@@ -285,7 +323,7 @@ fn bot_item(
                 .flex()
                 .flex_col()
                 .gap_0p5()
-                // Row 1: Name + Time
+                // Row 1: Name + Time + Delete button
                 .child(
                     div()
                         .flex()
@@ -305,9 +343,36 @@ fn bot_item(
                         .child(
                             div()
                                 .flex_shrink_0()
-                                .text_xs()
-                                .text_color(rgb(theme::TEXT_DIM))
-                                .child(time.to_string()),
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .when(!time.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_DIM))
+                                            .child(time.to_string()),
+                                    )
+                                })
+                                .when_some(on_delete, |d, on_del| {
+                                    d.child(
+                                        div()
+                                            .id(SharedString::from(format!("del-{}", id)))
+                                            .cursor_pointer()
+                                            .px_1()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_DIM))
+                                            .hover(|h| {
+                                                h.text_color(rgb(theme::DANGER)).bg(rgb(0xfee2e2))
+                                            })
+                                            .child("✕")
+                                            .on_click(move |_, _, cx: &mut gpui::App| {
+                                                cx.stop_propagation();
+                                                on_del(cx);
+                                            }),
+                                    )
+                                }),
                         ),
                 )
                 // Row 2: Preview + Unread dot

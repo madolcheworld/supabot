@@ -181,6 +181,15 @@ pub fn run_command(brain: &dyn Brain, command: Command) -> Option<CommandResult>
             members,
             lead,
         } => CommandResult::CreateGroup(brain.create_group(&title, &members, lead.as_ref())),
+        Command::CreateBot(req) => CommandResult::CreateBot(brain.create_bot(&req)),
+        Command::DeleteBot(id) => CommandResult::DeleteBot {
+            result: brain.delete_bot(id.as_str()),
+            bot: id,
+        },
+        Command::DeleteGroup(id) => CommandResult::DeleteGroup {
+            result: brain.delete_conversation(&id),
+            conversation: id,
+        },
         Command::BotSession { id, action } => {
             CommandResult::BotSession(brain.bot_session(&id, action))
         }

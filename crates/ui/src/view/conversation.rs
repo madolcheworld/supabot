@@ -41,7 +41,26 @@ pub fn header(
             .border_b_1()
             .border_color(rgb(theme::BORDER))
             .text_color(rgb(theme::TEXT_DIM))
-            .child("No conversation");
+            .child("No conversation")
+            .child(div().flex_1())
+            .when(!s.graph_open, |d| {
+                let state_toggle = state.clone();
+                d.child(
+                    div()
+                        .id("open-sidebar-btn")
+                        .cursor_pointer()
+                        .p_1()
+                        .rounded_md()
+                        .hover(|h| h.bg(rgb(theme::SURFACE_RAISED)))
+                        .child(bits::sidebar_icon(false))
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            state_toggle.update(cx, |st, cx| {
+                                st.graph_open = true;
+                                cx.notify();
+                            });
+                        }),
+                )
+            });
     };
     let title = s.conversation_title(conversation);
     let conv_id = conversation.id.clone();
@@ -276,10 +295,11 @@ pub fn header(
                                 .child(activity)
                                 .into_any_element()
                         } else if let Some(bot) = &direct_bot {
-                            div()
-                                .truncate()
-                                .child(format!("@{} · direct conversation", bot.name))
-                                .into_any_element()
+                            let subtitle = match s.bot_workspace(&bot.name) {
+                                Some(ws) => format!("@{} · workspace: {}", bot.name, ws.display()),
+                                None => format!("@{} · direct conversation", bot.name),
+                            };
+                            div().truncate().child(subtitle).into_any_element()
                         } else {
                             div()
                                 .truncate()

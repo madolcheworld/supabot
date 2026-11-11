@@ -202,6 +202,9 @@ pub fn base_rules(messaging_enabled: bool) -> String {
             "\n\n## Working with your team\n\
              - Hand a piece of work to the teammate who owns it with `handoff_task`; ask a \
              question or pass a note with `message_bot`.\n\
+             - If the user addresses or mentions a teammate by name (e.g. 'halo scout', \
+             'scout tolong...', or asks for another bot), immediately hand off that work to that \
+             teammate with `handoff_task` and report their answer back to the user.\n\
              - @mention a teammate only when you need them to act or answer. Never mention \
              somebody to thank them — an acknowledgement wakes them for nothing.\n\
              - In a group, reply only when you have something to add. When you do not, answer \

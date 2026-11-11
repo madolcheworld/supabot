@@ -562,20 +562,28 @@ impl AcpAgent {
             .collect()
     }
 
-    fn launch_with(&self, extra_env: BTreeMap<String, String>) -> AgentLaunch {
+    fn session_cwd(&self, request: &ChatRequest) -> PathBuf {
+        match &request.cwd {
+            Some(dir) if dir.is_absolute() => dir.clone(),
+            Some(dir) => self.cwd.join(dir),
+            None => self.cwd.clone(),
+        }
+    }
+
+    fn launch_with(&self, extra_env: BTreeMap<String, String>, cwd: PathBuf) -> AgentLaunch {
         let mut env = self.child_env();
         env.extend(extra_env);
         AgentLaunch {
             command: self.command.clone(),
             args: self.args.clone(),
             env,
-            cwd: Some(self.cwd.clone()),
+            cwd: Some(cwd),
             inherit_env: self.inherit_env,
         }
     }
 
     fn launch(&self) -> AgentLaunch {
-        self.launch_with(self.substituted_model_env(None))
+        self.launch_with(self.substituted_model_env(None), self.cwd.clone())
     }
 
     /// The live connection for one env-pin key, spawning (and handshaking)
@@ -585,6 +593,7 @@ impl AcpAgent {
     async fn connection_for(
         &self,
         key: &str,
+        cwd: PathBuf,
         extra_env: BTreeMap<String, String>,
         cancel: &CancellationToken,
     ) -> Result<Arc<Connection>, LlmError> {
@@ -592,7 +601,7 @@ impl AcpAgent {
         if let Some(conn) = slots.get(key).filter(|conn| conn.alive()) {
             return Ok(Arc::clone(conn));
         }
-        let launch = self.launch_with(extra_env);
+        let launch = self.launch_with(extra_env, cwd);
         let timeout = setup_timeout(&self.spec);
         let mut attempt = 0u32;
         loop {
@@ -768,19 +777,26 @@ impl LlmBackend for AcpAgent {
                 env: self.key_env.clone().unwrap_or_default(),
             });
         }
-        // Resolve the wished model *before* connecting: when `model_env` is
-        // configured the pin lives in the child's environment, and
-        // environments are born, not changed — so each model gets its own
-        // connection (and its own agent process).
+        // Resolve the wished model and per-bot workspace *before* connecting:
+        // when `model_env` is configured or a bot supplies its own `cwd`, each
+        // distinct `(model, cwd)` gets its own connection (and agent process)
+        // started directly inside that workspace.
+        let cwd = self.session_cwd(&request);
         let desired = desired_model(&request, self.spec.model.as_deref());
         let env_key = if self.model_env.is_empty() {
             String::new()
         } else {
             desired.clone().unwrap_or_default()
         };
+        let conn_key = if request.cwd.is_some() {
+            format!("{env_key}\n{}", cwd.display())
+        } else {
+            env_key
+        };
         let conn = self
             .connection_for(
-                &env_key,
+                &conn_key,
+                cwd.clone(),
                 self.substituted_model_env(desired.as_deref()),
                 &cancel,
             )
@@ -791,7 +807,7 @@ impl LlmBackend for AcpAgent {
         // 1. A fresh session per turn (module docs: the rendered history *is*
         //    the context; a reused session would double it).
         let new_params = json!({
-            "cwd": self.cwd.to_string_lossy(),
+            "cwd": cwd.to_string_lossy(),
             "mcpServers": [],
         });
         let session_value = self
@@ -1218,7 +1234,12 @@ impl LlmBackend for AcpAgent {
         // budget when it has to spawn one.
         let cancel = CancellationToken::new();
         let conn = self
-            .connection_for("", self.substituted_model_env(None), &cancel)
+            .connection_for(
+                "",
+                self.cwd.clone(),
+                self.substituted_model_env(None),
+                &cancel,
+            )
             .await?;
         let budget = probe_budget(&self.spec);
         let result = tokio::time::timeout(

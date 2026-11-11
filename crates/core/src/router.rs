@@ -93,33 +93,40 @@ impl GroupRouter {
             }
         }
 
-        let handles = mentioned_handles(text);
-        if handles.iter().any(|h| h == EVERYONE) {
+        let mut handles = mentioned_handles(text);
+        if handles.iter().any(|h| h == EVERYONE) || contains_word_ci(text, EVERYONE) {
             return RouteDecision {
                 targets: members.iter().map(|m| m.id.clone()).collect(),
                 reason: RouteReason::Everyone,
                 handles,
             };
         }
-        if !handles.is_empty() {
-            let targets: Vec<BotId> = handles
-                .iter()
-                .filter_map(|handle| {
-                    members
-                        .iter()
-                        .find(|m| m.name == *handle)
-                        .map(|m| m.id.clone())
-                })
-                .collect();
-            if !targets.is_empty() {
-                return RouteDecision {
-                    targets: dedupe(targets),
-                    reason: RouteReason::Mention,
-                    handles,
-                };
+
+        let mut targets: Vec<BotId> = Vec::new();
+
+        // 1. Matches from explicit @mentions
+        for handle in &handles {
+            if let Some(bot) = members.iter().find(|m| m.name.eq_ignore_ascii_case(handle)) {
+                targets.push(bot.id.clone());
             }
-            // A mention of somebody who is not in this group wakes nobody by
-            // itself; fall through to the reply-to/lead rules.
+        }
+
+        // 2. Matches from natural bot names and labels
+        for member in members {
+            if contains_word_ci(text, &member.name) || contains_word_ci(text, &member.label) {
+                if !handles.iter().any(|h| h.eq_ignore_ascii_case(&member.name)) {
+                    handles.push(member.name.clone());
+                }
+                targets.push(member.id.clone());
+            }
+        }
+
+        if !targets.is_empty() {
+            return RouteDecision {
+                targets: dedupe(targets),
+                reason: RouteReason::Mention,
+                handles,
+            };
         }
 
         if let Some(author) = reply_to
@@ -151,8 +158,8 @@ impl GroupRouter {
             })
     }
 
-    /// Which members a bot's reply wakes: the ones it mentioned, minus the
-    /// ones already addressed by the message it answers.
+    /// Which members a bot's reply wakes: the ones it mentioned or directly addressed,
+    /// minus the ones already addressed by the message it answers.
     pub fn wake_from_reply(
         members: &[Bot],
         reply_text: &str,
@@ -164,16 +171,39 @@ impl GroupRouter {
             .filter_map(|handle| {
                 members
                     .iter()
-                    .find(|m| m.name == *handle)
+                    .find(|m| m.name.eq_ignore_ascii_case(handle))
                     .map(|m| m.id.clone())
             })
             .collect();
-        if handles.iter().any(|h| h == EVERYONE) {
+        for member in members {
+            if is_bot_addressed_in_reply(reply_text, member) {
+                targets.push(member.id.clone());
+            }
+        }
+        if handles.iter().any(|h| h == EVERYONE) || contains_word_ci(reply_text, EVERYONE) {
             targets.extend(members.iter().map(|m| m.id.clone()));
         }
         targets.retain(|id| !already_addressed.contains(id));
         dedupe(targets)
     }
+}
+
+/// Check if a bot is directly addressed in a bot's reply (via friendly greeting or vocative).
+pub fn is_bot_addressed_in_reply(text: &str, bot: &Bot) -> bool {
+    let name = &bot.name;
+    let label = &bot.label;
+
+    for n in [name.as_str(), label.as_str()] {
+        if contains_word_ci(text, &format!("{n},")) || contains_word_ci(text, &format!("{n}:")) {
+            return true;
+        }
+        for greeting in ["halo", "hai", "hi", "hey", "hello", "dear"] {
+            if contains_word_ci(text, &format!("{greeting} {n}")) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// True when a bot's reply means "nothing to add", so it is not posted.
@@ -219,6 +249,55 @@ pub fn mentioned_handles(text: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// Check if a word/name appears in `text` on word boundaries, case-insensitively.
+///
+/// A word boundary is start/end of string or any character other than alphanumeric,
+/// `_`, or `-`. If the character immediately preceding is `@`, it only matches if
+/// that `@` was itself at a word boundary (so `@lead` matches, but `user@lead.com` does not).
+pub fn contains_word_ci(text: &str, word: &str) -> bool {
+    if word.is_empty() || text.is_empty() {
+        return false;
+    }
+    let word_lower = word.to_lowercase();
+    let text_lower = text.to_lowercase();
+
+    let mut search_from = 0;
+    while let Some(byte_idx) = text_lower[search_from..].find(&word_lower) {
+        let match_start = search_from + byte_idx;
+        let match_end = match_start + word_lower.len();
+
+        let before_ok = if match_start == 0 {
+            true
+        } else {
+            let prev_slice = &text[..match_start];
+            let last_char = prev_slice.chars().last().unwrap();
+            if last_char == '@' {
+                let before_at = &prev_slice[..prev_slice.len() - last_char.len_utf8()];
+                before_at
+                    .chars()
+                    .last()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.')
+            } else {
+                !last_char.is_alphanumeric() && last_char != '_' && last_char != '-'
+            }
+        };
+
+        let after_ok = if match_end >= text.len() {
+            true
+        } else {
+            let next_char = text[match_end..].chars().next().unwrap();
+            !next_char.is_alphanumeric() && next_char != '_' && next_char != '-'
+        };
+
+        if before_ok && after_ok {
+            return true;
+        }
+
+        search_from = match_start + 1;
+    }
+    false
 }
 
 fn dedupe(mut ids: Vec<BotId>) -> Vec<BotId> {
@@ -388,5 +467,79 @@ mod tests {
         let lead = &by_name(&members, "lead").id;
         let decision = GroupRouter::route(&members, "@dev go", &[], None, lead);
         assert_eq!(decision.names(&members), vec!["dev"]);
+    }
+
+    #[test]
+    fn natural_greeting_and_bot_name_without_at_wakes_bot() {
+        let members = team();
+        let scout = by_name(&members, "scout").id.clone();
+        let dev = by_name(&members, "dev").id.clone();
+        let lead = &by_name(&members, "lead").id;
+
+        // Greeting without @
+        let decision =
+            GroupRouter::route(&members, "halo scout, tolong cari file", &[], None, lead);
+        assert_eq!(decision.reason, RouteReason::Mention);
+        assert_eq!(decision.targets, vec![scout.clone()]);
+
+        // Direct call with colon
+        let decision = GroupRouter::route(&members, "dev: tolong compile", &[], None, lead);
+        assert_eq!(decision.reason, RouteReason::Mention);
+        assert_eq!(decision.targets, vec![dev.clone()]);
+
+        // Multiple bots mentioned naturally
+        let decision = GroupRouter::route(
+            &members,
+            "tolong tanyakan ke dev dan scout ya",
+            &[],
+            None,
+            lead,
+        );
+        assert_eq!(decision.reason, RouteReason::Mention);
+        assert_eq!(decision.targets.len(), 2);
+        assert!(decision.targets.contains(&scout));
+        assert!(decision.targets.contains(&dev));
+    }
+
+    #[test]
+    fn word_boundary_matcher_avoids_false_positives() {
+        assert!(!contains_word_ci("developer sedang bekerja", "dev"));
+        assert!(!contains_word_ci("email@dev.org", "dev"));
+        assert!(contains_word_ci("halo dev!", "dev"));
+        assert!(contains_word_ci("dev, tolong", "dev"));
+        assert!(contains_word_ci("@dev", "dev"));
+        assert!(contains_word_ci("hey @dev!", "dev"));
+        assert!(contains_word_ci("Dev", "dev"));
+    }
+
+    #[test]
+    fn wake_from_reply_wakes_naturally_named_bots() {
+        let members = team();
+        let scout = by_name(&members, "scout").id.clone();
+        let dev = by_name(&members, "dev").id.clone();
+
+        let woken = GroupRouter::wake_from_reply(
+            &members,
+            "halo dev tolong bantu ini",
+            std::slice::from_ref(&scout),
+        );
+        assert_eq!(woken, vec![dev]);
+
+        let woken_vocative = GroupRouter::wake_from_reply(
+            &members,
+            "dev: tolong compile kode ini",
+            std::slice::from_ref(&scout),
+        );
+        assert_eq!(woken_vocative, vec![by_name(&members, "dev").id.clone()]);
+
+        let woken_narrative = GroupRouter::wake_from_reply(
+            &members,
+            "On it — handing the search to dev.",
+            std::slice::from_ref(&scout),
+        );
+        assert!(
+            woken_narrative.is_empty(),
+            "third-person reference does not wake"
+        );
     }
 }

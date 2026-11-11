@@ -236,6 +236,13 @@ impl Swarm {
         self.data_dir.join("workspaces")
     }
 
+    /// Provision `<data>/workspaces/<bot_name>` (including `.spool/` and
+    /// `MEMORY.md`) so each bot's isolated workspace exists as soon as the bot
+    /// is created.
+    pub fn ensure_bot_workspace(&self, bot_name: &str) -> Result<PathBuf, DomainError> {
+        crate::compose::ensure_bot_workspace(&self.workspaces_root(), bot_name)
+    }
+
     /// Make sure the local node exists, so a bot with no node binding has one.
     pub fn ensure_local_node(&self) -> Result<NodeInfo, DomainError> {
         if let Some(node) = self.store.get_node(&NodeId::local())? {
@@ -264,9 +271,8 @@ impl Swarm {
         } else {
             self.bots.list()?
         };
-        let ws_root = self.workspaces_root();
         for bot in &bots {
-            let _ = crate::compose::ensure_bot_workspace(&ws_root, &bot.name);
+            let _ = self.ensure_bot_workspace(&bot.name);
         }
         Ok(bots)
     }

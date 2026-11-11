@@ -813,21 +813,24 @@ async fn execute_turn(
     session.note_conversation(&conversation.id);
 
     let memory_content = read_bot_memory(&workspace);
+    let workspace_abs = std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
+    let placement = if node.id.is_local() {
+        format!(
+            "node `{}` (local); private workspace: `{}`",
+            node.label,
+            workspace_abs.display()
+        )
+    } else {
+        format!("node `{}` (remote)", node.label)
+    };
+    let chat_cwd = node.id.is_local().then_some(workspace_abs);
     let instructions = env.instructions.render(
         bot,
         RenderOptions {
             task,
             tools: &visible,
             memory_index: memory_content.as_deref(),
-            placement: Some(&format!(
-                "node `{}` ({})",
-                node.label,
-                if node.id.is_local() {
-                    "local"
-                } else {
-                    "remote"
-                }
-            )),
+            placement: Some(&placement),
             messaging_enabled: settings.bot_messaging,
         },
     )?;
@@ -884,6 +887,7 @@ async fn execute_turn(
             temperature: None,
             extra_body: spec.map(|s| s.extra_body.clone()).unwrap_or_default(),
             extra_headers: spec.map(|s| s.extra_headers.clone()).unwrap_or_default(),
+            cwd: chat_cwd.clone(),
         };
 
         let (event_tx, event_rx) = mpsc::channel(256);

@@ -706,3 +706,144 @@ async fn the_instructions_a_bot_gets_name_its_real_team_and_tools() {
 
     rig.swarm.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_natural_greeting_wakes_a_teammate_in_the_group_without_at_symbol() {
+    let rig = rig();
+    rig.script(
+        LEAD,
+        vec![ScriptedTurn::text("halo dev, tolong buat parser test.")],
+    );
+    rig.script(
+        DEV,
+        vec![ScriptedTurn::text(
+            "Siap, test parser sudah dibuat dan lolos.",
+        )],
+    );
+
+    rig.swarm
+        .send(&rig.group, "mulai kerjakan pengujian")
+        .expect("sent");
+    rig.settle().await;
+
+    let group = rig.transcript(&rig.group);
+    assert!(
+        group.contains("halo dev, tolong buat parser test"),
+        "{group}"
+    );
+    assert!(
+        group.contains("Siap, test parser sudah dibuat dan lolos"),
+        "the naturally greeted bot answers in the group: {group}"
+    );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_natural_greeting_in_dm_delegates_to_teammate_and_reports_back() {
+    let rig = rig();
+    let lead_dm = rig.dm_of(&rig.lead);
+
+    // Lead receives greeting asking for scout in Lead's DM, delegates to Scout, then reports back.
+    rig.script(
+        LEAD,
+        vec![
+            ScriptedTurn::text("Saya minta bantuan scout untuk mencarikan file parser.")
+                .with_tool_call(
+                    "handoff_task",
+                    json!({
+                        "to": "scout",
+                        "title": "cari file parser",
+                        "task": "temukan letak file parser toml",
+                        "context": "di direktori src/"
+                    }),
+                ),
+            ScriptedTurn::text("Sedang didelegasikan ke scout..."),
+            ScriptedTurn::text("Scout sudah menemukan file parser di src/parser.rs. Selesai!"),
+        ],
+    );
+    rig.script(
+        SCOUT,
+        vec![ScriptedTurn::text(
+            "File parser terletak di src/parser.rs baris 10.",
+        )],
+    );
+
+    rig.swarm
+        .send(&lead_dm, "halo scout tolong carikan file parser")
+        .expect("sent");
+    rig.settle().await;
+
+    let dm_transcript = rig.transcript(&lead_dm);
+    assert!(
+        dm_transcript.contains("halo scout tolong carikan file parser"),
+        "{dm_transcript}"
+    );
+    assert!(
+        dm_transcript.contains("Scout sudah menemukan file parser di src/parser.rs"),
+        "lead reports back scout's answer in dm: {dm_transcript}"
+    );
+
+    // Verify task was created for scout
+    let tasks = rig.swarm.tasks.in_conversation(&lead_dm).expect("tasks");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].owner, rig.scout);
+    assert_eq!(tasks[0].status, TaskStatus::Succeeded);
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn each_bot_turn_receives_its_own_private_workspace_cwd_and_instructions() {
+    let rig = rig();
+    rig.script(LEAD, vec![ScriptedTurn::text("Lead ready.")]);
+    rig.script(SCOUT, vec![ScriptedTurn::text("Scout ready.")]);
+
+    rig.swarm
+        .send(&rig.dm_of(&rig.lead), "hi lead")
+        .expect("sent");
+    rig.swarm
+        .send(&rig.dm_of(&rig.scout), "hi scout")
+        .expect("sent");
+    rig.settle().await;
+
+    let lead_req = rig
+        .swarm
+        .backends
+        .registry()
+        .fake(LEAD)
+        .expect("fake lead")
+        .requests();
+    let scout_req = rig
+        .swarm
+        .backends
+        .registry()
+        .fake(SCOUT)
+        .expect("fake scout")
+        .requests();
+
+    assert_eq!(lead_req.len(), 1);
+    assert_eq!(scout_req.len(), 1);
+
+    let lead_cwd = lead_req[0].cwd.as_ref().expect("lead receives cwd");
+    let scout_cwd = scout_req[0].cwd.as_ref().expect("scout receives cwd");
+    assert_ne!(lead_cwd, scout_cwd, "each bot gets its own workspace");
+    assert!(lead_cwd.ends_with("workspaces/lead"), "{lead_cwd:?}");
+    assert!(scout_cwd.ends_with("workspaces/scout"), "{scout_cwd:?}");
+    assert!(
+        lead_req[0]
+            .instructions
+            .contains(&format!("private workspace: `{}`", lead_cwd.display())),
+        "{}",
+        lead_req[0].instructions
+    );
+    assert!(
+        scout_req[0]
+            .instructions
+            .contains(&format!("private workspace: `{}`", scout_cwd.display())),
+        "{}",
+        scout_req[0].instructions
+    );
+
+    rig.swarm.shutdown().await;
+}

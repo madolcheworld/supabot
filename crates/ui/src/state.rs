@@ -18,6 +18,7 @@
 //!   rather than being dropped on the floor.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use swarmbot_client::{BackendProbe, BackendView, Health, PairingCode};
@@ -69,6 +70,13 @@ impl ConnectionState {
     pub fn is_online(&self) -> bool {
         matches!(self, Self::Connected)
     }
+}
+
+/// A target selected for deletion confirmation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteTarget {
+    Bot { id: BotId, label: String },
+    Group { id: ConversationId, title: String },
 }
 
 /// Everything the app knows, plus the owner's navigation state.
@@ -124,6 +132,14 @@ pub struct AppState {
     pub routine_creator_open: bool,
     pub routine_draft_bot: Option<BotId>,
     pub routine_draft_schedule: RoutineSchedule,
+    pub create_group_open: bool,
+    pub create_group_title: String,
+    pub create_group_members: Vec<BotId>,
+    pub create_bot_open: bool,
+    pub create_bot_backend: Option<String>,
+    pub confirm_delete: Option<DeleteTarget>,
+    /// Brain data dir when locally spawned or explicitly supplied via `--data-dir`.
+    pub data_dir: Option<PathBuf>,
 
     // --- navigation / view state -----------------------------------------
     pub screen: Screen,
@@ -186,6 +202,13 @@ impl AppState {
             routine_creator_open: false,
             routine_draft_bot: None,
             routine_draft_schedule: RoutineSchedule::Interval { every_secs: 300 },
+            create_group_open: false,
+            create_group_title: String::new(),
+            create_group_members: Vec::new(),
+            create_bot_open: false,
+            create_bot_backend: None,
+            confirm_delete: None,
+            data_dir: None,
             screen: Screen::default(),
             open_conversation: None,
             open_task: None,
@@ -199,6 +222,12 @@ impl AppState {
             expanded_full: HashSet::new(),
             dismissed: HashSet::new(),
         }
+    }
+
+    pub fn bot_workspace(&self, bot_name: &str) -> Option<PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join("workspaces").join(bot_name))
     }
 
     // --- collapsible view state -------------------------------------------
@@ -397,6 +426,14 @@ impl AppState {
         if let Some(bot) = self.bots.iter_mut().find(|b| &b.id == id) {
             bot.status = status;
         }
+    }
+
+    pub fn remove_bot(&mut self, id: &BotId) {
+        if let Some(bot) = self.bots.iter().find(|b| &b.id == id) {
+            let dm = bot.direct_conversation_id.clone();
+            self.remove_conversation(&dm);
+        }
+        self.bots.retain(|b| &b.id != id);
     }
 
     pub fn upsert_conversation(&mut self, conversation: Conversation) {

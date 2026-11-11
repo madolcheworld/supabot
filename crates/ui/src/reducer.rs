@@ -239,6 +239,33 @@ pub fn apply_result(state: &mut AppState, result: CommandResult) {
             state.toast = Some("group created".to_string());
         }
         CommandResult::CreateGroup(Err(err)) => fail(state, "could not create the group", &err),
+        CommandResult::CreateBot(Ok(bot)) => {
+            let dm = bot.direct_conversation_id.clone();
+            state.upsert_bot(bot);
+            state.open(dm);
+            state.toast = Some("bot created".to_string());
+        }
+        CommandResult::CreateBot(Err(err)) => fail(state, "could not create the bot", &err),
+        CommandResult::DeleteBot {
+            bot,
+            result: Ok(()),
+        } => {
+            state.remove_bot(&bot);
+            state.toast = Some("bot deleted".to_string());
+        }
+        CommandResult::DeleteBot {
+            result: Err(err), ..
+        } => fail(state, "could not delete the bot", &err),
+        CommandResult::DeleteGroup {
+            conversation,
+            result: Ok(()),
+        } => {
+            state.remove_conversation(&conversation);
+            state.toast = Some("group deleted".to_string());
+        }
+        CommandResult::DeleteGroup {
+            result: Err(err), ..
+        } => fail(state, "could not delete the group", &err),
         CommandResult::BotSession(Ok(folded)) => {
             state.toast = Some(format!("folded {folded} message(s)"))
         }
@@ -745,5 +772,56 @@ mod tests {
         // Deleted
         apply_result(&mut state, CommandResult::RoutineDeleted(id, Ok(())));
         assert_eq!(state.routines.len(), 0);
+    }
+
+    #[test]
+    fn create_and_delete_bot_and_group_update_state_consistently() {
+        use swarmbot_contracts::Bot;
+        let mut state = AppState::new("http://brain.test");
+        let dm = ConversationId::new();
+        let bot = Bot::new(
+            "researcher",
+            "Researcher",
+            "searches docs",
+            "fake",
+            dm.clone(),
+        );
+        let bot_id = bot.id.clone();
+
+        // 1. Create bot
+        apply_result(&mut state, CommandResult::CreateBot(Ok(bot.clone())));
+        assert_eq!(state.bots.len(), 1);
+        assert_eq!(state.bots[0].name, "researcher");
+        assert_eq!(state.open_conversation, Some(dm.clone()));
+
+        // 2. Delete bot
+        apply_result(
+            &mut state,
+            CommandResult::DeleteBot {
+                bot: bot_id.clone(),
+                result: Ok(()),
+            },
+        );
+        assert!(state.bots.is_empty());
+        assert_eq!(state.open_conversation, None);
+
+        // 3. Group creation and deletion
+        let b1 = BotId::new();
+        let b2 = BotId::new();
+        let group = Conversation::group("Dev Team", vec![b1.clone(), b2], b1).expect("group");
+        let group_id = group.id.clone();
+        state.upsert_conversation(group);
+        state.open(group_id.clone());
+        assert_eq!(state.open_conversation, Some(group_id.clone()));
+
+        apply_result(
+            &mut state,
+            CommandResult::DeleteGroup {
+                conversation: group_id,
+                result: Ok(()),
+            },
+        );
+        assert!(state.conversations.is_empty());
+        assert_eq!(state.open_conversation, None);
     }
 }

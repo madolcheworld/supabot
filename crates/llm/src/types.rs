@@ -17,6 +17,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -151,6 +152,10 @@ pub struct ChatRequest {
     /// every built-in key and over the backend spec's `extra_body`.
     pub extra_body: Map<String, Value>,
     pub extra_headers: BTreeMap<String, String>,
+    /// Optional per-turn working directory (used by ACP backends to isolate
+    /// each bot's session inside its own workspace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 impl fmt::Debug for ChatRequest {
@@ -164,6 +169,7 @@ impl fmt::Debug for ChatRequest {
             .field("temperature", &self.temperature)
             .field("extra_body", &self.extra_body)
             .field("extra_headers", &RedactedHeaders(&self.extra_headers))
+            .field("cwd", &self.cwd)
             .finish()
     }
 }
@@ -179,6 +185,7 @@ impl ChatRequest {
             temperature: None,
             extra_body: Map::new(),
             extra_headers: BTreeMap::new(),
+            cwd: None,
         }
     }
 

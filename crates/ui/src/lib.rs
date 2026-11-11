@@ -197,7 +197,7 @@ pub fn run() -> i32 {
             if selftest {
                 run_selftest(cx, brain_url, report_window);
             } else {
-                run_app(cx, brain_url, brain, login_token, report_window);
+                run_app(cx, brain_url, data_dir, brain, login_token, report_window);
             }
         })
     }));
@@ -217,16 +217,22 @@ pub fn run() -> i32 {
 fn run_app(
     cx: &mut App,
     brain_url: SharedString,
+    data_dir: Option<PathBuf>,
     brain: Arc<ClientBrain>,
     login_token: Option<SecretToken>,
     report: Report,
 ) {
-    let state = cx.new(|_| AppState::new(brain_url.to_string()));
+    let state = cx.new(|_| {
+        let mut s = AppState::new(brain_url.to_string());
+        s.data_dir = data_dir;
+        s
+    });
     let (events_tx, events_rx) = std::sync::mpsc::channel();
     let worker = worker::Worker::start(brain, events_tx);
     if let Some(token) = login_token {
         let _ = worker.commands.send(proto::Command::Login(token));
     }
+    let _ = worker.commands.send(proto::Command::FetchBackends);
     worker::spawn_pump(cx, state.clone(), events_rx);
     worker::spawn_ticker(cx, state.clone());
     let commands = worker.commands.clone();

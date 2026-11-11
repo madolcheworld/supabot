@@ -27,6 +27,11 @@ use crate::args::Args;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
 /// How often to poll health while waiting.
 const HEALTH_POLL: Duration = Duration::from_millis(200);
+/// How long to wait for a graceful `POST /api/shutdown` exit before falling
+/// back to `SIGKILL`.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often to poll child exit while shutting down gracefully.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 
 /// Why a brain could not be spawned. Errors are values; each variant names the
 /// concrete thing that went wrong so the window can show it.
@@ -61,12 +66,13 @@ impl std::fmt::Display for SpawnError {
 
 impl std::error::Error for SpawnError {}
 
-/// A running brain child. Killing it and (for a temp data dir) removing the
+/// A running brain child. Stopping it and (for a temp data dir) removing the
 /// directory happen on drop, so an early return or a panic does not leak it.
 pub struct SpawnedBrain {
     child: Child,
     /// The exact argv it was started with, kept for the report and for honesty.
     pub argv: Vec<String>,
+    brain_url: String,
     data_dir: PathBuf,
     /// Whether `data_dir` is a temp dir this struct created (and must remove).
     owns_data_dir: bool,
@@ -85,11 +91,27 @@ impl SpawnedBrain {
         &self.data_dir
     }
 
-    /// Stop the child. SIGKILL via [`Child::kill`]: the spawned brain's data dir
-    /// is disposable (a temp dir by default), so a graceful shutdown is not worth
-    /// the extra failure modes here. This is stated plainly rather than dressed
-    /// up as a clean stop.
+    /// Stop the child: ask for a graceful `POST /api/shutdown` first so SQLite
+    /// checkpoints and turns finish settling, then fall back to `SIGKILL` if it
+    /// does not exit within [`SHUTDOWN_TIMEOUT`].
     pub fn kill(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        if let Ok((_, token)) = read_owner_token(&self.data_dir)
+            && let Ok(client) = BrainClient::new(&self.brain_url)
+        {
+            let client = client.with_token(&token);
+            if client.shutdown().is_ok() {
+                let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+                while Instant::now() < deadline {
+                    if matches!(self.child.try_wait(), Ok(Some(_))) {
+                        return;
+                    }
+                    std::thread::sleep(SHUTDOWN_POLL);
+                }
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -150,13 +172,8 @@ pub fn spawn(args: &Args) -> Result<SpawnedBrain, SpawnError> {
         if let Some(team) = find_team_file() {
             command.arg("--team").arg(&team);
         }
-    } else {
-        if let Some(team) = find_team_file() {
-            command.arg("--team").arg(&team);
-        }
-        if let Some(config) = find_config_file() {
-            command.arg("--config").arg(&config);
-        }
+    } else if let Some(config) = find_config_file() {
+        command.arg("--config").arg(&config);
     }
 
     let argv: Vec<String> = std::iter::once(bin.display().to_string())
@@ -170,6 +187,7 @@ pub fn spawn(args: &Args) -> Result<SpawnedBrain, SpawnError> {
     let spawned = SpawnedBrain {
         child,
         argv,
+        brain_url: args.brain.clone(),
         data_dir,
         owns_data_dir: owns,
     };
@@ -199,21 +217,47 @@ fn brain_binary() -> Result<PathBuf, SpawnError> {
     }
 }
 
-/// The data dir: `--data-dir` when given (not owned, not removed on exit), else
-/// a fresh temp dir named for this process (owned, removed on exit).
+/// The data dir:
+/// * `--data-dir` when given (persistent, not removed on exit);
+/// * a disposable temp dir for `--offline` or `--selftest` (owned, removed on exit);
+/// * `$XDG_DATA_HOME/swarmbot` or `~/.local/share/swarmbot` (fallback `./data`)
+///   otherwise so user-created bots and conversations survive restarts.
 fn resolve_data_dir(args: &Args) -> Result<(PathBuf, bool), SpawnError> {
-    if let Some(dir) = &args.data_dir {
-        let path = PathBuf::from(dir);
-        std::fs::create_dir_all(&path).map_err(|err| SpawnError::Io {
-            reason: format!("cannot create the data dir {}: {err}", path.display()),
-        })?;
-        return Ok((path, false));
-    }
-    let dir = std::env::temp_dir().join(format!("swarmbot-ui-brain-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|err| SpawnError::Io {
-        reason: format!("cannot create the temp data dir {}: {err}", dir.display()),
+    let xdg = std::env::var("XDG_DATA_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    let (path, owns) = resolve_data_dir_with(args, xdg.as_deref(), home.as_deref());
+    std::fs::create_dir_all(&path).map_err(|err| SpawnError::Io {
+        reason: format!("cannot create the data dir {}: {err}", path.display()),
     })?;
-    Ok((dir, true))
+    Ok((path, owns))
+}
+
+fn resolve_data_dir_with(
+    args: &Args,
+    xdg_data_home: Option<&str>,
+    home: Option<&str>,
+) -> (PathBuf, bool) {
+    if let Some(dir) = &args.data_dir {
+        return (PathBuf::from(dir), false);
+    }
+    if args.offline || args.selftest {
+        let dir = std::env::temp_dir().join(format!("swarmbot-ui-brain-{}", std::process::id()));
+        return (dir, true);
+    }
+    (persistent_data_dir(xdg_data_home, home), false)
+}
+
+fn persistent_data_dir(xdg_data_home: Option<&str>, home: Option<&str>) -> PathBuf {
+    if let Some(xdg) = xdg_data_home.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(xdg).join("swarmbot");
+    }
+    if let Some(home) = home.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("swarmbot");
+    }
+    PathBuf::from("data")
 }
 
 /// `HOST:PORT` for the child to listen on: `--brain-addr` when given, else
@@ -372,5 +416,59 @@ mod tests {
         std::fs::write(dir.path().join("owner-token"), "   \n").expect("write");
         let err = read_owner_token(dir.path()).expect_err("empty is not a token");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    fn base_args() -> Args {
+        Args {
+            brain: "http://127.0.0.1:8787".to_string(),
+            token: None,
+            spawn_brain: true,
+            offline: false,
+            data_dir: None,
+            brain_addr: None,
+            selftest: false,
+            report: None,
+        }
+    }
+
+    #[test]
+    fn spawn_brain_persists_under_xdg_or_home_by_default() {
+        let args = base_args();
+        let (path, owns) = resolve_data_dir_with(&args, Some("/xdg"), Some("/home/tester"));
+        assert_eq!(path, PathBuf::from("/xdg/swarmbot"));
+        assert!(!owns);
+
+        let (path, owns) = resolve_data_dir_with(&args, Some("  "), Some("/home/tester"));
+        assert_eq!(path, PathBuf::from("/home/tester/.local/share/swarmbot"));
+        assert!(!owns);
+
+        let (path, owns) = resolve_data_dir_with(&args, None, None);
+        assert_eq!(path, PathBuf::from("data"));
+        assert!(!owns);
+    }
+
+    #[test]
+    fn offline_and_selftest_keep_disposable_temp_data_dirs() {
+        let mut offline = base_args();
+        offline.offline = true;
+        let (path, owns) = resolve_data_dir_with(&offline, Some("/xdg"), Some("/home/tester"));
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert!(owns);
+
+        let mut selftest = base_args();
+        selftest.selftest = true;
+        let (path, owns) = resolve_data_dir_with(&selftest, Some("/xdg"), Some("/home/tester"));
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert!(owns);
+    }
+
+    #[test]
+    fn explicit_data_dir_beats_defaults_and_is_not_owned() {
+        let mut args = base_args();
+        args.offline = true;
+        args.data_dir = Some("/custom/swarmbot-state".to_string());
+        let (path, owns) = resolve_data_dir_with(&args, Some("/xdg"), Some("/home/tester"));
+        assert_eq!(path, PathBuf::from("/custom/swarmbot-state"));
+        assert!(!owns);
     }
 }

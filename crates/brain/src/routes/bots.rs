@@ -142,6 +142,7 @@ pub async fn create(
         bot.skills = body.skills;
         bot = state.swarm.bots.update(&bot)?;
     }
+    state.swarm.ensure_bot_workspace(&bot.name)?;
     Ok((StatusCode::CREATED, finish(&state, bot, true)?))
 }
 

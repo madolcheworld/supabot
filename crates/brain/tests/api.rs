@@ -348,6 +348,12 @@ async fn bots_create_list_get_patch_and_delete() {
     // answer, which is indistinguishable from a hung brain.
     let bot_id: BotId = id.parse().expect("a bot id");
     assert!(brain.swarm.runners.get(&bot_id).is_some(), "no runner");
+    let bot_ws = brain.swarm.workspaces_root().join("reviewer-two");
+    assert!(
+        bot_ws.join("MEMORY.md").is_file(),
+        "bot workspace initialized"
+    );
+    assert!(bot_ws.join(".spool").is_dir(), "bot spool initialized");
 
     // List: the demo team plus this one.
     let bots = array(get(&client, &brain.url("/api/bots")).await).await;

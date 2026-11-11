@@ -14,8 +14,8 @@
 
 use serde_json::Value;
 use swarmbot_client::{
-    BackendModels, BackendProbe, BackendView, BrainClient, ClientError, Health, NewRoutineRequest,
-    PairingCode, SentMessage, SessionAction, TaskDetail,
+    BackendModels, BackendProbe, BackendView, BrainClient, ClientError, Health, NewBotRequest,
+    NewRoutineRequest, PairingCode, SentMessage, SessionAction, TaskDetail,
 };
 use swarmbot_contracts::{
     Bot, BotId, Conversation, ConversationId, Decision, EntryId, NodeId, NodeInfo, RequestId,
@@ -49,6 +49,9 @@ pub trait Brain: Send + Sync {
         members: &[BotId],
         lead: Option<&BotId>,
     ) -> Result<Conversation, ClientError>;
+    fn delete_conversation(&self, id: &ConversationId) -> Result<(), ClientError>;
+    fn create_bot(&self, request: &NewBotRequest) -> Result<Bot, ClientError>;
+    fn delete_bot(&self, id_or_name: &str) -> Result<(), ClientError>;
     fn bot_session(&self, id_or_name: &str, action: SessionAction) -> Result<usize, ClientError>;
     fn create_pairing_code(&self) -> Result<PairingCode, ClientError>;
     fn revoke_node(&self, id: &NodeId) -> Result<(), ClientError>;
@@ -133,6 +136,15 @@ impl Brain for ClientBrain {
         lead: Option<&BotId>,
     ) -> Result<Conversation, ClientError> {
         self.client.create_group(title, members, lead)
+    }
+    fn delete_conversation(&self, id: &ConversationId) -> Result<(), ClientError> {
+        self.client.delete_conversation(id)
+    }
+    fn create_bot(&self, request: &NewBotRequest) -> Result<Bot, ClientError> {
+        self.client.create_bot(request)
+    }
+    fn delete_bot(&self, id_or_name: &str) -> Result<(), ClientError> {
+        self.client.delete_bot(id_or_name)
     }
     fn bot_session(&self, id_or_name: &str, action: SessionAction) -> Result<usize, ClientError> {
         self.client.bot_session(id_or_name, action)
@@ -334,6 +346,27 @@ pub mod scripted {
                 Conversation::direct(BotId::new())
             };
             self.maybe_fail(conversation)
+        }
+        fn delete_conversation(&self, id: &ConversationId) -> Result<(), ClientError> {
+            self.record("delete_conversation", id.to_string());
+            self.maybe_fail(())
+        }
+        fn create_bot(&self, request: &NewBotRequest) -> Result<Bot, ClientError> {
+            self.record(
+                "create_bot",
+                format!("{} ({})", request.name, request.label),
+            );
+            self.maybe_fail(swarmbot_contracts::Bot::new(
+                &request.name,
+                &request.label,
+                &request.instructions,
+                &request.backend,
+                swarmbot_contracts::ConversationId::new(),
+            ))
+        }
+        fn delete_bot(&self, id_or_name: &str) -> Result<(), ClientError> {
+            self.record("delete_bot", id_or_name.to_string());
+            self.maybe_fail(())
         }
         fn bot_session(&self, id: &str, action: SessionAction) -> Result<usize, ClientError> {
             self.record("bot_session", format!("{id} {action:?}"));

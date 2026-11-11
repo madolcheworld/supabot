@@ -27,7 +27,7 @@ pub struct Args {
     #[arg(long)]
     pub token: Option<SecretToken>,
 
-    /// Start `swarmbot-brain` as a child, wait for `/api/health`, and kill it on
+    /// Start `swarmbot-brain` as a child, wait for `/api/health`, and stop it on
     /// exit. Uses `std::process` — no tokio in this process (D7.2).
     #[arg(long)]
     pub spawn_brain: bool,
@@ -38,8 +38,9 @@ pub struct Args {
     #[arg(long)]
     pub offline: bool,
 
-    /// Data directory for a spawned brain (defaults to a fresh temp dir that is
-    /// removed on exit).
+    /// Data directory for a spawned brain (defaults to `$XDG_DATA_HOME/swarmbot`
+    /// or `~/.local/share/swarmbot`, or a disposable temp dir under `--offline`
+    /// / `--selftest`).
     #[arg(long)]
     pub data_dir: Option<String>,
 

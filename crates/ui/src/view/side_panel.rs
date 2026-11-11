@@ -21,16 +21,19 @@ pub fn render(
     let state_toggle = state.clone();
 
     // Determine target bot name
+    let has_bots = !s.bots.is_empty();
     let bot_name = if let Some(conv) = s.open_conversation() {
         match &conv.kind {
             swarmbot_contracts::ConversationKind::Direct { bot_id } => s
                 .bot(bot_id)
                 .map(|b| b.label.clone())
-                .unwrap_or_else(|| "Waypoint".to_string()),
-            _ => "Waypoint".to_string(),
+                .unwrap_or_else(|| "Bot".to_string()),
+            _ => "Group".to_string(),
         }
+    } else if let Some(first_bot) = s.bots.first() {
+        first_bot.label.clone()
     } else {
-        "Waypoint".to_string()
+        "Bot".to_string()
     };
 
     div()
@@ -67,9 +70,9 @@ pub fn render(
                         }),
                 ),
         )
-        // 2. Scrollable content: Bot Screen Card + Routines Section
-        .child(
-            div()
+        // 2. Scrollable content: Team Bots Section + optional Bot Screen Card + Routines Section
+        .child({
+            let mut scroll = div()
                 .id("side-panel-scroll")
                 .flex_1()
                 .overflow_y_scroll()
@@ -78,14 +81,18 @@ pub fn render(
                 .gap_4()
                 .px_4()
                 .py_2()
+                // Team Bots Section
+                .child(team_bots_section(s, state, commands));
+            if has_bots {
                 // Top Card: "<BotName>'s screen"
-                .child(screen_card(&bot_name))
-                // Bottom Section: Routines
-                .child(routines_section(s, state, commands)),
-        )
+                scroll = scroll.child(screen_card(&bot_name, true));
+            }
+            // Bottom Section: Routines
+            scroll.child(routines_section(s, state, commands))
+        })
 }
 
-fn screen_card(bot_name: &str) -> gpui::Div {
+fn screen_card(bot_name: &str, has_bots: bool) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -110,8 +117,225 @@ fn screen_card(bot_name: &str) -> gpui::Div {
                 .justify_center()
                 .text_xs()
                 .text_color(rgb(theme::TEXT_MUTED))
-                .child(format!("{bot_name}'s screen")),
+                .child(if has_bots {
+                    format!("{bot_name}'s screen")
+                } else {
+                    "No active bot screen".to_string()
+                }),
         )
+}
+
+fn team_bots_section(
+    s: &AppState,
+    state: &Entity<AppState>,
+    commands: &Sender<Command>,
+) -> gpui::Div {
+    let state_h = state.clone();
+    let commands_h = commands.clone();
+
+    let mut section = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        // Header row
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .pt_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(rgb(theme::TEXT))
+                                .child("Team Bots"),
+                        )
+                        .when(!s.bots.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .bg(rgb(theme::SURFACE_RAISED))
+                                    .text_xs()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .child(s.bots.len().to_string()),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .id("add-bot-button")
+                        .size(px(28.0))
+                        .rounded_lg()
+                        .bg(rgb(0xebebee))
+                        .cursor_pointer()
+                        .hover(|h| h.bg(rgb(0xdcdce0)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(rgb(theme::TEXT))
+                        .text_base()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child("+")
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            state_h.update(cx, |st, cx| {
+                                st.create_bot_open = true;
+                                st.create_group_open = false;
+                                cx.notify();
+                            });
+                            let _ = commands_h.send(Command::FetchBackends);
+                        }),
+                ),
+        );
+
+    if !s.bots.is_empty() {
+        let mut list = div().flex().flex_col().gap_1p5();
+        for bot in &s.bots {
+            let state_open = state.clone();
+            let state_del = state.clone();
+            let bot_id = bot.id.clone();
+            let bot_label = bot.label.clone();
+            let dm = bot.direct_conversation_id.clone();
+            let bot_color = theme::bot_color(bot);
+            let bot_initial = bits::initial(&bot.label);
+            let bot_handle = bot.name.clone();
+
+            list = list.child(
+                div()
+                    .id(gpui::SharedString::from(format!("side-bot-{}", bot.id)))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py_1p5()
+                    .rounded_xl()
+                    .cursor_pointer()
+                    .hover(|h| h.bg(rgb(theme::SURFACE_RAISED)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .flex_1()
+                            .child(bits::avatar(bot_color, bot_initial, px(28.0)))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(rgb(theme::TEXT))
+                                            .truncate()
+                                            .child(bot_label.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_MUTED))
+                                            .truncate()
+                                            .child(format!("@{bot_handle}")),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(gpui::SharedString::from(format!("side-del-{}", bot.id)))
+                            .cursor_pointer()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_DIM))
+                            .hover(|h| h.text_color(rgb(theme::DANGER)).bg(rgb(0xfee2e2)))
+                            .child("✕")
+                            .on_click(move |_, _, cx: &mut gpui::App| {
+                                cx.stop_propagation();
+                                let bid = bot_id.clone();
+                                let blab = bot_label.clone();
+                                state_del.update(cx, |st, cx| {
+                                    st.confirm_delete = Some(crate::state::DeleteTarget::Bot {
+                                        id: bid,
+                                        label: blab,
+                                    });
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .on_click(move |_, _, cx: &mut gpui::App| {
+                        let dm = dm.clone();
+                        state_open.update(cx, |st, cx| {
+                            st.open(dm);
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+        section = section.child(list);
+    } else {
+        let state_empty = state.clone();
+        let commands_empty = commands.clone();
+        section = section.child(
+            div()
+                .py_3()
+                .px_3()
+                .rounded_xl()
+                .bg(rgb(theme::SURFACE_RAISED))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child("No bots yet"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_DIM))
+                        .child("Add a bot to start chatting or form a group."),
+                )
+                .child(
+                    div()
+                        .id("side-empty-add-bot")
+                        .px_3()
+                        .py_1p5()
+                        .rounded_lg()
+                        .bg(rgb(theme::ACCENT))
+                        .hover(|h| h.bg(rgb(theme::ACCENT_HOVER)))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(theme::BACKGROUND))
+                        .child("+ Add Bot")
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            state_empty.update(cx, |st, cx| {
+                                st.create_bot_open = true;
+                                st.create_group_open = false;
+                                cx.notify();
+                            });
+                            let _ = commands_empty.send(Command::FetchBackends);
+                        }),
+                ),
+        );
+    }
+
+    section
 }
 
 fn routines_section(
@@ -121,29 +345,6 @@ fn routines_section(
 ) -> gpui::Div {
     let state_h = state.clone();
     let commands_h = commands.clone();
-
-    // Default sample routines from the screenshot
-    let default_routines = [
-        ("Check Waypoint inbox", "Every day at 10:27 AM"),
-        ("Liesl food surprise reminder", "Every Thursday at 5:00 PM"),
-        (
-            "Black Oak Halloween window check",
-            "Every October 1 at 9:00 AM",
-        ),
-        ("Basecamp day-of email", "Every November 20 at 8:00 AM"),
-        (
-            "Black Oak 2027 first-weekend open",
-            "Every November 21 at 8:00 AM",
-        ),
-        (
-            "Black Oak 2027 Halloween weekend open",
-            "Every November 28 at 8:00 AM",
-        ),
-        (
-            "February trip planning check",
-            "Every February 1 at 9:00 AM",
-        ),
-    ];
 
     let mut section = div()
         .flex()
@@ -190,17 +391,22 @@ fn routines_section(
 
     let mut list = div().flex().flex_col().gap_3p5();
 
-    // Render real routines if configured
     if !s.routines.is_empty() {
         for routine in &s.routines {
             let sched = format_schedule(&routine.schedule);
             list = list.child(routine_item(&routine.name, &sched));
         }
     } else {
-        // Render the exact routines list from the screenshot
-        for (name, sched) in default_routines {
-            list = list.child(routine_item(name, sched));
-        }
+        list = list.child(
+            div()
+                .py_2()
+                .px_3()
+                .rounded_xl()
+                .bg(rgb(theme::SURFACE_RAISED))
+                .text_xs()
+                .text_color(rgb(theme::TEXT_DIM))
+                .child("No routines yet"),
+        );
     }
 
     section = section.child(list);
