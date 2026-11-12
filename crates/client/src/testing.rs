@@ -25,10 +25,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use swarmbot_contracts::{
-    ApprovalRule, BackendSpec, Bot, BotId, Conversation, ConversationId, Decision, Entry, EntryId,
-    EntryKind, LiveCursor, LiveEvent, NodeInfo, PolicyMap, RequestId, RequestStatus, Responder,
-    RuleEffect, RuleScope, RuntimeRequest, Settings, Snapshot, Surface, Task, TaskId, TaskStatus,
-    TaskStep,
+    ApprovalRule, BackendSpec, Bot, BotId, Conversation, ConversationId, ConversationKind,
+    Decision, Entry, EntryId, EntryKind, LiveCursor, LiveEvent, NodeInfo, PolicyMap, RequestId,
+    RequestStatus, Responder, RuleEffect, RuleScope, RuntimeRequest, Settings, Snapshot, Surface,
+    Task, TaskId, TaskStatus, TaskStep,
 };
 
 /// One request the stub received, as tests see it.
@@ -456,9 +456,9 @@ fn route(request: &RawRequest) -> Reply {
         ("GET" | "PATCH", ["api", "bots", _id]) => Reply::value(&stub_bot()),
         ("POST", ["api", "bots", _id, "session"]) => Reply::ok(json!({"folded": 3})),
         ("GET", ["api", "conversations"]) => Reply::value(&[stub_conversation()]),
-        ("POST", ["api", "conversations"]) => Reply::json(201, to_value(&stub_conversation())),
+        ("POST", ["api", "conversations"]) => Reply::json(201, to_value(&echo_group(&body()))),
         ("GET", ["api", "conversations", _id]) => Reply::value(&stub_conversation()),
-        ("PATCH", ["api", "conversations", _id]) => Reply::value(&echo_title(&body())),
+        ("PATCH", ["api", "conversations", id]) => Reply::value(&echo_group_update(id, &body())),
         ("GET", ["api", "conversations", _id, "entries" | "tail"]) => Reply::value(&[stub_entry()]),
         ("POST", ["api", "conversations", _id, "messages"]) => {
             Reply::ok(echo_sent_message(&body()))
@@ -608,15 +608,94 @@ fn echo_bot(body: &str) -> Bot {
     bot
 }
 
-/// `PATCH /api/conversations/{id}`: the renamed conversation.
-fn echo_title(body: &str) -> Conversation {
-    let mut conversation = stub_conversation();
-    if let Ok(value) = serde_json::from_str::<Value>(body)
-        && let Some(title) = value["title"].as_str()
-    {
-        conversation.title = Some(title.to_string());
+#[derive(Deserialize)]
+struct GroupCreateBody {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    members: Vec<BotId>,
+    #[serde(default)]
+    lead: Option<BotId>,
+}
+
+/// `POST /api/conversations`: a group carrying the requested title, members, and lead.
+fn echo_group(body: &str) -> Conversation {
+    let parsed: GroupCreateBody = serde_json::from_str(body).unwrap_or(GroupCreateBody {
+        title: String::new(),
+        members: Vec::new(),
+        lead: None,
+    });
+    let default_a = stub_bot().id;
+    let default_b = BotId::from_suffix("000000000000000000000000000000b2");
+    let members = if parsed.members.is_empty() {
+        vec![default_a.clone(), default_b]
+    } else {
+        parsed.members
+    };
+    let lead = parsed
+        .lead
+        .unwrap_or_else(|| members.first().cloned().unwrap_or(default_a));
+    let title = if parsed.title.trim().is_empty() {
+        "Stub Group".to_string()
+    } else {
+        parsed.title
+    };
+    let base = stub_conversation();
+    Conversation {
+        id: ConversationId::new(),
+        kind: ConversationKind::Group { members, lead },
+        title: Some(title),
+        created_at: base.created_at,
+        updated_at: base.updated_at,
+        last_seq: 0,
+        archived: false,
     }
-    conversation
+}
+
+#[derive(Deserialize)]
+struct GroupPatchBody {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    members: Option<Vec<BotId>>,
+    #[serde(default)]
+    lead: Option<BotId>,
+}
+
+/// `PATCH /api/conversations/{id}`: the updated group conversation.
+fn echo_group_update(id: &str, body: &str) -> Conversation {
+    let parsed: GroupPatchBody = serde_json::from_str(body).unwrap_or(GroupPatchBody {
+        title: None,
+        members: None,
+        lead: None,
+    });
+    let default_a = stub_bot().id;
+    let default_b = BotId::from_suffix("000000000000000000000000000000b2");
+    let members = match parsed.members {
+        Some(members) => members,
+        None => {
+            let mut members = vec![default_a.clone(), default_b];
+            if let Some(ref lead) = parsed.lead
+                && !members.contains(lead)
+            {
+                members.push(lead.clone());
+            }
+            members
+        }
+    };
+    let lead = parsed
+        .lead
+        .unwrap_or_else(|| members.first().cloned().unwrap_or(default_a));
+    let base = stub_conversation();
+    Conversation {
+        id: ConversationId::parse(id).unwrap_or(base.id),
+        kind: ConversationKind::Group { members, lead },
+        title: Some(parsed.title.unwrap_or_else(|| "Stub Group".to_string())),
+        created_at: base.created_at,
+        updated_at: base.updated_at,
+        last_seq: base.last_seq,
+        archived: false,
+    }
 }
 
 #[derive(Deserialize)]

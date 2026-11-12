@@ -1,11 +1,14 @@
 //! Target resolution: one string from the command line, one conversation to
 //! talk in.
 //!
-//! `<TARGET>` may be a bot handle (`lead`, `@Lead`), a group title (`Team`) or
-//! a raw conversation id (`cnv_…`), tried in exactly that order — a handle is
-//! what people type, an id is what scripts paste. The caller is told *which*
-//! interpretation matched, because silently guessing a DM when the user meant
-//! a group is the kind of surprise a CLI must not have.
+//! `<TARGET>` may be a bot handle (`lead`, `@Lead`, `bot:lead`), a group title
+//! (`Team`, `group:Team`, `#Team`) or a raw conversation id (`cnv_…`). Bare
+//! targets are tried in exact order: bot handle, then group title, then
+//! conversation id — a handle is what people type, an id is what scripts paste.
+//! Explicit prefixes (`@` / `bot:`, `#` / `group:`) disambiguate when a bot and
+//! a group share a name. The caller is told *which* interpretation matched,
+//! because silently guessing a DM when the user meant a group is the kind of
+//! surprise a CLI must not have.
 
 use anyhow::{Result, anyhow};
 use swarmbot_contracts::bot::{Bot, normalize_name};
@@ -82,8 +85,97 @@ impl Directory {
             .collect()
     }
 
+    /// Resolve a group explicitly by title (case-insensitive) or group id.
+    pub fn resolve_group(&self, raw: &str) -> Result<Conversation> {
+        let key = raw.trim();
+        if key.is_empty() {
+            return Err(anyhow!("a group name cannot be empty"));
+        }
+        if let Some(conversation) = self.conversations.iter().find(|c| {
+            c.kind.is_group()
+                && c.title
+                    .as_deref()
+                    .is_some_and(|title| title.eq_ignore_ascii_case(key))
+        }) {
+            return Ok(conversation.clone());
+        }
+        if let Ok(id) = ConversationId::parse(key)
+            && let Some(conversation) = self
+                .conversations
+                .iter()
+                .find(|c| c.kind.is_group() && c.id == id)
+        {
+            return Ok(conversation.clone());
+        }
+        let groups: Vec<String> = self
+            .groups()
+            .iter()
+            .map(|c| format!("\"{}\"", c.title.as_deref().unwrap_or("untitled")))
+            .collect();
+        Err(anyhow!(
+            "there is no group called \"{key}\" (groups: {})",
+            if groups.is_empty() {
+                "(none)".into()
+            } else {
+                groups.join(", ")
+            }
+        ))
+    }
+
+    /// Resolve a bot explicitly by handle (`lead`, `@lead`, case-insensitive).
+    pub fn resolve_bot(&self, raw: &str) -> Result<Bot> {
+        let handle = normalize_name(raw.trim());
+        if handle.is_empty() {
+            return Err(anyhow!("a bot handle cannot be empty"));
+        }
+        self.bots
+            .iter()
+            .find(|b| b.name == handle)
+            .cloned()
+            .ok_or_else(|| {
+                let bots: Vec<String> = self.bots.iter().map(|b| format!("@{}", b.name)).collect();
+                anyhow!(
+                    "there is no bot called @{handle} (bots: {})",
+                    if bots.is_empty() {
+                        "(none)".into()
+                    } else {
+                        bots.join(", ")
+                    }
+                )
+            })
+    }
+
+    /// When a bare target resolved to a bot whose handle matches a group title,
+    /// tell the caller how to reach the group instead of leaving them guessing.
+    pub fn ambiguity_hint(&self, raw: &str, matched: &Target) -> Option<String> {
+        let key = raw.trim();
+        if key.starts_with('@')
+            || key.starts_with('#')
+            || strip_prefix_ignore_ascii_case(key, "bot:").is_some()
+            || strip_prefix_ignore_ascii_case(key, "group:").is_some()
+        {
+            return None;
+        }
+        if let Target::Bot { bot } = matched
+            && let Some(group) = self.conversations.iter().find(|c| {
+                c.kind.is_group()
+                    && c.title
+                        .as_deref()
+                        .is_some_and(|title| title.eq_ignore_ascii_case(&bot.name))
+            })
+        {
+            let title = group.title.as_deref().unwrap_or(&bot.name);
+            return Some(format!(
+                "both bot @{} and group \"{title}\" exist — matched bot; use `#{title}` or `group:{title}` for the group",
+                bot.name
+            ));
+        }
+        None
+    }
+
     /// Bot handle, then group title, then conversation id — the documented
-    /// order. An unknown target is an error that lists what does exist,
+    /// order. Explicit prefixes (`group:` / `#` and `bot:` / `@`) pick one side
+    /// directly. An unknown target is an error that lists what does exist,
     /// because "not found" alone sends people guessing.
     pub fn resolve(&self, raw: &str) -> Result<Target> {
         let key = raw.trim();
@@ -91,8 +183,21 @@ impl Directory {
             return Err(anyhow!("a target cannot be empty"));
         }
 
-        // 1. A bot handle: `@` optional, case-insensitive (normalize_name does
-        //    exactly the folding a mention would).
+        if let Some(group_key) =
+            strip_prefix_ignore_ascii_case(key, "group:").or_else(|| key.strip_prefix('#'))
+        {
+            let conversation = self.resolve_group(group_key)?;
+            return Ok(Target::Group { conversation });
+        }
+        if let Some(bot_key) =
+            strip_prefix_ignore_ascii_case(key, "bot:").or_else(|| key.strip_prefix('@'))
+        {
+            let bot = self.resolve_bot(bot_key)?;
+            return Ok(Target::Bot { bot });
+        }
+
+        // 1. A bot handle: case-insensitive (normalize_name does the same
+        //    folding a mention would).
         let handle = normalize_name(key);
         if !handle.is_empty()
             && let Some(bot) = self.bots.iter().find(|b| b.name == handle)
@@ -153,6 +258,12 @@ impl Directory {
             },
         )
     }
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &s[prefix.len()..])
 }
 
 /// Ids are long; the tail is the distinguishing part in a one-line message.
@@ -312,5 +423,57 @@ mod tests {
             target.describe()
         );
         assert!(target.bot().is_none());
+    }
+
+    #[test]
+    fn explicit_prefixes_disambiguate_shared_bot_and_group_names() {
+        let dm = ConversationId::new();
+        let team_bot = Bot::new("team", "Team", "", "fake", dm.clone());
+        let scout = Bot::new("scout", "Scout", "", "fake", ConversationId::new());
+        let group = Conversation::group(
+            "Team",
+            vec![team_bot.id.clone(), scout.id.clone()],
+            team_bot.id.clone(),
+        )
+        .expect("a valid group");
+        let directory = Directory::new(
+            vec![team_bot.clone(), scout],
+            vec![
+                Conversation {
+                    kind: swarmbot_contracts::conversation::ConversationKind::Direct {
+                        bot_id: team_bot.id.clone(),
+                    },
+                    id: dm,
+                    ..Conversation::direct(BotId::new())
+                },
+                group.clone(),
+            ],
+        );
+
+        let bare = directory.resolve("team").expect("resolves bare");
+        assert!(matches!(bare, Target::Bot { .. }));
+        let hint = directory
+            .ambiguity_hint("team", &bare)
+            .expect("warns about ambiguity");
+        assert!(
+            hint.contains("#Team") && hint.contains("group:Team"),
+            "{hint}"
+        );
+
+        for expr in ["group:team", "#Team", "#team"] {
+            let resolved = directory.resolve(expr).expect("resolves group prefix");
+            assert_eq!(resolved.conversation_id(), &group.id, "{expr}");
+            assert!(matches!(resolved, Target::Group { .. }), "{expr}");
+            assert!(directory.ambiguity_hint(expr, &resolved).is_none());
+        }
+        for expr in ["bot:team", "@team"] {
+            let resolved = directory.resolve(expr).expect("resolves bot prefix");
+            assert_eq!(resolved.bot().expect("bot").id, team_bot.id, "{expr}");
+            assert!(directory.ambiguity_hint(expr, &resolved).is_none());
+        }
+        assert!(
+            directory.resolve_group("scout").is_err(),
+            "resolve_group ignores bot handles"
+        );
     }
 }

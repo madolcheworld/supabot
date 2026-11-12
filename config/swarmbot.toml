@@ -1,7 +1,20 @@
 # SwarmBot Brain Configuration with Installed ACP Providers
 data_dir = "data"
 public_addr = "127.0.0.1:8787"
+
+# Internal listener: the MCP gateway that exposes SwarmBot's team/task tools
+# (`message_bot`, `post_to_group`, `handoff_task`, etc.) to ACP / CLI harnesses.
+# Port 0 picks an ephemeral loopback port without conflicts; "" disables it.
+internal_addr = "127.0.0.1:0"
+
 default_backend = "opencode"
+
+# ACP backends run their own sandboxed tools and answer ACP permission asks
+# using `permission_mode`:
+#   - "reject" (default): refuse every ACP permission ask so the agent reads,
+#     answers, and uses SwarmBot's MCP team/task tools without mutating files.
+#   - "allow": explicit opt-in that picks the agent's allow-once option per
+#     action (never `*_always`, so no blanket grant outlives a turn).
 
 # 1. OpenCode (Native ACP Agent installed on this machine)
 [[backends]]
@@ -11,6 +24,7 @@ kind = "acp"
 command = "opencode"
 args = ["acp"]
 models_command = ["opencode", "models"]
+permission_mode = "reject"
 [backends.options.model_env]
 OPENCODE_CONFIG_CONTENT = '{"model":"{model}"}'
 
@@ -20,6 +34,7 @@ id = "claude"
 kind = "acp"
 [backends.options]
 command = "claude-code-acp"
+permission_mode = "reject"
 
 # 3. Codex (via ACP adapter)
 [[backends]]
@@ -27,6 +42,7 @@ id = "codex"
 kind = "acp"
 [backends.options]
 command = "codex-acp"
+permission_mode = "reject"
 
 
 [settings]

@@ -23,9 +23,9 @@ use std::time::Instant;
 
 use swarmbot_client::{BackendProbe, BackendView, Health, PairingCode};
 use swarmbot_contracts::{
-    Bot, BotId, Conversation, ConversationId, Entry, EntryId, LiveCursor, NodeId, NodeInfo,
-    RequestId, Routine, RoutineId, RoutineRun, RoutineSchedule, RuntimeRequest, Settings, Task,
-    TaskId, TaskStep, Turn, TurnStatus,
+    Bot, BotId, BotStatus, Conversation, ConversationId, ConversationKind, Entry, EntryId,
+    LiveCursor, NodeId, NodeInfo, RequestId, Routine, RoutineId, RoutineRun, RoutineSchedule,
+    RuntimeRequest, Settings, Task, TaskId, TaskStatus, TaskStep, Turn, TurnId, TurnStatus,
 };
 
 /// Which pane the main area shows. The delegation graph is an overlay panel
@@ -132,12 +132,22 @@ pub struct AppState {
     pub routine_creator_open: bool,
     pub routine_draft_bot: Option<BotId>,
     pub routine_draft_schedule: RoutineSchedule,
+    /// Popup menu opened by the `+` button in the left sidebar.
+    pub plus_menu_open: bool,
     pub create_group_open: bool,
     pub create_group_title: String,
     pub create_group_members: Vec<BotId>,
+    pub create_group_lead: Option<BotId>,
+    pub edit_group_id: Option<ConversationId>,
+    /// One-shot seed pushed into `edit_group_title_input` when opening the modal.
+    pub edit_group_title_seed: Option<String>,
+    pub edit_group_members: Vec<BotId>,
+    pub edit_group_lead: Option<BotId>,
     pub create_bot_open: bool,
     pub create_bot_backend: Option<String>,
     pub confirm_delete: Option<DeleteTarget>,
+    /// Entry in the open conversation currently targeted by "Reply".
+    pub reply_to: Option<EntryId>,
     /// Brain data dir when locally spawned or explicitly supplied via `--data-dir`.
     pub data_dir: Option<PathBuf>,
 
@@ -202,12 +212,19 @@ impl AppState {
             routine_creator_open: false,
             routine_draft_bot: None,
             routine_draft_schedule: RoutineSchedule::Interval { every_secs: 300 },
+            plus_menu_open: false,
             create_group_open: false,
             create_group_title: String::new(),
             create_group_members: Vec::new(),
+            create_group_lead: None,
+            edit_group_id: None,
+            edit_group_title_seed: None,
+            edit_group_members: Vec::new(),
+            edit_group_lead: None,
             create_bot_open: false,
             create_bot_backend: None,
             confirm_delete: None,
+            reply_to: None,
             data_dir: None,
             screen: Screen::default(),
             open_conversation: None,
@@ -285,7 +302,7 @@ impl AppState {
         self.requests.iter().find(|r| &r.id == id)
     }
 
-    pub fn turn(&self, id: &swarmbot_contracts::TurnId) -> Option<&Turn> {
+    pub fn turn(&self, id: &TurnId) -> Option<&Turn> {
         self.turns.iter().find(|t| &t.id == id)
     }
 
@@ -374,12 +391,64 @@ impl AppState {
             .collect()
     }
 
-    /// The running turn in a conversation, if any — drives "Handling…" and the
-    /// Stop button's enabled state.
+    /// Pending requests relevant to `conv`: requests recorded directly in `conv`
+    /// plus requests raised inside delegated `handoff_task` DM turns whose
+    /// originating task comes from `conv`.
+    pub fn group_pending_requests(&self, conv: &Conversation) -> Vec<RuntimeRequest> {
+        let task_origin = |r: &RuntimeRequest| -> Option<&ConversationId> {
+            let tid = r.task_id.as_ref().or_else(|| {
+                r.turn_id
+                    .as_ref()
+                    .and_then(|turn_id| self.turn(turn_id))
+                    .and_then(|t| t.task_id.as_ref())
+            });
+            tid.and_then(|id| self.task(id)).map(|t| &t.origin)
+        };
+        let members = conv.kind.participants();
+        self.requests
+            .iter()
+            .filter(|r| {
+                if !r.is_pending() {
+                    return false;
+                }
+                if r.conversation_id == conv.id {
+                    return true;
+                }
+                if task_origin(r) == Some(&conv.id) {
+                    return true;
+                }
+                // If a group member raised a pending request inside its own DM
+                // without a linked task origin from another conversation,
+                // keep it visible while viewing the group.
+                if conv.kind.is_group()
+                    && members.contains(&r.bot_id)
+                    && task_origin(r).is_none()
+                    && self
+                        .bot(&r.bot_id)
+                        .is_some_and(|b| b.direct_conversation_id == r.conversation_id)
+                {
+                    return true;
+                }
+                false
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The running turn in a conversation, if any — drives the Stop button's
+    /// enabled state and DM activity line.
     pub fn running_turn(&self, id: &ConversationId) -> Option<&Turn> {
         self.turns
             .iter()
             .find(|t| &t.conversation_id == id && t.status == TurnStatus::Running)
+    }
+
+    /// All turns currently running in a conversation.
+    pub fn running_turns(&self, id: &ConversationId) -> Vec<&Turn> {
+        self.turns
+            .iter()
+            .filter(|t| &t.conversation_id == id && t.status == TurnStatus::Running)
+            .collect()
     }
 
     /// The bot currently working in a conversation, for the "Handling…" line.
@@ -388,15 +457,91 @@ impl AppState {
             .and_then(|turn| self.bot(&turn.bot_id))
     }
 
+    /// True when any turn, member bot, or task originating from `group` is active.
+    pub fn is_group_working(&self, group: &Conversation) -> bool {
+        if self.running_turn(&group.id).is_some() {
+            return true;
+        }
+        let members = group.kind.participants();
+        if members
+            .iter()
+            .any(|id| self.bot(id).is_some_and(|b| b.status.is_busy()))
+        {
+            return true;
+        }
+        self.tasks.iter().any(|t| {
+            t.origin == group.id && matches!(t.status, TaskStatus::Running | TaskStatus::Queued)
+        })
+    }
+
+    /// All currently active/working bots for a group conversation, including
+    /// bots running delegated DM tasks whose `origin` is `conv.id`.
+    pub fn active_group_activities(&self, conv: &Conversation) -> Vec<(Bot, String)> {
+        let mut out: Vec<(Bot, String)> = Vec::new();
+        let mut push_unique = |bot: &Bot, activity: String| {
+            if let Some((_, existing)) = out.iter_mut().find(|(b, _)| b.id == bot.id) {
+                if existing == "Working…" && activity != "Working…" {
+                    *existing = activity;
+                }
+                return;
+            }
+            out.push((bot.clone(), activity));
+        };
+
+        let bot_activity = |bot: &Bot, fallback: &str| -> String {
+            match &bot.status {
+                BotStatus::Working { activity, .. } if !activity.trim().is_empty() => {
+                    activity.clone()
+                }
+                _ => fallback.to_string(),
+            }
+        };
+
+        for turn in self.running_turns(&conv.id) {
+            if let Some(bot) = self.bot(&turn.bot_id) {
+                let act = bot_activity(bot, "Working…");
+                push_unique(bot, act);
+            }
+        }
+
+        // Delegated tasks whose origin is this group (running or queued).
+        for task in self.tasks.iter().filter(|t| {
+            t.origin == conv.id && matches!(t.status, TaskStatus::Running | TaskStatus::Queued)
+        }) {
+            if let Some(bot) = self.bot(&task.owner) {
+                let fallback = if task.title.trim().is_empty() {
+                    "Delegated task…".to_string()
+                } else {
+                    format!("task: {}", task.title)
+                };
+                let act = bot_activity(bot, &fallback);
+                push_unique(bot, act);
+            }
+        }
+
+        // Also include any group member whose bot status is busy (e.g.
+        // running a group-triggered turn before task state settles).
+        for member_id in conv.kind.participants() {
+            if let Some(bot) = self.bot(&member_id)
+                && bot.status.is_busy()
+            {
+                let act = bot_activity(bot, "Working…");
+                push_unique(bot, act);
+            }
+        }
+
+        out
+    }
+
     /// True when any bot is working or any turn is running — the app animates
     /// spinners only while this holds, to keep an idle window cheap.
     pub fn any_busy(&self) -> bool {
         self.turns.iter().any(|t| t.status == TurnStatus::Running)
             || self.bots.iter().any(|b| b.status.is_busy())
-            || self.tasks.iter().any(|t| {
-                use swarmbot_contracts::TaskStatus;
-                matches!(t.status, TaskStatus::Running | TaskStatus::Queued)
-            })
+            || self
+                .tasks
+                .iter()
+                .any(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Queued))
     }
 
     /// Total unread across all conversations (for a badge on the app title).
@@ -409,9 +554,50 @@ impl AppState {
     /// Open a conversation: set the selection, clear its unread, and switch the
     /// main pane back to the transcript.
     pub fn open(&mut self, id: ConversationId) {
+        if self.open_conversation.as_ref() != Some(&id) {
+            self.reply_to = None;
+        }
         self.open_conversation = Some(id.clone());
         self.unread.insert(id, 0);
+        self.plus_menu_open = false;
         self.screen = Screen::Conversation;
+    }
+
+    /// Open the Add Bot modal and close any competing creation/menu overlays.
+    pub fn open_create_bot(&mut self) {
+        self.plus_menu_open = false;
+        self.create_bot_open = true;
+        self.create_group_open = false;
+        self.edit_group_id = None;
+    }
+
+    /// Open the Create Group modal with an empty member selection so bots are
+    /// added only when explicitly chosen.
+    pub fn open_create_group(&mut self) {
+        self.plus_menu_open = false;
+        self.create_group_open = true;
+        self.create_bot_open = false;
+        self.edit_group_id = None;
+        self.create_group_title.clear();
+        self.create_group_members.clear();
+        self.create_group_lead = None;
+    }
+
+    /// Open the Edit Group modal seeded with an existing group's title,
+    /// members, and lead bot.
+    pub fn open_edit_group(&mut self, conv: &Conversation) {
+        let ConversationKind::Group { members, lead } = &conv.kind else {
+            return;
+        };
+        self.plus_menu_open = false;
+        self.create_group_open = false;
+        self.create_bot_open = false;
+        self.bot_menu_open = false;
+        self.confirm_delete = None;
+        self.edit_group_id = Some(conv.id.clone());
+        self.edit_group_title_seed = Some(self.conversation_title(conv));
+        self.edit_group_members = members.clone();
+        self.edit_group_lead = Some(lead.clone());
     }
 
     pub fn upsert_bot(&mut self, bot: Bot) {
@@ -453,6 +639,11 @@ impl AppState {
         self.unread.remove(id);
         if self.open_conversation.as_ref() == Some(id) {
             self.open_conversation = None;
+            self.reply_to = None;
+        }
+        if self.edit_group_id.as_ref() == Some(id) {
+            self.edit_group_id = None;
+            self.edit_group_title_seed = None;
         }
     }
 
@@ -541,5 +732,163 @@ impl AppState {
         entries.sort_by_key(|e| e.seq);
         entries.dedup_by(|a, b| a.id == b.id);
         self.entries.insert(id, entries);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creation_helpers_toggle_exclusive_overlays_and_clear_group_selection() {
+        let mut state = AppState::new("http://brain.test");
+        state.plus_menu_open = true;
+        state.create_group_title = "Old".into();
+        state.create_group_members = vec![BotId::new()];
+
+        state.open_create_bot();
+        assert!(!state.plus_menu_open);
+        assert!(state.create_bot_open);
+        assert!(!state.create_group_open);
+
+        state.plus_menu_open = true;
+        state.open_create_group();
+        assert!(!state.plus_menu_open);
+        assert!(!state.create_bot_open);
+        assert!(state.create_group_open);
+        assert!(state.create_group_title.is_empty());
+        assert!(state.create_group_members.is_empty());
+
+        state.plus_menu_open = true;
+        state.open(ConversationId::new());
+        assert!(!state.plus_menu_open);
+    }
+
+    #[test]
+    fn group_working_and_active_bots_include_delegated_dm_tasks() {
+        use swarmbot_contracts::{Task, TurnInitiator};
+
+        let mut state = AppState::new("http://brain.test");
+        let b1 = Bot::new("lead", "Lead", "", "fake", ConversationId::new());
+        let dm2 = ConversationId::new();
+        let mut b2 = Bot::new("scout", "Scout", "", "fake", dm2.clone());
+        b2.status = BotStatus::Working {
+            activity: "Scanning repo".into(),
+            conversation_id: dm2,
+        };
+        let b1_id = b1.id.clone();
+        let b2_id = b2.id.clone();
+        state.upsert_bot(b1);
+        state.upsert_bot(b2);
+
+        let group =
+            Conversation::group("Launch", vec![b1_id.clone(), b2_id.clone()], b1_id.clone())
+                .expect("group");
+        let gid = group.id.clone();
+        state.upsert_conversation(group.clone());
+
+        // Turn running directly in group + delegated task owned by b2 originating from group.
+        state.upsert_turn(Turn::start(
+            b1_id.clone(),
+            gid.clone(),
+            TurnInitiator::Owner,
+            None,
+            None,
+        ));
+        let task = Task::handoff(
+            b1_id.clone(),
+            b2_id.clone(),
+            gid.clone(),
+            "Inspect docs",
+            "Inspect docs",
+            None,
+        );
+        state.upsert_task(task);
+
+        assert!(state.is_group_working(&group));
+        let active = state.active_group_activities(&group);
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|(b, _)| b.id == b1_id));
+        assert!(
+            active
+                .iter()
+                .any(|(b, act)| b.id == b2_id && act == "Scanning repo")
+        );
+    }
+
+    #[test]
+    fn group_pending_requests_surface_delegated_dm_handoff_cards() {
+        use swarmbot_contracts::{Surface, Task};
+
+        let mut state = AppState::new("http://brain.test");
+        let dm1 = ConversationId::new();
+        let dm2 = ConversationId::new();
+        let b1 = Bot::new("lead", "Lead", "", "fake", dm1.clone());
+        let b2 = Bot::new("scout", "Scout", "", "fake", dm2.clone());
+        let b1_id = b1.id.clone();
+        let b2_id = b2.id.clone();
+        state.upsert_bot(b1);
+        state.upsert_bot(b2);
+
+        let group = Conversation::group("Team", vec![b1_id.clone(), b2_id.clone()], b1_id.clone())
+            .expect("group");
+        let gid = group.id.clone();
+        let other_group = ConversationId::new();
+        state.upsert_conversation(group.clone());
+
+        // Task originating from `group`, running in `dm2`.
+        let task = Task::handoff(
+            b1_id.clone(),
+            b2_id.clone(),
+            gid.clone(),
+            "Check host",
+            "Check host",
+            None,
+        );
+        let mut req_from_group_task = RuntimeRequest::approval(
+            b2_id.clone(),
+            dm2.clone(),
+            Surface::Shell,
+            "shell",
+            "ls",
+            None,
+        );
+        req_from_group_task.task_id = Some(task.id.clone());
+        state.upsert_task(task);
+        state.upsert_request(req_from_group_task.clone());
+
+        // Task originating from a DIFFERENT group — must NOT leak into `group`.
+        let other_task = Task::handoff(
+            b1_id,
+            b2_id.clone(),
+            other_group,
+            "Unrelated",
+            "Unrelated",
+            None,
+        );
+        let mut req_other_group =
+            RuntimeRequest::question(b2_id, dm2, "unrelated question", vec![]);
+        req_other_group.task_id = Some(other_task.id.clone());
+        state.upsert_task(other_task);
+        state.upsert_request(req_other_group);
+
+        let surfaced = state.group_pending_requests(&group);
+        assert_eq!(surfaced.len(), 1);
+        assert_eq!(surfaced[0].id, req_from_group_task.id);
+    }
+
+    #[test]
+    fn open_edit_group_seeds_existing_title_members_and_lead() {
+        let mut state = AppState::new("http://brain.test");
+        let b1 = BotId::new();
+        let b2 = BotId::new();
+        let group =
+            Conversation::group("Ops", vec![b1.clone(), b2.clone()], b2.clone()).expect("group");
+        let gid = group.id.clone();
+        state.open_edit_group(&group);
+        assert_eq!(state.edit_group_id, Some(gid));
+        assert_eq!(state.edit_group_title_seed.as_deref(), Some("Ops"));
+        assert_eq!(state.edit_group_members, vec![b1, b2.clone()]);
+        assert_eq!(state.edit_group_lead, Some(b2));
     }
 }

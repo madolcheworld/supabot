@@ -605,8 +605,7 @@ async fn the_kill_switch_stops_delegation_in_its_tracks() {
             .expect("deliveries")
             .is_empty()
     );
-    // Every DM carries a "@x joined the team" line, so assert on messages:
-    // nothing was ever said to scout.
+    // Assert that scout's DM has no messages (nothing was ever said to scout).
     let scout_dm = rig.entries(&rig.dm_of(&rig.scout));
     assert!(
         scout_dm.iter().all(|entry| !entry.is_message()),
@@ -844,6 +843,833 @@ async fn each_bot_turn_receives_its_own_private_workspace_cwd_and_instructions()
         "{}",
         scout_req[0].instructions
     );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn group_multi_turn_a_to_b_to_a_retains_session_history_and_respects_explicit_dual_mention() {
+    let rig = rig();
+
+    // A -> B -> A inside the group: lead asks scout, scout replies to lead, lead finishes.
+    rig.script(
+        LEAD,
+        vec![
+            ScriptedTurn::text("@scout please verify Cargo.toml"),
+            ScriptedTurn::text("Confirmed with scout: Cargo.toml is clean."),
+        ],
+    );
+    rig.script(
+        SCOUT,
+        vec![ScriptedTurn::text("@lead Cargo.toml is clean and builds.")],
+    );
+
+    rig.swarm
+        .send(&rig.group, "please check Cargo.toml")
+        .expect("sent");
+    rig.settle().await;
+
+    let group_log = rig.transcript(&rig.group);
+    assert!(
+        group_log.contains("@scout please verify Cargo.toml"),
+        "{group_log}"
+    );
+    assert!(
+        group_log.contains("@lead Cargo.toml is clean and builds."),
+        "{group_log}"
+    );
+    assert!(
+        group_log.contains("Confirmed with scout: Cargo.toml is clean."),
+        "{group_log}"
+    );
+
+    // Final replies must be persisted into each bot's session history.
+    let lead_session = swarmbot_core::session::Session::load(rig.swarm.store.as_ref(), &rig.lead)
+        .expect("session");
+    let lead_assistant_msgs: Vec<&str> = lead_session
+        .messages()
+        .iter()
+        .filter(|m| m.role == swarmbot_llm::Role::Assistant)
+        .map(|m| m.content.as_str())
+        .collect();
+    assert!(
+        lead_assistant_msgs.contains(&"@scout please verify Cargo.toml"),
+        "lead session missed turn 1 final reply: {lead_assistant_msgs:?}"
+    );
+    assert!(
+        lead_assistant_msgs.contains(&"Confirmed with scout: Cargo.toml is clean."),
+        "lead session missed turn 2 final reply: {lead_assistant_msgs:?}"
+    );
+
+    let scout_session = swarmbot_core::session::Session::load(rig.swarm.store.as_ref(), &rig.scout)
+        .expect("session");
+    assert!(
+        scout_session.messages().iter().any(|m| {
+            m.role == swarmbot_llm::Role::Assistant
+                && m.content == "@lead Cargo.toml is clean and builds."
+        }),
+        "scout session missed final reply"
+    );
+
+    // Next: owner explicitly mentions BOTH @lead and @scout. Even if lead says
+    // "halo scout", scout must NOT be woken a second time for the same message.
+    rig.script(
+        LEAD,
+        vec![ScriptedTurn::text("On it — halo scout, let's check docs.")],
+    );
+    rig.script(SCOUT, vec![ScriptedTurn::text("Docs checked.")]);
+    let scout_calls_before = rig
+        .swarm
+        .backends
+        .registry()
+        .fake(SCOUT)
+        .expect("fake scout")
+        .requests()
+        .len();
+
+    rig.swarm
+        .send(&rig.group, "@lead @scout check the docs")
+        .expect("sent");
+    rig.settle().await;
+
+    let scout_calls_after = rig
+        .swarm
+        .backends
+        .registry()
+        .fake(SCOUT)
+        .expect("fake scout")
+        .requests()
+        .len();
+    assert_eq!(
+        scout_calls_after - scout_calls_before,
+        1,
+        "scout should wake exactly once when owner already addressed @lead @scout"
+    );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn group_multi_turn_ping_pong_stops_at_hop_limit() {
+    let rig = rig();
+    rig.swarm
+        .settings
+        .update(|s| s.max_hops = 3)
+        .expect("settings");
+
+    rig.script(
+        LEAD,
+        (0..6)
+            .map(|i| ScriptedTurn::text(format!("@scout ping {i}")))
+            .collect(),
+    );
+    rig.script(
+        SCOUT,
+        (0..6)
+            .map(|i| ScriptedTurn::text(format!("@lead pong {i}")))
+            .collect(),
+    );
+
+    rig.swarm.send(&rig.group, "start ping pong").expect("sent");
+    rig.settle().await;
+
+    let group_log = rig.transcript(&rig.group);
+    assert!(
+        group_log.contains("too many hand-offs"),
+        "hop limit should stop group oscillation: {group_log}"
+    );
+    assert!(
+        rig.swarm
+            .store
+            .queued_deliveries(&rig.lead)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        rig.swarm
+            .store
+            .queued_deliveries(&rig.scout)
+            .unwrap()
+            .is_empty()
+    );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn group_catchup_uses_message_prefix_and_does_not_duplicate_trigger() {
+    let rig = rig();
+
+    // First turn only wakes lead so scout misses both owner's message and lead's reply.
+    rig.script(
+        LEAD,
+        vec![
+            ScriptedTurn::text("I will ask scout once you confirm."),
+            ScriptedTurn::text("@scout please verify the build"),
+        ],
+    );
+    rig.script(SCOUT, vec![ScriptedTurn::text("Build looks green.")]);
+
+    rig.swarm
+        .send(&rig.group, "early context for lead only")
+        .expect("sent");
+    rig.settle().await;
+
+    rig.swarm
+        .send(&rig.group, "@lead proceed with step two")
+        .expect("sent");
+    rig.settle().await;
+
+    let scout_requests = rig
+        .swarm
+        .backends
+        .registry()
+        .fake(SCOUT)
+        .expect("fake scout")
+        .requests();
+    assert_eq!(scout_requests.len(), 1);
+    let user_prompt = scout_requests[0]
+        .messages
+        .iter()
+        .filter(|m| m.role == swarmbot_llm::Role::User)
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        user_prompt.contains("[Message from @lead] @scout please verify the build"),
+        "group delivery must render with [Message from @...]: {user_prompt}"
+    );
+    assert!(
+        !user_prompt.contains("[Direct message from @lead]"),
+        "group delivery must never claim Direct message: {user_prompt}"
+    );
+    assert!(
+        user_prompt.contains("[Messages in this group you have not seen]")
+            && user_prompt.contains("I will ask scout once you confirm."),
+        "earlier unseen messages appear in catch-up: {user_prompt}"
+    );
+    assert_eq!(
+        user_prompt
+            .matches("@scout please verify the build")
+            .count(),
+        1,
+        "triggering message must not be duplicated in catch-up: {user_prompt}"
+    );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn dm_bot_to_bot_reply_via_plain_text_and_via_tool_avoid_deadlock() {
+    let rig = rig();
+    let lead_dm = rig.dm_of(&rig.lead);
+
+    // 1. Plain-text reply addressing `@sender` from B back to A forwards without
+    // requiring `message_bot`, while A's plain reply back to the owner does not
+    // ping-pong back to B.
+    rig.script(
+        LEAD,
+        vec![
+            ScriptedTurn::text("Asking scout in DM.").with_tool_call(
+                "message_bot",
+                json!({"to": "scout", "text": "what is the port?", "urgency": "urgent"}),
+            ),
+            ScriptedTurn::text("Asked scout; waiting."),
+            ScriptedTurn::text("Scout answered: port is 8080."),
+        ],
+    );
+    rig.script(SCOUT, vec![ScriptedTurn::text("@lead Port is 8080.")]);
+
+    rig.swarm
+        .send(&lead_dm, "check the port with scout")
+        .expect("sent");
+    rig.settle().await;
+
+    let lead_requests = rig
+        .swarm
+        .backends
+        .registry()
+        .fake(LEAD)
+        .expect("fake lead")
+        .requests();
+    let got_dm_reply = lead_requests.iter().any(|req| {
+        req.messages.iter().any(|m| {
+            m.content
+                .contains("[Direct message from @scout] @lead Port is 8080.")
+        })
+    });
+    assert!(
+        got_dm_reply,
+        "lead must receive scout's @lead DM reply back without deadlock: {lead_requests:?}"
+    );
+    assert_eq!(
+        rig.swarm
+            .backends
+            .registry()
+            .fake(SCOUT)
+            .expect("fake scout")
+            .requests()
+            .len(),
+        1,
+        "lead's owner-facing follow-up without @scout must not ping-pong back to scout"
+    );
+
+    let lead_dm_log = rig.transcript(&lead_dm);
+    assert!(
+        lead_dm_log.contains("Scout answered: port is 8080."),
+        "{lead_dm_log}"
+    );
+
+    // 2. Reply via `message_bot` tool: B's closing text (even with `@lead`) must
+    // NOT double-forward, and A's plain acknowledgement must NOT ping-pong back.
+    rig.script(
+        LEAD,
+        vec![
+            ScriptedTurn::text("Checking logs.").with_tool_call(
+                "message_bot",
+                json!({"to": "scout", "text": "check logs", "urgency": "urgent"}),
+            ),
+            ScriptedTurn::text("Sent question."),
+            ScriptedTurn::text("Noted — I will fold scout's read."),
+        ],
+    );
+    rig.script(
+        SCOUT,
+        vec![
+            ScriptedTurn::text("Calling lead back.").with_tool_call(
+                "message_bot",
+                json!({"to": "lead", "text": "Logs are completely clean.", "urgency": "urgent"}),
+            ),
+            ScriptedTurn::text("@lead Closing note for my own DM only."),
+        ],
+    );
+
+    rig.swarm
+        .send(&lead_dm, "check logs with scout")
+        .expect("sent");
+    rig.settle().await;
+
+    let updated_lead_dm = rig.transcript(&lead_dm);
+    assert!(
+        updated_lead_dm.contains("Logs are completely clean."),
+        "{updated_lead_dm}"
+    );
+    assert!(
+        !updated_lead_dm.contains("Closing note for my own DM only."),
+        "must not double-forward closing text when message_bot already responded: {updated_lead_dm}"
+    );
+    assert_eq!(
+        rig.swarm
+            .backends
+            .registry()
+            .fake(SCOUT)
+            .expect("fake scout")
+            .requests()
+            .len(),
+        3,
+        "lead's plain acknowledgement must not ping-pong back to scout (1 call in sub-case 1 + 2 tool-loop rounds in sub-case 2)"
+    );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn dm_plain_acknowledgement_and_third_person_do_not_ping_pong() {
+    let rig = rig();
+    let scout_dm = rig.dm_of(&rig.scout);
+    let lead_dm = rig.dm_of(&rig.lead);
+
+    // Case 1 & 2: scout sends DM updates to lead; lead replies in its own DM with
+    // plain "LEAD-DM-ACK" and third-person "Noted — I will fold scout's early
+    // read into the verdict." — neither explicitly addresses @scout, so neither
+    // wakes scout.
+    rig.script(
+        SCOUT,
+        vec![
+            ScriptedTurn::text("Sharing first early read.")
+                .with_tool_call("message_bot", json!({"to": "lead", "text": "early read 1"})),
+            ScriptedTurn::text("First read sent."),
+            ScriptedTurn::text("Sharing second early read.")
+                .with_tool_call("message_bot", json!({"to": "lead", "text": "early read 2"})),
+            ScriptedTurn::text("Second read sent."),
+        ],
+    );
+    rig.script(
+        LEAD,
+        vec![
+            ScriptedTurn::text("LEAD-DM-ACK"),
+            ScriptedTurn::text("Noted — I will fold scout's early read into the verdict."),
+        ],
+    );
+
+    rig.swarm.send(&scout_dm, "share read 1").expect("sent");
+    rig.settle().await;
+    rig.swarm.send(&scout_dm, "share read 2").expect("sent");
+    rig.settle().await;
+
+    let scout_turns = rig
+        .swarm
+        .store
+        .turns_in(&scout_dm, 20)
+        .expect("scout turns");
+    assert_eq!(
+        scout_turns.len(),
+        2,
+        "plain ack and third-person possessive mention must not create extra DM turns for scout: {scout_turns:?}"
+    );
+    let scout_reqs = rig
+        .swarm
+        .backends
+        .registry()
+        .fake(SCOUT)
+        .expect("fake scout")
+        .requests();
+    assert_eq!(
+        scout_reqs.len(),
+        4,
+        "2 DM turns * (tool call round + answer round) = 4 calls; zero ping-pong turns"
+    );
+    let scout_dm_log = rig.transcript(&scout_dm);
+    assert!(!scout_dm_log.contains("LEAD-DM-ACK"), "{scout_dm_log}");
+    assert!(
+        !scout_dm_log.contains("fold scout's early read"),
+        "{scout_dm_log}"
+    );
+
+    // Case 3: lead uses `post_to_group` mentioning @scout while answering scout's
+    // DM, then writes `@scout Moved to Team.` in its DM closing text; recording
+    // post_to_group targets prevents a duplicate DM forward into scout's DM.
+    rig.script(
+        SCOUT,
+        vec![
+            ScriptedTurn::text("Asking where to continue.").with_tool_call(
+                "message_bot",
+                json!({"to": "lead", "text": "where should we follow up?"}),
+            ),
+            ScriptedTurn::text("Asked lead."),
+            ScriptedTurn::text("Following up in Team."),
+        ],
+    );
+    rig.script(
+        LEAD,
+        vec![
+            ScriptedTurn::text("Posting in group.").with_tool_call(
+                "post_to_group",
+                json!({"group": "Team", "text": "@scout let's continue in Team"}),
+            ),
+            ScriptedTurn::text("@scout Moved to Team."),
+        ],
+    );
+
+    rig.swarm
+        .send(&scout_dm, "ask lead where next")
+        .expect("sent");
+    rig.settle().await;
+
+    let scout_dm_turns = rig
+        .swarm
+        .store
+        .turns_in(&scout_dm, 20)
+        .expect("scout dm turns");
+    assert_eq!(
+        scout_dm_turns.len(),
+        3,
+        "scout's DM only ran the 3 owner-triggered turns, no duplicate DM forward from lead: {scout_dm_turns:?}"
+    );
+    let scout_reqs = rig
+        .swarm
+        .backends
+        .registry()
+        .fake(SCOUT)
+        .expect("fake scout")
+        .requests();
+    assert_eq!(
+        scout_reqs.len(),
+        7,
+        "4 prior calls + 2 rounds for Case 3 DM turn + 1 Team group turn = 7"
+    );
+    let group_log = rig.transcript(&rig.group);
+    assert!(group_log.contains("let's continue in Team"), "{group_log}");
+    assert!(group_log.contains("Following up in Team."), "{group_log}");
+    assert!(
+        !rig.transcript(&scout_dm).contains("Moved to Team."),
+        "must not forward DM closing text when post_to_group already reached scout"
+    );
+    assert!(
+        rig.transcript(&lead_dm).contains("LEAD-DM-ACK"),
+        "lead's local DM retained its own acknowledgement"
+    );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_turn_provider_attaches_servers_for_acp_filters_node_tools_and_drops_on_finish() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    use swarmbot_contracts::DomainError;
+    use swarmbot_contracts::config::BackendKind;
+    use swarmbot_contracts::tool::Toolset;
+    use swarmbot_core::{McpTurnProvider, McpTurnRegistration, McpTurnRequest};
+    use swarmbot_llm::{
+        BackendStatus, Capabilities, ChatRequest, ChatResponse, FinishReason, LlmBackend, LlmError,
+        LlmEvent, McpServerSpec,
+    };
+
+    struct RecordedCall {
+        request: ChatRequest,
+        dropped_during_chat: bool,
+    }
+
+    struct MockAcpBackend {
+        id: String,
+        drop_flag: Arc<AtomicBool>,
+        calls: Mutex<Vec<RecordedCall>>,
+    }
+
+    #[async_trait]
+    impl LlmBackend for MockAcpBackend {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn kind(&self) -> BackendKind {
+            BackendKind::Acp
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                streaming: false,
+                tool_calls: false,
+                reasoning: false,
+                steer: false,
+                survives_restart: false,
+            }
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest,
+            events: mpsc::Sender<LlmEvent>,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, LlmError> {
+            let dropped_during_chat = self.drop_flag.load(Ordering::SeqCst);
+            self.calls.lock().unwrap().push(RecordedCall {
+                request,
+                dropped_during_chat,
+            });
+            let mut response = ChatResponse::empty();
+            response.text = "ACP finished.".to_string();
+            let _ = events
+                .send(LlmEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    usage: response.usage,
+                    text: response.text.clone(),
+                    reasoning: String::new(),
+                    tool_calls: Vec::new(),
+                })
+                .await;
+            Ok(response)
+        }
+
+        async fn probe(&self) -> Result<BackendStatus, LlmError> {
+            Ok(BackendStatus {
+                backend: self.id.clone(),
+                ok: true,
+                detail: "mock acp ok".to_string(),
+                model: None,
+                version: None,
+            })
+        }
+    }
+
+    struct TestMcpProvider {
+        requests: Mutex<Vec<McpTurnRequest>>,
+        drop_flag: Arc<AtomicBool>,
+    }
+
+    impl McpTurnProvider for TestMcpProvider {
+        fn register_turn(
+            &self,
+            request: McpTurnRequest,
+        ) -> Result<McpTurnRegistration, DomainError> {
+            self.requests.lock().unwrap().push(request);
+            let flag = Arc::clone(&self.drop_flag);
+            Ok(McpTurnRegistration::new(
+                vec![McpServerSpec::http(
+                    "swarmbot",
+                    "http://127.0.0.1:49999/mcp/turn",
+                )],
+                move || {
+                    flag.store(true, Ordering::SeqCst);
+                },
+            ))
+        }
+    }
+
+    // Sub-case 1: ACP bot with NO MCP provider gets honest instructions without
+    // claiming SwarmBot messaging/task tool names.
+    let rig = rig();
+    let bare_flag = Arc::new(AtomicBool::new(false));
+    let acp = Arc::new(MockAcpBackend {
+        id: "mock-acp".to_string(),
+        drop_flag: Arc::clone(&bare_flag),
+        calls: Mutex::new(Vec::new()),
+    });
+    rig.swarm
+        .backends
+        .register("mock-acp", Arc::clone(&acp) as Arc<dyn LlmBackend>);
+    let mut lead_bot = rig.swarm.bots.get(&rig.lead).expect("lead bot");
+    lead_bot.backend = "mock-acp".to_string();
+    rig.swarm
+        .bots
+        .update(&lead_bot)
+        .expect("switch lead to mock-acp");
+
+    rig.swarm
+        .send(&rig.dm_of(&rig.lead), "first bare acp turn")
+        .expect("sent");
+    rig.settle().await;
+
+    {
+        let calls = acp.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].request.mcp_servers.is_empty());
+        assert!(calls[0].request.tools.is_empty());
+        let instr = &calls[0].request.instructions;
+        assert!(!instr.contains("handoff_task"), "{instr}");
+        assert!(!instr.contains("message_bot"), "{instr}");
+        assert!(!instr.contains("post_to_group"), "{instr}");
+        assert!(instr.contains("@name"), "{instr}");
+    }
+
+    // Sub-case 2: Attach McpTurnProvider and run another ACP turn.
+    let reg_drop_flag = Arc::new(AtomicBool::new(false));
+    let acp_with_mcp = Arc::new(MockAcpBackend {
+        id: "mock-acp-mcp".to_string(),
+        drop_flag: Arc::clone(&reg_drop_flag),
+        calls: Mutex::new(Vec::new()),
+    });
+    rig.swarm.backends.register(
+        "mock-acp-mcp",
+        Arc::clone(&acp_with_mcp) as Arc<dyn LlmBackend>,
+    );
+    lead_bot.backend = "mock-acp-mcp".to_string();
+    rig.swarm
+        .bots
+        .update(&lead_bot)
+        .expect("switch lead to mock-acp-mcp");
+
+    let provider = Arc::new(TestMcpProvider {
+        requests: Mutex::new(Vec::new()),
+        drop_flag: Arc::clone(&reg_drop_flag),
+    });
+    rig.swarm
+        .set_mcp_provider(Arc::clone(&provider) as Arc<dyn McpTurnProvider>);
+
+    rig.swarm
+        .send(&rig.dm_of(&rig.lead), "second acp turn with mcp")
+        .expect("sent");
+    rig.settle().await;
+
+    {
+        let reqs = provider.requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].bot_id, rig.lead);
+        assert!(!reqs[0].in_task);
+        assert!(
+            !reqs[0].toolsets.contains(&Toolset::Node),
+            "ACP must keep its own fs/shell tools and omit Toolset::Node: {:?}",
+            reqs[0].toolsets
+        );
+        assert!(reqs[0].toolsets.contains(&Toolset::Bot));
+        assert!(reqs[0].toolsets.contains(&Toolset::Task));
+    }
+    {
+        let calls = acp_with_mcp.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.mcp_servers.len(), 1);
+        assert!(calls[0].request.tools.is_empty());
+        assert!(
+            !calls[0].dropped_during_chat,
+            "MCP registration must stay active during backend.chat()"
+        );
+        let instr = &calls[0].request.instructions;
+        assert!(instr.contains("handoff_task"), "{instr}");
+        assert!(instr.contains("message_bot"), "{instr}");
+        assert!(instr.contains("post_to_group"), "{instr}");
+    }
+    assert!(
+        reg_drop_flag.load(Ordering::SeqCst),
+        "MCP registration handle must drop cleanly when the turn ends"
+    );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn mid_turn_steer_on_single_round_and_other_conversation_steer_both_run() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use tokio::sync::{Notify, mpsc};
+    use tokio_util::sync::CancellationToken;
+
+    use swarmbot_contracts::config::BackendKind;
+    use swarmbot_contracts::delivery::Delivery;
+    use swarmbot_llm::{
+        BackendStatus, Capabilities, ChatRequest, ChatResponse, FinishReason, LlmBackend, LlmError,
+        LlmEvent,
+    };
+
+    struct CoordinatedBackend {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        calls: AtomicUsize,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    #[async_trait]
+    impl LlmBackend for CoordinatedBackend {
+        fn id(&self) -> &str {
+            "coord"
+        }
+
+        fn kind(&self) -> BackendKind {
+            BackendKind::Fake
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                streaming: false,
+                tool_calls: true,
+                reasoning: false,
+                steer: true,
+                survives_restart: false,
+            }
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest,
+            events: mpsc::Sender<LlmEvent>,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().unwrap().push(request);
+            if n == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            let mut response = ChatResponse::empty();
+            response.text = format!("reply-{n}");
+            let _ = events
+                .send(LlmEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    usage: response.usage,
+                    text: response.text.clone(),
+                    reasoning: String::new(),
+                    tool_calls: Vec::new(),
+                })
+                .await;
+            Ok(response)
+        }
+
+        async fn probe(&self) -> Result<BackendStatus, LlmError> {
+            Ok(BackendStatus {
+                backend: "coord".to_string(),
+                ok: true,
+                detail: "ok".to_string(),
+                model: None,
+                version: None,
+            })
+        }
+    }
+
+    let rig = rig();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let coord = Arc::new(CoordinatedBackend {
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+        calls: AtomicUsize::new(0),
+        requests: Mutex::new(Vec::new()),
+    });
+    rig.swarm
+        .backends
+        .register("coord", Arc::clone(&coord) as Arc<dyn LlmBackend>);
+    let mut lead_bot = rig.swarm.bots.get(&rig.lead).expect("lead bot");
+    lead_bot.backend = "coord".to_string();
+    rig.swarm
+        .bots
+        .update(&lead_bot)
+        .expect("switch lead to coord");
+
+    let lead_dm = rig.dm_of(&rig.lead);
+    // Start a turn in lead's DM.
+    rig.swarm.send(&lead_dm, "initial dm prompt").expect("sent");
+    started.notified().await;
+
+    // While round 1 is paused in backend.chat(), verify:
+    // 1) steering ANOTHER conversation (`rig.group`) is refused by `steer` and queued via `deliver`;
+    // 2) steering `lead_dm` joins mid-turn and triggers round 2 even after a 0-tool-call round!
+    let mut group_steer =
+        Delivery::owner_message(rig.group.clone(), rig.lead.clone(), "group note");
+    group_steer.urgency = swarmbot_contracts::delivery::Urgency::Urgent;
+    rig.swarm
+        .store
+        .insert_delivery(&group_steer)
+        .expect("insert group delivery");
+    assert!(!rig.swarm.runners.steer(&rig.lead, group_steer.clone()));
+    rig.swarm
+        .runners
+        .deliver(group_steer)
+        .expect("deliver group");
+
+    let mut dm_steer =
+        Delivery::owner_message(lead_dm.clone(), rig.lead.clone(), "mid-turn adjustment");
+    dm_steer.urgency = swarmbot_contracts::delivery::Urgency::Urgent;
+    rig.swarm
+        .store
+        .insert_delivery(&dm_steer)
+        .expect("insert dm delivery");
+    assert!(rig.swarm.runners.steer(&rig.lead, dm_steer));
+
+    release.notify_one();
+    rig.settle().await;
+
+    {
+        let reqs = coord.requests.lock().unwrap();
+        assert_eq!(
+            reqs.len(),
+            3,
+            "round 1 (initial dm), round 2 (mid-turn dm steer), and turn 2 (preserved group steer): {:?}",
+            reqs.len()
+        );
+        assert!(
+            reqs[1]
+                .messages
+                .iter()
+                .any(|m| { m.role == swarmbot_llm::Role::Assistant && m.content == "reply-0" })
+        );
+        assert!(reqs[1].messages.iter().any(|m| {
+            m.content
+                .contains("[Added while you were working] mid-turn adjustment")
+        }));
+        assert!(
+            reqs[2]
+                .messages
+                .iter()
+                .any(|m| { m.content.contains("group note") })
+        );
+    }
 
     rig.swarm.shutdown().await;
 }

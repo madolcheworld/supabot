@@ -7,7 +7,7 @@ use tracing::info;
 
 use swarmbot_contracts::Seq;
 use swarmbot_contracts::bot::Bot;
-use swarmbot_contracts::conversation::Conversation;
+use swarmbot_contracts::conversation::{Conversation, ConversationKind};
 use swarmbot_contracts::entry::Entry;
 use swarmbot_contracts::error::DomainError;
 use swarmbot_contracts::id::{BotId, ConversationId};
@@ -111,6 +111,68 @@ impl ConversationService {
             ));
         }
         conversation.title = Some(title.to_string());
+        conversation.updated_at = Utc::now();
+        self.store.update_conversation(&conversation)?;
+        self.hub.publish(Change::Conversation(conversation.clone()));
+        Ok(conversation)
+    }
+
+    /// Update a group's title, members and/or lead.
+    pub fn update_group(
+        &self,
+        id: &ConversationId,
+        title: Option<String>,
+        members: Option<Vec<BotId>>,
+        lead: Option<BotId>,
+    ) -> Result<Conversation, DomainError> {
+        let mut conversation = self.get(id)?;
+        let ConversationKind::Group {
+            members: current_members,
+            lead: current_lead,
+        } = &conversation.kind
+        else {
+            return Err(DomainError::conflict("a DM cannot be updated as a group"));
+        };
+
+        if let Some(new_title) = title {
+            let trimmed = new_title.trim();
+            if trimmed.is_empty() {
+                return Err(DomainError::invalid("a group needs a title"));
+            }
+            conversation.title = Some(trimmed.to_string());
+        }
+
+        let next_members = match members {
+            Some(ids) => {
+                if ids.is_empty() {
+                    return Err(DomainError::invalid("a group needs at least two bots"));
+                }
+                for bot_id in &ids {
+                    if self.store.get_bot(bot_id)?.is_none() {
+                        return Err(swarmbot_contracts::not_found::bot(bot_id));
+                    }
+                }
+                ids
+            }
+            None => current_members.clone(),
+        };
+
+        let next_lead = match lead {
+            Some(bot_id) => {
+                if self.store.get_bot(&bot_id)?.is_none() {
+                    return Err(swarmbot_contracts::not_found::bot(&bot_id));
+                }
+                bot_id
+            }
+            None => current_lead.clone(),
+        };
+
+        let next_kind = ConversationKind::Group {
+            members: next_members,
+            lead: next_lead,
+        };
+        next_kind.validate()?;
+        conversation.kind = next_kind;
         conversation.updated_at = Utc::now();
         self.store.update_conversation(&conversation)?;
         self.hub.publish(Change::Conversation(conversation.clone()));
@@ -463,5 +525,89 @@ mod tests {
             Some("Team")
         );
         assert!(rig.service.find_by_title("Nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn update_group_updates_title_members_lead_and_validates() {
+        let rig = rig();
+        let group = rig
+            .service
+            .create_group(
+                "Alpha",
+                vec![rig.lead.id.clone(), rig.scout.id.clone()],
+                Some(rig.lead.id.clone()),
+            )
+            .unwrap();
+        let before = rig.service.hub.cursor();
+
+        // Update title, expand members to include dev, and transfer lead to scout.
+        let updated = rig
+            .service
+            .update_group(
+                &group.id,
+                Some("Beta".into()),
+                Some(vec![
+                    rig.lead.id.clone(),
+                    rig.scout.id.clone(),
+                    rig.dev.id.clone(),
+                ]),
+                Some(rig.scout.id.clone()),
+            )
+            .unwrap();
+        assert_eq!(updated.title.as_deref(), Some("Beta"));
+        assert_eq!(
+            updated.kind,
+            ConversationKind::Group {
+                members: vec![
+                    rig.lead.id.clone(),
+                    rig.scout.id.clone(),
+                    rig.dev.id.clone(),
+                ],
+                lead: rig.scout.id.clone(),
+            }
+        );
+        let events = rig.store.events_since(before, 20).unwrap();
+        assert!(events.iter().any(|(_, ev)| matches!(
+            ev,
+            swarmbot_contracts::LiveEvent::ConversationUpsert { conversation, .. }
+                if conversation.id == group.id && conversation.title.as_deref() == Some("Beta")
+        )));
+
+        // Rejects DM, empty members, unknown bot, and lead outside members.
+        assert!(
+            rig.service
+                .update_group(
+                    &rig.lead.direct_conversation_id,
+                    Some("Nope".into()),
+                    None,
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            rig.service
+                .update_group(&group.id, None, Some(vec![]), None)
+                .is_err()
+        );
+        assert!(
+            rig.service
+                .update_group(
+                    &group.id,
+                    None,
+                    Some(vec![rig.lead.id.clone(), BotId::new()]),
+                    None
+                )
+                .is_err()
+        );
+        assert!(
+            rig.service
+                .update_group(
+                    &group.id,
+                    None,
+                    Some(vec![rig.lead.id.clone(), rig.scout.id.clone()]),
+                    Some(rig.dev.id.clone())
+                )
+                .is_err()
+        );
     }
 }

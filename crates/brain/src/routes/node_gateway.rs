@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Request, State};
-use axum::http::HeaderMap;
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use serde_json::json;
@@ -260,6 +260,22 @@ pub async fn mcp_handler(
     req: Request,
 ) -> Response {
     mcp.handle(req).await.into_response()
+}
+
+/// `ANY /mcp/t/{token}` on the internal listener.
+///
+/// Drives a turn-scoped [`swarmbot_mcp::McpHttpService`] created by
+/// [`crate::state::AppState`]'s `McpTurnProvider`, returning 404 once the turn
+/// unregisters or for an unknown token.
+pub async fn turn_mcp_handler(
+    State(turns): State<Arc<swarmbot_mcp::TurnMcpRegistry>>,
+    Path(token): Path<String>,
+    req: Request,
+) -> Response {
+    match turns.get_service(&token) {
+        Some(service) => service.handle(req).await.into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// The documented envelope, for the routes whose status is not one a

@@ -22,7 +22,7 @@
 //! The node gateway speaks `swarmbot-node-protocol` v1: `POST /node/pair` redeems
 //! a single-use code for a node identity, and `GET /node` upgrades to the control
 //! socket only after a signature over a fresh nonce verifies. The MCP gateway on
-//! the internal listener is still a stub, and says so with 501.
+//! the internal listener serves `/mcp` and per-turn `/mcp/t/{token}` endpoints.
 //!
 //! # The boot sequence
 //!
@@ -115,7 +115,7 @@ impl Brain {
         // built. Writing them afterwards would change what the runners do but not
         // what the tools allow — and a ceiling that half applies is worse than one
         // that is ignored.
-        if on_disk && resolved.fresh && resolved.config_path.is_some() {
+        if on_disk && resolved.fresh {
             seed_settings(&resolved)?;
         }
 
@@ -474,23 +474,117 @@ mod tests {
 
     #[tokio::test]
     async fn a_fresh_durable_brain_adopts_the_configured_settings() {
+        use swarmbot_contracts::node::{PolicyCeiling, Surface};
+        use swarmbot_contracts::{BotId, ConversationId, Invocation, ToolCallId, ToolCallRequest};
+        use swarmbot_tools::{ApprovalGate, ToolContext};
+
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut resolved = resolved(dir.path(), true);
         resolved.config.settings.max_hops = 2;
-        // `config_path` has to look like a real file for the pre-composition
-        // seeding to run, which is what makes the ceilings effective from the
-        // first tool call.
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path, "# written by the test\n").expect("write");
-        resolved.config_path = Some(config_path);
+        resolved.config.settings.bot_messaging = false;
+        resolved
+            .config
+            .settings
+            .safety
+            .set(Surface::Shell, PolicyCeiling::Never);
+        // Even without a config file on disk, pre-composition seeding ensures
+        // both `SettingsHandle` and `PolicyEngine` start from configured values.
+        assert!(resolved.config_path.is_none());
 
         let brain =
             Brain::durable(resolved, &BTreeMap::new(), SecretRegistry::new()).expect("a brain");
         assert_eq!(brain.swarm.settings.get().max_hops, 2);
+        assert!(!brain.swarm.settings.get().bot_messaging);
         assert_eq!(
             brain.swarm.store.settings().expect("settings").max_hops,
             2,
             "the store holds them before composition reads them"
+        );
+
+        let workspace = dir.path().join("workspaces/lead");
+        let ctx = ToolContext::local(
+            Invocation::new(BotId::from_suffix("lead"), ConversationId::from_suffix("c")),
+            workspace.clone(),
+            Arc::clone(&brain.swarm.gate) as Arc<dyn ApprovalGate>,
+            Arc::clone(&brain.swarm.nodes),
+            workspace.join(".spool"),
+        );
+        let result = brain
+            .swarm
+            .tools
+            .dispatch(
+                &ctx,
+                ToolCallRequest {
+                    id: ToolCallId::new(),
+                    name: "shell".into(),
+                    args: serde_json::json!({"command": "echo should-not-run"}),
+                },
+            )
+            .await;
+        assert!(result.is_error, "shell must respect PolicyCeiling::Never");
+        assert!(
+            brain
+                .swarm
+                .store
+                .pending_requests()
+                .expect("requests")
+                .is_empty(),
+            "PolicyCeiling::Never refuses before queuing approval"
+        );
+        brain.swarm.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_memory_brain_adopts_the_configured_settings_and_ceilings() {
+        use swarmbot_contracts::node::{PolicyCeiling, Surface};
+        use swarmbot_contracts::{BotId, ConversationId, Invocation, ToolCallId, ToolCallRequest};
+        use swarmbot_tools::{ApprovalGate, ToolContext};
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut resolved = resolved(dir.path(), true);
+        resolved.config.settings.max_hops = 3;
+        resolved.config.settings.bot_messaging = false;
+        resolved
+            .config
+            .settings
+            .safety
+            .set(Surface::Shell, PolicyCeiling::Never);
+
+        let brain =
+            Brain::memory(resolved, &BTreeMap::new(), SecretRegistry::new()).expect("a brain");
+        let settings = brain.swarm.settings.get();
+        assert_eq!(settings.max_hops, 3);
+        assert!(!settings.bot_messaging);
+        assert_eq!(brain.swarm.store.settings().expect("settings"), settings);
+
+        let workspace = dir.path().join("workspaces/lead");
+        let ctx = ToolContext::local(
+            Invocation::new(BotId::from_suffix("lead"), ConversationId::from_suffix("c")),
+            workspace.clone(),
+            Arc::clone(&brain.swarm.gate) as Arc<dyn ApprovalGate>,
+            Arc::clone(&brain.swarm.nodes),
+            workspace.join(".spool"),
+        );
+        let result = brain
+            .swarm
+            .tools
+            .dispatch(
+                &ctx,
+                ToolCallRequest {
+                    id: ToolCallId::new(),
+                    name: "shell".into(),
+                    args: serde_json::json!({"command": "echo should-not-run"}),
+                },
+            )
+            .await;
+        assert!(result.is_error, "shell must respect PolicyCeiling::Never");
+        assert!(
+            brain
+                .swarm
+                .store
+                .pending_requests()
+                .expect("requests")
+                .is_empty()
         );
         brain.swarm.shutdown().await;
     }

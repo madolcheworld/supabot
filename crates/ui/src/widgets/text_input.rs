@@ -115,6 +115,20 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Update the placeholder text only when it actually changes.
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let placeholder = placeholder.into();
+        if self.placeholder == placeholder {
+            return;
+        }
+        self.placeholder = placeholder;
+        cx.notify();
+    }
+
     pub fn set_font_size(mut self, size: Pixels) -> Self {
         self.font_size = size;
         self.line_height = size * 1.45;

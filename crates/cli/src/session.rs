@@ -33,11 +33,12 @@ use serde_json::Value;
 use swarmbot_contracts::bot::Bot;
 use swarmbot_contracts::conversation::Conversation;
 use swarmbot_contracts::entry::Entry;
-use swarmbot_contracts::id::{ConversationId, RequestId};
+use swarmbot_contracts::id::{BotId, ConversationId, EntryId, RequestId};
 use swarmbot_contracts::live::LiveEvent;
 use swarmbot_contracts::node::NodeInfo;
 use swarmbot_contracts::request::{Decision, RuntimeRequest};
 use swarmbot_contracts::task::Task;
+use swarmbot_contracts::turn::Turn;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// What one sent message did, in the only fact a front end prints.
@@ -95,6 +96,18 @@ pub trait Session: Clone + Send + Sync + 'static {
     /// Post the owner's message. Mentions are parsed by the brain in both
     /// modes, so neither half sends an `addressed` list of its own.
     fn send(&self, conversation: &ConversationId, text: &str) -> Result<SendReport>;
+
+    /// Post the owner's message with explicit addressing and/or reply target.
+    fn send_with(
+        &self,
+        conversation: &ConversationId,
+        text: &str,
+        addressed: &[BotId],
+        reply_to: Option<&EntryId>,
+    ) -> Result<SendReport> {
+        let _ = (addressed, reply_to);
+        self.send(conversation, text)
+    }
 
     /// The live event stream, optionally narrowed to one conversation.
     ///
@@ -213,6 +226,52 @@ pub fn honest_stream_error<S: Session>(session: &S, err: anyhow::Error) -> anyho
         Some(reason) => anyhow!("{reason}"),
         None => err,
     }
+}
+
+/// Whether a runtime request belongs to `focus`.
+///
+/// A direct conversation only matches requests created in `focus` (or tied to
+/// a task whose `origin` is `focus`). A group conversation also surfaces:
+/// - requests tied to a task whose `origin` is that group (so cards raised in
+///   delegated DM turns appear inline in the group), and
+/// - requests raised in a member's direct conversation when no task belonging
+///   to a different origin claims them.
+pub(crate) fn request_relevant_to(
+    request: &RuntimeRequest,
+    focus: &ConversationId,
+    conversations: &[Conversation],
+    bots: &[Bot],
+    tasks: &[Task],
+    turns: &[Turn],
+) -> bool {
+    if request.conversation_id == *focus {
+        return true;
+    }
+    let task_id = request.task_id.as_ref().or_else(|| {
+        request.turn_id.as_ref().and_then(|turn_id| {
+            turns
+                .iter()
+                .find(|turn| &turn.id == turn_id)
+                .and_then(|turn| turn.task_id.as_ref())
+        })
+    });
+    if let Some(task_id) = task_id
+        && let Some(task) = tasks.iter().find(|task| &task.id == task_id)
+    {
+        return task.origin == *focus;
+    }
+    let Some(group) = conversations
+        .iter()
+        .find(|c| &c.id == focus && c.kind.is_group())
+    else {
+        return false;
+    };
+    if !group.kind.participants().contains(&request.bot_id) {
+        return false;
+    }
+    bots.iter()
+        .find(|bot| bot.id == request.bot_id)
+        .is_some_and(|bot| bot.direct_conversation_id == request.conversation_id)
 }
 
 #[cfg(test)]

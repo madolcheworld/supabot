@@ -4,6 +4,7 @@
 //! It is also the [`RunnerHooks`] implementation, which is how a runner wakes
 //! mentioned teammates and settles tasks without knowing either service exists.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -13,16 +14,16 @@ use serde_json::Value;
 use swarmbot_contracts::Seq;
 use swarmbot_contracts::bot::{Bot, BotStatus};
 use swarmbot_contracts::conversation::{Conversation, ConversationKind};
-use swarmbot_contracts::delivery::{CausalChain, Delivery};
+use swarmbot_contracts::delivery::{CausalChain, Delivery, Urgency};
 use swarmbot_contracts::entry::{Entry, PostState};
 use swarmbot_contracts::error::DomainError;
-use swarmbot_contracts::id::{BotId, ConversationId, EntryId, RequestId, TaskId};
+use swarmbot_contracts::id::{BotId, ConversationId, EntryId, RequestId, TaskId, TurnId};
 use swarmbot_contracts::repo::{Persistence, RecoveryReport, recover};
 use swarmbot_contracts::request::{Decision, Responder, RuntimeRequest};
 
 use crate::approval::ApprovalService;
 use crate::bus::{Change, LiveHub};
-use crate::messaging::Messaging;
+use crate::messaging::{Messaging, SendContext};
 use crate::router::{GroupRouter, RouteDecision};
 use crate::runners::{RunnerHooks, RunnerMap};
 use crate::settings::SettingsHandle;
@@ -323,6 +324,41 @@ impl RunnerHooks for Orchestrator {
         // A finished task may free room for a queued one.
         if let Err(err) = self.tasks.pump() {
             debug!(error = %err, "cannot pump the task queue");
+        }
+    }
+
+    fn take_turn_targets(&self, turn_id: &TurnId) -> HashSet<BotId> {
+        self.messaging.take_turn_targets(turn_id)
+    }
+
+    fn forward_dm_reply(
+        &self,
+        conversation: &Conversation,
+        from: &Bot,
+        to: &BotId,
+        text: &str,
+        source_entry: Option<EntryId>,
+        hops: u8,
+    ) {
+        if !self.settings.get().bot_messaging {
+            return;
+        }
+        let ctx = SendContext {
+            from: from.clone(),
+            conversation: conversation.clone(),
+            hops,
+            source_entry,
+        };
+        if let Err(err) = self
+            .messaging
+            .message_bot(&ctx, to.as_str(), text, Urgency::Background)
+        {
+            warn!(
+                error = %err,
+                from = %from.name,
+                to = %to,
+                "cannot forward DM reply back to teammate"
+            );
         }
     }
 }

@@ -19,7 +19,7 @@ use axum::extract::{FromRequest, Request, State};
 use axum::http::{HeaderMap, Method, Uri};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{delete, get, post};
+use axum::routing::{any, delete, get, post};
 use serde::de::DeserializeOwned;
 use tracing::debug;
 
@@ -129,8 +129,11 @@ use std::sync::Arc;
 /// The internal listener: loopback-only, for the MCP gateway the CLI harnesses
 /// connect to (M3). It carries no owner routes on purpose — a second path to the
 /// API would be a second place to get authorization wrong.
-pub fn internal_router(mcp: Arc<swarmbot_mcp::McpHttpService>) -> Router {
-    Router::new()
+pub fn internal_router(
+    mcp: Arc<swarmbot_mcp::McpHttpService>,
+    turns: Arc<swarmbot_mcp::TurnMcpRegistry>,
+) -> Router {
+    let static_routes = Router::new()
         .route("/health", get(internal_health))
         .route(
             "/mcp",
@@ -138,7 +141,11 @@ pub fn internal_router(mcp: Arc<swarmbot_mcp::McpHttpService>) -> Router {
                 .get(node_gateway::mcp_handler)
                 .delete(node_gateway::mcp_handler),
         )
-        .with_state(mcp)
+        .with_state(mcp);
+    let turn_routes = Router::new()
+        .route("/mcp/t/{token}", any(node_gateway::turn_mcp_handler))
+        .with_state(turns);
+    static_routes.merge(turn_routes)
 }
 
 async fn internal_health() -> axum::Json<serde_json::Value> {

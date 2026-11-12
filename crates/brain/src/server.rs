@@ -16,6 +16,7 @@
 //!   the caller can shut the swarm down. A second signal exits at once, because
 //!   "stop" twice means the first stop was too slow.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -92,7 +93,10 @@ pub fn app(state: AppState) -> Router {
 /// authorization wrong.
 pub fn internal_app(state: &AppState) -> Router {
     let mcp = routes::node_gateway::create_mcp_service(state);
-    instrumented(routes::internal_router(mcp), state)
+    instrumented(
+        routes::internal_router(mcp, Arc::clone(&state.turn_mcp)),
+        state,
+    )
 }
 
 /// The layers both listeners share, innermost first.
@@ -273,6 +277,19 @@ pub async fn serve(
     let public_addr = public
         .local_addr()
         .context("cannot read the bound address")?;
+    // Publish the internal address before spawning either listener so any turn
+    // woken via the public listener can register a reachable `/mcp/t/{token}`
+    // endpoint right away.
+    let internal_addr = match internal.as_ref() {
+        Some(listener) => {
+            let addr = listener
+                .local_addr()
+                .context("cannot read the bound internal address")?;
+            state.set_internal_addr(addr);
+            Some(addr)
+        }
+        None => None,
+    };
     info!(
         listener = %public_addr,
         "the public listener is up: REST, /ws/live and the node gateway"
@@ -292,7 +309,7 @@ pub async fn serve(
         // reference, and the task owns it.
         let router = internal_app(&serving);
         tokio::spawn(async move {
-            if let Ok(addr) = listener.local_addr() {
+            if let Some(addr) = internal_addr {
                 info!(listener = %addr, "the internal listener is up: the MCP gateway");
                 write_mcp_config(&serving.config.paths, &addr);
             }

@@ -248,8 +248,13 @@ struct CreateGroupBody<'a> {
 }
 
 #[derive(Serialize)]
-struct RenameBody<'a> {
-    title: &'a str,
+struct UpdateGroupBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    members: Option<&'a [BotId]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lead: Option<&'a BotId>,
 }
 
 #[derive(Serialize)]
@@ -463,13 +468,34 @@ impl BrainClient {
         self.http.get(&url)
     }
 
+    /// Update a group's title, member list, and/or lead (`PATCH /api/conversations/{id}`).
+    ///
+    /// Only `Some(...)` fields are sent on the wire so the brain leaves
+    /// omitted fields untouched.
+    pub fn update_group(
+        &self,
+        id: &ConversationId,
+        title: Option<&str>,
+        members: Option<&[BotId]>,
+        lead: Option<&BotId>,
+    ) -> Result<Conversation, ClientError> {
+        let url = self.endpoint(&["api", "conversations", id.as_str()], &[])?;
+        self.http.patch(
+            &url,
+            &UpdateGroupBody {
+                title,
+                members,
+                lead,
+            },
+        )
+    }
+
     pub fn rename_conversation(
         &self,
         id: &ConversationId,
         title: &str,
     ) -> Result<Conversation, ClientError> {
-        let url = self.endpoint(&["api", "conversations", id.as_str()], &[])?;
-        self.http.patch(&url, &RenameBody { title })
+        self.update_group(id, Some(title), None, None)
     }
 
     /// Groups only; a DM cannot be deleted (the brain answers 409).
@@ -955,6 +981,88 @@ mod tests {
         client
             .delete_conversation(&conversation_id)
             .expect("delete");
+    }
+
+    #[test]
+    fn update_group_updates_title_members_and_lead() {
+        let stub = StubBrain::start();
+        let client = stub_client(&stub);
+
+        let group_id = ConversationId::new();
+        let b1 = BotId::from_suffix("000000000000000000000000000000b1");
+        let b2 = BotId::from_suffix("000000000000000000000000000000b2");
+        let b3 = BotId::from_suffix("000000000000000000000000000000b3");
+        let members = vec![b1.clone(), b2.clone(), b3.clone()];
+
+        let updated = client
+            .update_group(&group_id, Some("Core Team"), Some(&members), Some(&b2))
+            .expect("update group");
+        assert_eq!(updated.id, group_id);
+        assert_eq!(updated.title.as_deref(), Some("Core Team"));
+        assert_eq!(
+            updated.kind,
+            swarmbot_contracts::ConversationKind::Group {
+                members: members.clone(),
+                lead: b2.clone(),
+            }
+        );
+
+        let path = format!("/api/conversations/{group_id}");
+        let recorded = stub.last_request("PATCH", &path).expect("recorded");
+        let body = body_json(&recorded);
+        assert_eq!(body["title"], "Core Team");
+        assert_eq!(
+            body["members"],
+            json!([b1.as_str(), b2.as_str(), b3.as_str()])
+        );
+        assert_eq!(body["lead"], b2.as_str());
+    }
+
+    #[test]
+    fn update_group_partial_updates_omit_none_fields() {
+        let stub = StubBrain::start();
+        let client = stub_client(&stub);
+
+        let group_id = ConversationId::new();
+        let b2 = BotId::from_suffix("000000000000000000000000000000b2");
+        let b3 = BotId::from_suffix("000000000000000000000000000000b3");
+        let path = format!("/api/conversations/{group_id}");
+
+        // Title only.
+        let updated = client
+            .update_group(&group_id, Some("New Title"), None, None)
+            .expect("title patch");
+        assert_eq!(updated.title.as_deref(), Some("New Title"));
+        let body = body_json(&stub.last_request("PATCH", &path).expect("recorded"));
+        assert_eq!(body, json!({"title": "New Title"}));
+
+        // Members only.
+        let subset = vec![b2.clone(), b3.clone()];
+        let updated = client
+            .update_group(&group_id, None, Some(&subset), None)
+            .expect("members patch");
+        assert_eq!(updated.kind.participants(), subset);
+        let body = body_json(&stub.last_request("PATCH", &path).expect("recorded"));
+        assert_eq!(body, json!({"members": [b2.as_str(), b3.as_str()]}));
+
+        // Lead only.
+        let updated = client
+            .update_group(&group_id, None, None, Some(&b3))
+            .expect("lead patch");
+        match updated.kind {
+            swarmbot_contracts::ConversationKind::Group { lead, .. } => assert_eq!(lead, b3),
+            other => panic!("expected group, got {other:?}"),
+        }
+        let body = body_json(&stub.last_request("PATCH", &path).expect("recorded"));
+        assert_eq!(body, json!({"lead": b3.as_str()}));
+
+        // `rename_conversation` delegates cleanly with only `title` set.
+        let renamed = client
+            .rename_conversation(&group_id, "Via Rename")
+            .expect("rename");
+        assert_eq!(renamed.title.as_deref(), Some("Via Rename"));
+        let body = body_json(&stub.last_request("PATCH", &path).expect("recorded"));
+        assert_eq!(body, json!({"title": "Via Rename"}));
     }
 
     #[test]

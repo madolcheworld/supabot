@@ -6,6 +6,7 @@
 
 pub mod transport;
 
+use std::fmt;
 use std::sync::Arc;
 
 use rmcp::handler::server::ServerHandler;
@@ -16,14 +17,19 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::Value;
-use swarmbot_contracts::{Capabilities, InvocationId, ToolCallId, ToolCallRequest, Toolset};
+use swarmbot_contracts::{
+    Capabilities, InvocationId, ToolCallId, ToolCallRequest, ToolError, ToolResult, Toolset,
+};
 use swarmbot_tools::{ToolContext, ToolRegistry};
 
 pub use rmcp;
 pub use transport::{
-    McpHttpService, create_default_http_service, create_http_service, serve_stdio,
-    serve_stdio_with_ct, serve_transport, serve_transport_with_ct,
+    McpHttpService, StreamableHttpServerConfig, TurnMcpHandle, TurnMcpRegistry,
+    create_default_http_service, create_http_service, serve_stdio, serve_stdio_with_ct,
+    serve_transport, serve_transport_with_ct,
 };
+
+const ALL_TOOLSETS: [Toolset; 4] = [Toolset::Bot, Toolset::Node, Toolset::Owner, Toolset::Task];
 
 /// Filter configuration for which tools are exposed over MCP.
 #[derive(Clone, Debug, Default)]
@@ -74,11 +80,22 @@ impl SwarmMcpServer {
         self
     }
 
+    /// Returns the active tool filter, if any.
+    pub fn filter(&self) -> Option<&ToolFilter> {
+        self.filter.as_ref()
+    }
+
+    /// Returns `true` when `name` is visible under the active [`ToolFilter`].
+    pub fn is_tool_visible(&self, name: &str) -> bool {
+        self.visible_specs().iter().any(|spec| spec.name == name)
+    }
+
     /// Returns the specs visible according to the active filter.
     pub fn visible_specs(&self) -> Vec<swarmbot_contracts::ToolSpec> {
-        if let Some(filter) = &self.filter
-            && let Some(toolsets) = &filter.toolsets
-        {
+        if let Some(filter) = &self.filter {
+            // `toolsets: None` means "do not restrict by toolset", while still
+            // applying node capability and `in_task` gating.
+            let toolsets = filter.toolsets.as_deref().unwrap_or(&ALL_TOOLSETS);
             return self.registry.visible_specs(
                 toolsets,
                 filter.node_caps.as_ref(),
@@ -94,6 +111,18 @@ impl SwarmMcpServer {
         name: &str,
         args: Value,
     ) -> Result<CallToolResponse, ErrorData> {
+        if self.filter.is_some() && !self.is_tool_visible(name) {
+            let result = if self.registry.get(name).is_some() {
+                ToolResult::error(format!("tool `{name}` is not available"))
+            } else {
+                ToolError::UnknownTool {
+                    tool: name.to_string(),
+                }
+                .to_result()
+            };
+            return Ok(tool_result_to_response(result));
+        }
+
         let tool_name = name.to_string();
         let tool_call_id = ToolCallId::new();
 
@@ -108,27 +137,38 @@ impl SwarmMcpServer {
         ctx.invocation.tool_call_id = Some(tool_call_id);
 
         let tool_result = self.registry.dispatch(&ctx, call_req).await;
+        Ok(tool_result_to_response(tool_result))
+    }
+}
 
-        let mut content_blocks = Vec::new();
-        for item in tool_result.content {
-            match item {
-                swarmbot_contracts::Content::Text { text } => {
-                    content_blocks.push(ContentBlock::Text(TextContent::new(text)));
-                }
-                swarmbot_contracts::Content::Image { mime, data_base64 } => {
-                    content_blocks.push(ContentBlock::Image(ImageContent::new(data_base64, mime)));
-                }
+impl fmt::Debug for SwarmMcpServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SwarmMcpServer")
+            .field("filter", &self.filter)
+            .finish_non_exhaustive()
+    }
+}
+
+fn tool_result_to_response(tool_result: ToolResult) -> CallToolResponse {
+    let mut content_blocks = Vec::with_capacity(tool_result.content.len());
+    for item in tool_result.content {
+        match item {
+            swarmbot_contracts::Content::Text { text } => {
+                content_blocks.push(ContentBlock::Text(TextContent::new(text)));
+            }
+            swarmbot_contracts::Content::Image { mime, data_base64 } => {
+                content_blocks.push(ContentBlock::Image(ImageContent::new(data_base64, mime)));
             }
         }
-
-        let res = if tool_result.is_error {
-            CallToolResult::error(content_blocks)
-        } else {
-            CallToolResult::success(content_blocks)
-        };
-
-        Ok(CallToolResponse::Complete(res))
     }
+
+    let res = if tool_result.is_error {
+        CallToolResult::error(content_blocks)
+    } else {
+        CallToolResult::success(content_blocks)
+    };
+
+    CallToolResponse::Complete(res)
 }
 
 /// Convert a SwarmBot [`swarmbot_contracts::ToolSpec`] into an MCP [`Tool`].

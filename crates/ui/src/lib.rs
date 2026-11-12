@@ -269,14 +269,23 @@ fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) {
     let windows = configs.len();
     let mut applied = 0usize;
     let mut failed = false;
-    for (index, (screen, graph, palette, provider_menu)) in configs.into_iter().enumerate() {
+    for (index, cfg) in configs.into_iter().enumerate() {
         let state = cx.new(|_| AppState::new(brain_url.to_string()));
         applied = selftest::drive(cx, &state);
         state.update(cx, |s, _| {
-            s.screen = screen;
-            s.graph_open = graph;
-            s.palette_open = palette;
-            if provider_menu {
+            s.screen = cfg.screen;
+            s.graph_open = cfg.graph;
+            s.palette_open = cfg.palette;
+            if cfg.plus_menu {
+                s.plus_menu_open = true;
+            }
+            if cfg.create_bot {
+                s.open_create_bot();
+            }
+            if cfg.create_group {
+                s.open_create_group();
+            }
+            if cfg.provider_menu {
                 // Fabricate what the REST fetches would have delivered, so
                 // the menu's two columns have real rows to render.
                 s.backends = vec![
@@ -316,7 +325,7 @@ fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) {
                 s.menu_backend = Some("codex".into());
                 s.bot_menu_open = true;
             }
-            if screen == state::Screen::Routines
+            if cfg.screen == state::Screen::Routines
                 && let Ok(r) = swarmbot_contracts::Routine::new(
                     swarmbot_contracts::BotId::from_suffix("lead"),
                     "Daily Triage",
@@ -344,7 +353,14 @@ fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) {
         );
         match opened {
             Ok(_) => report.note(format!(
-                "selftest: window {index} drew screen={screen:?} graph={graph} palette={palette} provider_menu={provider_menu}"
+                "selftest: window {index} drew screen={:?} graph={} palette={} provider_menu={} plus_menu={} create_bot={} create_group={}",
+                cfg.screen,
+                cfg.graph,
+                cfg.palette,
+                cfg.provider_menu,
+                cfg.plus_menu,
+                cfg.create_bot,
+                cfg.create_group
             )),
             Err(err) => {
                 report.note(format!("WINDOW FAILED (screen {index}): {err}"));

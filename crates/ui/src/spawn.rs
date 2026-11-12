@@ -157,24 +157,17 @@ pub fn spawn(args: &Args) -> Result<SpawnedBrain, SpawnError> {
 
     let mut command = Command::new(&bin);
     command
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .arg("--addr")
-        .arg(&addr)
+        .args(build_brain_args(
+            args,
+            &data_dir,
+            &addr,
+            find_team_file().as_deref(),
+            find_config_file().as_deref(),
+        ))
         // Keep the child's logs out of the UI's stdout so `--report` stays clean;
         // inherit stderr so a crash is visible.
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-
-    if args.offline {
-        // The brain's own `--offline` forces the scripted fake backend.
-        command.arg("--offline");
-        if let Some(team) = find_team_file() {
-            command.arg("--team").arg(&team);
-        }
-    } else if let Some(config) = find_config_file() {
-        command.arg("--config").arg(&config);
-    }
 
     let argv: Vec<String> = std::iter::once(bin.display().to_string())
         .chain(command_args(&command))
@@ -201,6 +194,46 @@ pub fn spawn(args: &Args) -> Result<SpawnedBrain, SpawnError> {
             Err(err)
         }
     }
+}
+
+/// Build CLI arguments for the spawned `swarmbot-brain` child process.
+///
+/// On a non-`--offline` launch with an uninitialized `data_dir` (no
+/// `swarmbot.sqlite` yet), passes `--team` if a team file is discovered so a
+/// fresh UI launch boots with a ready team instead of an empty roster.
+fn build_brain_args(
+    args: &Args,
+    data_dir: &Path,
+    addr: &str,
+    team_file: Option<&Path>,
+    config_file: Option<&Path>,
+) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = vec![
+        "--data-dir".into(),
+        data_dir.as_os_str().to_os_string(),
+        "--addr".into(),
+        addr.into(),
+    ];
+    if args.offline {
+        // The brain's own `--offline` forces the scripted fake backend.
+        out.push("--offline".into());
+        if let Some(team) = team_file {
+            out.push("--team".into());
+            out.push(team.as_os_str().to_os_string());
+        }
+    } else {
+        if let Some(config) = config_file {
+            out.push("--config".into());
+            out.push(config.as_os_str().to_os_string());
+        }
+        if !data_dir.join("swarmbot.sqlite").exists()
+            && let Some(team) = team_file
+        {
+            out.push("--team".into());
+            out.push(team.as_os_str().to_os_string());
+        }
+    }
+    out
 }
 
 /// The `swarmbot-brain` binary, expected next to this executable (both live in
@@ -470,5 +503,42 @@ mod tests {
         let (path, owns) = resolve_data_dir_with(&args, Some("/xdg"), Some("/home/tester"));
         assert_eq!(path, PathBuf::from("/custom/swarmbot-state"));
         assert!(!owns);
+    }
+
+    #[test]
+    fn spawn_brain_passes_team_file_only_when_sqlite_does_not_exist() {
+        let args = base_args();
+        let fresh_dir = TempDir::new("fresh-db");
+        let team = Path::new("config/team.waypoint.toml");
+        let cfg = Path::new("config/swarmbot.toml");
+
+        let argv_fresh: Vec<String> = build_brain_args(
+            &args,
+            fresh_dir.path(),
+            "127.0.0.1:8787",
+            Some(team),
+            Some(cfg),
+        )
+        .into_iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+        assert!(argv_fresh.contains(&"--config".to_string()));
+        assert!(argv_fresh.contains(&"--team".to_string()));
+        assert!(argv_fresh.contains(&"config/team.waypoint.toml".to_string()));
+
+        // Once swarmbot.sqlite exists, do not re-seed with --team.
+        std::fs::write(fresh_dir.path().join("swarmbot.sqlite"), b"").expect("touch db");
+        let argv_existing: Vec<String> = build_brain_args(
+            &args,
+            fresh_dir.path(),
+            "127.0.0.1:8787",
+            Some(team),
+            Some(cfg),
+        )
+        .into_iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+        assert!(argv_existing.contains(&"--config".to_string()));
+        assert!(!argv_existing.contains(&"--team".to_string()));
     }
 }

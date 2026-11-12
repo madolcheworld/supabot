@@ -55,5 +55,5 @@ pub use openai::{BodyStream, HttpError, HttpTransport, OpenAiCompat, ReqwestTran
 pub use registry::{BackendInfo, BackendRegistry, FAKE_BACKEND_ID};
 pub use types::{
     BackendStatus, Capabilities, ChatMessage, ChatRequest, ChatResponse, FinishReason, LlmEvent,
-    ModelList, ModelOption, Role, ToolCall,
+    McpServerSpec, ModelList, ModelOption, Role, ToolCall,
 };

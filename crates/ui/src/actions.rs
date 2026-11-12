@@ -70,6 +70,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-q", Quit, None),
         KeyBinding::new("ctrl-g", ToggleGraph, None),
         KeyBinding::new("ctrl-k", TogglePalette, None),
+        KeyBinding::new("ctrl-.", StopTurn, None),
         // Escape is handled only at the root, which is the last element on the
         // focus path, so it always gets the event: it closes the palette first,
         // then the composer's mention picker.

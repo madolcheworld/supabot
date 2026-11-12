@@ -78,8 +78,14 @@ pub fn apply(state: &mut AppState, event: LiveEvent) {
             let conv = entry.conversation_id.clone();
             let from_owner = entry.author.is_owner();
             let is_open = state.open_conversation.as_ref() == Some(&conv);
-            state.upsert_entry(entry);
-            if !is_open && !from_owner {
+            // Streaming deltas and tool-call updates arrive as repeated
+            // `EntryUpsert`s sharing the same `EntryId`. Only a genuinely new
+            // entry bumps the unread counter; updates to an existing (or
+            // dismissed) entry must not inflate unread counts.
+            let already_seen = state.dismissed.contains(&entry.id)
+                || state.entries(&conv).iter().any(|e| e.id == entry.id);
+            let inserted_or_kept = state.upsert_entry(entry);
+            if inserted_or_kept && !already_seen && !is_open && !from_owner {
                 *state.unread.entry(conv).or_insert(0) += 1;
             }
             state.cursor = Some(cursor);
@@ -239,6 +245,15 @@ pub fn apply_result(state: &mut AppState, result: CommandResult) {
             state.toast = Some("group created".to_string());
         }
         CommandResult::CreateGroup(Err(err)) => fail(state, "could not create the group", &err),
+        CommandResult::GroupUpdated(Ok(conversation)) => {
+            state.upsert_conversation(conversation);
+            state.edit_group_id = None;
+            state.edit_group_title_seed = None;
+            state.edit_group_members.clear();
+            state.edit_group_lead = None;
+            state.toast = Some("group updated".to_string());
+        }
+        CommandResult::GroupUpdated(Err(err)) => fail(state, "could not update the group", &err),
         CommandResult::CreateBot(Ok(bot)) => {
             let dm = bot.direct_conversation_id.clone();
             state.upsert_bot(bot);
@@ -823,5 +838,75 @@ mod tests {
         );
         assert!(state.conversations.is_empty());
         assert_eq!(state.open_conversation, None);
+    }
+
+    #[test]
+    fn repeated_entry_upsert_updates_do_not_reincrement_unread() {
+        let mut state = AppState::new("http://brain.test");
+        let open_id = ConversationId::new();
+        let bg_id = ConversationId::new();
+        let bot_id = BotId::new();
+        state.open(open_id);
+
+        let mut msg = Entry::bot_message(bg_id.clone(), 1, bot_id, "Hel", None);
+        msg.revision = 1;
+        apply(
+            &mut state,
+            LiveEvent::EntryUpsert {
+                cursor: LiveCursor::new(1, 1),
+                entry: msg.clone(),
+            },
+        );
+        assert_eq!(state.unread(&bg_id), 1);
+
+        // Streaming delta at higher revision on the same EntryId must not bump unread again.
+        msg.revision = 2;
+        if let swarmbot_contracts::EntryKind::Message(ref mut body) = msg.kind {
+            body.text = "Hello world".into();
+        }
+        apply(
+            &mut state,
+            LiveEvent::EntryUpsert {
+                cursor: LiveCursor::new(1, 2),
+                entry: msg,
+            },
+        );
+        assert_eq!(
+            state.unread(&bg_id),
+            1,
+            "streaming updates on an existing EntryId must not inflate unread"
+        );
+    }
+
+    #[test]
+    fn group_updated_applies_new_members_title_lead_and_closes_edit_modal() {
+        let mut state = AppState::new("http://brain.test");
+        let b1 = BotId::new();
+        let b2 = BotId::new();
+        let b3 = BotId::new();
+        let group =
+            Conversation::group("Alpha", vec![b1.clone(), b2.clone()], b1.clone()).expect("group");
+        let gid = group.id.clone();
+        state.upsert_conversation(group.clone());
+        state.open_edit_group(&group);
+        assert_eq!(state.edit_group_id, Some(gid.clone()));
+
+        let renamed = Conversation {
+            id: gid.clone(),
+            ..Conversation::group("Beta", vec![b2.clone(), b3], b2.clone()).expect("updated group")
+        };
+        apply_result(&mut state, CommandResult::GroupUpdated(Ok(renamed)));
+        assert_eq!(state.edit_group_id, None);
+        assert_eq!(state.edit_group_title_seed, None);
+        assert_eq!(state.toast.as_deref(), Some("group updated"));
+        let stored = state.conversation(&gid).expect("updated group present");
+        assert_eq!(stored.title.as_deref(), Some("Beta"));
+        assert_eq!(
+            stored.kind,
+            swarmbot_contracts::ConversationKind::Group {
+                members: vec![b2.clone(), stored.kind.participants()[1].clone()],
+                lead: b2,
+            }
+        );
     }
 }

@@ -16,8 +16,8 @@ use swarmbot_contracts::conversation::Conversation;
 use swarmbot_contracts::entry::Entry;
 use swarmbot_contracts::id::ConversationId;
 
-use crate::error::{ApiError, ApiResult, parse_id};
-use crate::routes::{JsonBody, MAX_PAGE, resolve_bot_refs};
+use crate::error::{ApiResult, parse_id};
+use crate::routes::{JsonBody, MAX_PAGE, resolve_bot, resolve_bot_refs};
 use crate::state::AppState;
 
 /// `POST /api/conversations` body.
@@ -37,9 +37,18 @@ pub struct CreateGroupRequest {
 }
 
 /// `PATCH /api/conversations/{id}` body.
-#[derive(Clone, Debug, Deserialize)]
-pub struct RenameRequest {
-    pub title: String,
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct UpdateGroupRequest {
+    /// New group title; empty/whitespace is rejected when present.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Replacement member list (ids, handles, or labels); preserves duplicates
+    /// so domain validation can reject them explicitly.
+    #[serde(default)]
+    pub members: Option<Vec<String>>,
+    /// New lead bot (id, handle, or label); must be in the group's members.
+    #[serde(default)]
+    pub lead: Option<String>,
 }
 
 /// `?after_seq=&limit=`
@@ -99,14 +108,28 @@ pub async fn get(
 pub async fn patch(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    JsonBody(body): JsonBody<RenameRequest>,
+    JsonBody(body): JsonBody<UpdateGroupRequest>,
 ) -> ApiResult<Json<Conversation>> {
     let id = conversation_id(&id)?;
-    if body.title.trim().is_empty() {
-        return Err(ApiError::invalid("a title cannot be empty"));
-    }
+    let members = body
+        .members
+        .as_deref()
+        .map(|keys| {
+            keys.iter()
+                .map(|key| resolve_bot(&state, key).map(|bot| bot.id))
+                .collect::<ApiResult<Vec<_>>>()
+        })
+        .transpose()?;
+    let lead = body
+        .lead
+        .as_deref()
+        .map(|key| resolve_bot(&state, key).map(|bot| bot.id))
+        .transpose()?;
     Ok(Json(
-        state.swarm.conversations.rename(&id, body.title.trim())?,
+        state
+            .swarm
+            .conversations
+            .update_group(&id, body.title, members, lead)?,
     ))
 }
 
@@ -215,9 +238,24 @@ mod tests {
         let query: PageQuery = serde_json::from_value(json!({})).expect("parses");
         assert!(query.after_seq.is_none() && query.limit.is_none());
 
-        let rename: RenameRequest =
+        let rename: UpdateGroupRequest =
             serde_json::from_value(json!({"title": "Renamed"})).expect("parses");
-        assert_eq!(rename.title, "Renamed");
+        assert_eq!(rename.title.as_deref(), Some("Renamed"));
+        assert!(rename.members.is_none());
+        assert!(rename.lead.is_none());
+
+        let full: UpdateGroupRequest = serde_json::from_value(json!({
+            "title": "Team",
+            "members": ["lead", "dev"],
+            "lead": "dev",
+        }))
+        .expect("parses");
+        assert_eq!(full.title.as_deref(), Some("Team"));
+        assert_eq!(
+            full.members.as_deref(),
+            Some(["lead".to_string(), "dev".to_string()].as_slice())
+        );
+        assert_eq!(full.lead.as_deref(), Some("dev"));
     }
 
     #[test]

@@ -49,6 +49,13 @@ pub trait Brain: Send + Sync {
         members: &[BotId],
         lead: Option<&BotId>,
     ) -> Result<Conversation, ClientError>;
+    fn update_group(
+        &self,
+        id: &ConversationId,
+        title: Option<&str>,
+        members: Option<&[BotId]>,
+        lead: Option<&BotId>,
+    ) -> Result<Conversation, ClientError>;
     fn delete_conversation(&self, id: &ConversationId) -> Result<(), ClientError>;
     fn create_bot(&self, request: &NewBotRequest) -> Result<Bot, ClientError>;
     fn delete_bot(&self, id_or_name: &str) -> Result<(), ClientError>;
@@ -136,6 +143,15 @@ impl Brain for ClientBrain {
         lead: Option<&BotId>,
     ) -> Result<Conversation, ClientError> {
         self.client.create_group(title, members, lead)
+    }
+    fn update_group(
+        &self,
+        id: &ConversationId,
+        title: Option<&str>,
+        members: Option<&[BotId]>,
+        lead: Option<&BotId>,
+    ) -> Result<Conversation, ClientError> {
+        self.client.update_group(id, title, members, lead)
     }
     fn delete_conversation(&self, id: &ConversationId) -> Result<(), ClientError> {
         self.client.delete_conversation(id)
@@ -336,16 +352,42 @@ pub mod scripted {
             &self,
             title: &str,
             members: &[BotId],
-            _lead: Option<&BotId>,
+            lead: Option<&BotId>,
         ) -> Result<Conversation, ClientError> {
             self.record("create_group", format!("{title} ({})", members.len()));
             let conversation = if members.len() >= 2 {
-                Conversation::group(title, members.to_vec(), members[0].clone())
+                let lead_id = lead.cloned().unwrap_or_else(|| members[0].clone());
+                Conversation::group(title, members.to_vec(), lead_id)
                     .unwrap_or_else(|_| Conversation::direct(members[0].clone()))
             } else {
                 Conversation::direct(BotId::new())
             };
             self.maybe_fail(conversation)
+        }
+        fn update_group(
+            &self,
+            id: &ConversationId,
+            title: Option<&str>,
+            members: Option<&[BotId]>,
+            lead: Option<&BotId>,
+        ) -> Result<Conversation, ClientError> {
+            self.record(
+                "update_group",
+                format!(
+                    "{id} title={:?} members={}",
+                    title,
+                    members.map_or(0, |m| m.len())
+                ),
+            );
+            let members_vec = members
+                .map(|m| m.to_vec())
+                .filter(|m| m.len() >= 2)
+                .unwrap_or_else(|| vec![BotId::new(), BotId::new()]);
+            let lead_id = lead.cloned().unwrap_or_else(|| members_vec[0].clone());
+            let mut conv = Conversation::group(title.unwrap_or("Group"), members_vec, lead_id)
+                .unwrap_or_else(|_| Conversation::direct(BotId::new()));
+            conv.id = id.clone();
+            self.maybe_fail(conv)
         }
         fn delete_conversation(&self, id: &ConversationId) -> Result<(), ClientError> {
             self.record("delete_conversation", id.to_string());

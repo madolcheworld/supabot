@@ -77,32 +77,29 @@ fn status_color(status: TaskStatus) -> u32 {
     }
 }
 
-/// The right-hand delegation panel for the open conversation.
-pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::Div {
-    let mut panel = div()
-        .w(theme::space::GRAPH_W)
-        .flex_none()
-        .h_full()
+/// The embeddable delegation section (used inside [`crate::view::side_panel`]
+/// so the task tree and step detail live inside the right panel scroll area
+/// without nested scroll containers).
+pub fn render_section(
+    s: &AppState,
+    state: &Entity<AppState>,
+    commands: &Sender<Command>,
+) -> gpui::Div {
+    let mut section = div()
+        .w_full()
+        .rounded_xl()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb(theme::SURFACE))
+        .p_3()
         .flex()
         .flex_col()
-        .bg(rgb(theme::SURFACE))
-        .border_l_1()
-        .border_color(rgb(theme::BORDER))
-        .overflow_hidden()
-        .child(
-            div()
-                .px_3()
-                .py_2()
-                .text_sm()
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(rgb(theme::TEXT))
-                .child("Delegation"),
-        );
+        .gap_2()
+        .child(bits::section_label("DELEGATION"));
 
     let Some(conversation) = s.open_conversation() else {
-        return panel.child(
+        return section.child(
             div()
-                .px_3()
                 .text_xs()
                 .text_color(rgb(theme::TEXT_DIM))
                 .child("no conversation open"),
@@ -110,9 +107,8 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
     };
     let tasks = s.tasks_for(&conversation.id);
     if tasks.is_empty() {
-        return panel.child(
+        return section.child(
             div()
-                .px_3()
                 .text_xs()
                 .text_color(rgb(theme::TEXT_DIM))
                 .child("no delegated work yet"),
@@ -120,17 +116,7 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
     }
 
     let flat = layout(&tasks);
-    let mut tree = div()
-        .id("graph-tree")
-        .flex_1()
-        .w_full()
-        .overflow_x_hidden()
-        .overflow_y_scroll()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .px_2()
-        .py_2();
+    let mut tree = div().w_full().flex().flex_col().gap_0p5();
 
     for node in &flat {
         let Some(task) = tasks.iter().find(|t| t.id == node.task) else {
@@ -164,6 +150,7 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
             .py_1()
             .rounded_md()
             .cursor_pointer()
+            .hover(|h| h.bg(rgb(theme::SURFACE_RAISED)))
             .when(selected, |d| d.bg(rgb(theme::SURFACE_RAISED)))
             // Connector for depth, so the tree reads as a tree.
             .when(node.depth > 0, |d| {
@@ -229,22 +216,19 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
         tree = tree.child(row);
     }
 
-    panel = panel.child(tree);
+    section = section.child(tree);
 
     // Steps of the selected task, if fetched.
-    if let Some(open_task) = &s.open_task {
+    if let Some(open_task) = &s.open_task
+        && tasks.iter().any(|t| &t.id == open_task)
+    {
         let steps = s.steps.get(open_task);
         let mut step_panel = div()
             .id("graph-steps")
-            .flex_none()
             .w_full()
-            .max_h(px(220.0))
-            .overflow_x_hidden()
-            .overflow_y_scroll()
             .border_t_1()
             .border_color(rgb(theme::BORDER))
-            .px_3()
-            .py_2()
+            .pt_2()
             .flex()
             .flex_col()
             .gap_1()
@@ -305,10 +289,32 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
                     }),
             );
         }
-        panel = panel.child(step_panel);
+        section = section.child(step_panel);
     }
 
-    panel
+    section
+}
+
+/// The standalone right-hand delegation panel for the open conversation.
+pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::Div {
+    div()
+        .w(theme::space::GRAPH_W)
+        .flex_none()
+        .h_full()
+        .flex()
+        .flex_col()
+        .bg(rgb(theme::SURFACE))
+        .border_l_1()
+        .border_color(rgb(theme::BORDER))
+        .overflow_hidden()
+        .child(
+            div()
+                .id("graph-panel-scroll")
+                .flex_1()
+                .overflow_y_scroll()
+                .p_3()
+                .child(render_section(s, state, commands)),
+        )
 }
 
 fn step_kind_mark(kind: swarmbot_contracts::StepKind) -> &'static str {

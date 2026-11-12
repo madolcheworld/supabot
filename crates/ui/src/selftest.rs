@@ -261,23 +261,69 @@ pub fn drive(cx: &mut App, state: &Entity<AppState>) -> usize {
     count
 }
 
+/// One window configuration exercised by `--selftest`.
+#[derive(Clone, Copy, Debug)]
+pub struct ScreenConfig {
+    pub screen: Screen,
+    pub graph: bool,
+    pub palette: bool,
+    pub provider_menu: bool,
+    pub plus_menu: bool,
+    pub create_bot: bool,
+    pub create_group: bool,
+}
+
+impl ScreenConfig {
+    const fn base(screen: Screen) -> Self {
+        Self {
+            screen,
+            graph: false,
+            palette: false,
+            provider_menu: false,
+            plus_menu: false,
+            create_bot: false,
+            create_group: false,
+        }
+    }
+}
+
 /// The screen configurations `--selftest` opens one window per. `open_window`
 /// forces a synchronous draw before it returns, so opening a window per config
 /// proves each screen's render path runs (and does not panic) on a real
 /// compositor — coverage a headless test cannot give here, because GPUI's
 /// `TestAppContext` is behind the `test-support` feature, which pulls in `x11`
 /// and would not link on this machine.
-pub fn screen_configs() -> Vec<(Screen, bool, bool, bool)> {
+pub fn screen_configs() -> Vec<ScreenConfig> {
+    let mut graph = ScreenConfig::base(Screen::Conversation);
+    graph.graph = true;
+
+    let mut palette = ScreenConfig::base(Screen::Conversation);
+    palette.palette = true;
+
+    let mut provider_menu = ScreenConfig::base(Screen::Conversation);
+    provider_menu.provider_menu = true;
+
+    let mut plus_menu = ScreenConfig::base(Screen::Conversation);
+    plus_menu.plus_menu = true;
+
+    let mut create_bot = ScreenConfig::base(Screen::Conversation);
+    create_bot.create_bot = true;
+
+    let mut create_group = ScreenConfig::base(Screen::Conversation);
+    create_group.create_group = true;
+
     vec![
-        // (screen, graph panel open, palette open, provider menu open)
-        (Screen::Conversation, false, false, false),
-        (Screen::Conversation, true, false, false),
-        (Screen::Nodes, false, false, false),
-        (Screen::Routines, false, false, false),
-        (Screen::Settings, false, false, false),
-        (Screen::Conversation, false, true, false),
+        ScreenConfig::base(Screen::Conversation),
+        graph,
+        ScreenConfig::base(Screen::Nodes),
+        ScreenConfig::base(Screen::Routines),
+        ScreenConfig::base(Screen::Settings),
+        palette,
         // The two-column provider menu over a DM: both columns, the search
         // box and the footer render on the live compositor.
-        (Screen::Conversation, false, false, true),
+        provider_menu,
+        plus_menu,
+        create_bot,
+        create_group,
     ]
 }

@@ -199,13 +199,24 @@ fn outcome_line(status: RequestStatus, request: &swarmbot_contracts::RuntimeRequ
 
 impl gpui::Render for CardView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(request) = self.state.read(cx).request(&self.request_id).cloned() else {
-            // The request is gone (deleted conversation, or not yet synced).
-            return div()
-                .text_sm()
-                .text_color(rgb(theme::TEXT_DIM))
-                .child("(card unavailable)")
-                .into_any_element();
+        let (request, bot_meta) = {
+            let st = self.state.read(cx);
+            let Some(request) = st.request(&self.request_id).cloned() else {
+                // The request is gone (deleted conversation, or not yet synced).
+                return div()
+                    .text_sm()
+                    .text_color(rgb(theme::TEXT_DIM))
+                    .child("(card unavailable)")
+                    .into_any_element();
+            };
+            let bot = st.bot(&request.bot_id);
+            let handle = bot
+                .map(|b| format!("@{}", b.name))
+                .unwrap_or_else(|| format!("@{}", request.bot_id.as_str()));
+            let color = bot
+                .map(theme::bot_color)
+                .unwrap_or_else(|| theme::bot_color_from_id(request.bot_id.as_str()));
+            (request, (handle, color))
         };
         let pending = request.status == RequestStatus::Pending;
         let eid = self.entry_id.as_str().to_string();
@@ -221,14 +232,48 @@ impl gpui::Render for CardView {
             .flex_col()
             .gap_2()
             .overflow_hidden()
-            // Title.
+            // Bot attribution + Title.
             .child(
                 div()
                     .w_full()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(theme::TEXT))
-                    .child(request.title()),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py(px(1.0))
+                            .rounded_full()
+                            .bg(rgb(0xffffff))
+                            .border_1()
+                            .border_color(rgb(theme::BORDER))
+                            .child(
+                                div()
+                                    .size(px(7.0))
+                                    .flex_none()
+                                    .rounded_full()
+                                    .bg(bot_meta.1),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(bot_meta.1)
+                                    .child(bot_meta.0),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(theme::TEXT))
+                            .child(request.title()),
+                    ),
             );
 
         // Target / reason / prompt.

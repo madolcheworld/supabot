@@ -13,7 +13,8 @@ use std::sync::mpsc::Sender;
 
 use gpui::{AnyElement, Entity, SharedString, div, prelude::*, px, rgb};
 use swarmbot_contracts::{
-    Author, Bot, Conversation, Entry, EntryId, EntryKind, NoticeLevel, PostState, ToolCallStatus,
+    Author, Bot, Conversation, ConversationKind, Entry, EntryId, EntryKind, NoticeLevel, PostState,
+    ToolCallStatus, TurnStatus,
 };
 
 use crate::proto::Command;
@@ -66,8 +67,12 @@ pub fn header(
     let conv_id = conversation.id.clone();
     let members = s.members(&conv_id);
 
-    // The live "Handling…" line, from a running turn in this conversation.
-    let running = s.running_turn(&conv_id).is_some();
+    let active_group_bots = if conversation.kind.is_group() {
+        s.active_group_activities(conversation)
+    } else {
+        Vec::new()
+    };
+    let running = s.running_turn(&conv_id).is_some() || !active_group_bots.is_empty();
     let activity = s
         .handling_bot(&conv_id)
         .and_then(|b| match &b.status {
@@ -247,6 +252,42 @@ pub fn header(
         None
     };
 
+    let group_edit_btn = if conversation.kind.is_group() {
+        let conv_clone = conversation.clone();
+        let state_edit = state.clone();
+        Some(
+            div()
+                .id("group-edit-btn")
+                .cursor_pointer()
+                .px_2()
+                .py(px(1.5))
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .bg(rgb(theme::SURFACE))
+                .hover(|h| h.bg(rgb(theme::SURFACE_RAISED)))
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child("Edit")
+                .on_click(move |_, _, cx: &mut gpui::App| {
+                    state_edit.update(cx, |st, cx| {
+                        st.open_edit_group(&conv_clone);
+                        cx.notify();
+                    });
+                }),
+        )
+    } else {
+        None
+    };
+
+    let group_lead_handle = match &conversation.kind {
+        ConversationKind::Group { lead, .. } => s
+            .bot(lead)
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| lead.as_str().to_string()),
+        ConversationKind::Direct { .. } => String::new(),
+    };
+
     div()
         .h(theme::space::HEADER_H)
         .flex_none()
@@ -260,6 +301,8 @@ pub fn header(
         .child(bits::avatar(bot_color, bot_initial, px(32.0)))
         .child(
             div()
+                .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .child(
@@ -276,7 +319,8 @@ pub fn header(
                                 .child(bot_label),
                         )
                         .children(direct_pill)
-                        .children(group_pill),
+                        .children(group_pill)
+                        .children(group_edit_btn),
                 )
                 .child(
                     div()
@@ -285,30 +329,70 @@ pub fn header(
                         .gap_2()
                         .text_xs()
                         .text_color(rgb(theme::TEXT_DIM))
-                        .child(if running {
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .truncate()
-                                .child(bits::spinner(s.spinner_phase))
-                                .child(activity)
-                                .into_any_element()
-                        } else if let Some(bot) = &direct_bot {
-                            let subtitle = match s.bot_workspace(&bot.name) {
-                                Some(ws) => format!("@{} · workspace: {}", bot.name, ws.display()),
-                                None => format!("@{} · direct conversation", bot.name),
-                            };
-                            div().truncate().child(subtitle).into_any_element()
-                        } else {
-                            div()
-                                .truncate()
-                                .child(format!("{} members", members.len()))
-                                .into_any_element()
-                        }),
+                        .child(
+                            if conversation.kind.is_group() && !active_group_bots.is_empty() {
+                                let mut row = div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .child(bits::spinner(s.spinner_phase));
+                                for (i, (bot, bot_act)) in active_group_bots.iter().enumerate() {
+                                    if i > 0 {
+                                        row = row.child(
+                                            div().text_color(rgb(theme::TEXT_DIM)).child("·"),
+                                        );
+                                    }
+                                    row = row.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .size(px(6.0))
+                                                    .flex_none()
+                                                    .rounded_full()
+                                                    .bg(theme::bot_color(bot)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(theme::TEXT_MUTED))
+                                                    .child(format!("@{}: {}", bot.name, bot_act)),
+                                            ),
+                                    );
+                                }
+                                row.into_any_element()
+                            } else if running {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .truncate()
+                                    .child(bits::spinner(s.spinner_phase))
+                                    .child(activity)
+                                    .into_any_element()
+                            } else if let Some(bot) = &direct_bot {
+                                let subtitle = match s.bot_workspace(&bot.name) {
+                                    Some(ws) => {
+                                        format!("@{} · workspace: {}", bot.name, ws.display())
+                                    }
+                                    None => format!("@{} · direct conversation", bot.name),
+                                };
+                                div().truncate().child(subtitle).into_any_element()
+                            } else {
+                                div()
+                                    .truncate()
+                                    .child(format!(
+                                        "{} members · lead @{group_lead_handle}",
+                                        members.len()
+                                    ))
+                                    .into_any_element()
+                            },
+                        ),
                 ),
         )
-        .child(div().flex_1())
         .when(!s.graph_open, |d| {
             let state_toggle = state.clone();
             d.child(
@@ -339,6 +423,90 @@ pub fn dm_bot(s: &AppState, conversation: &Conversation) -> Option<Bot> {
     }
 }
 
+/// Resolve the bot author of an entry — directly from `entry.author`, or via
+/// `turn_id` / `task_id` when the contract builder initialized `Author::System`
+/// (such as `Entry::tool_call`).
+pub fn entry_bot_author<'a>(s: &'a AppState, entry: &Entry) -> Option<&'a Bot> {
+    if let Author::Bot { id } = &entry.author {
+        return s.bot(id);
+    }
+    let turn_id = match &entry.kind {
+        EntryKind::Message(m) => m.turn_id.as_ref(),
+        EntryKind::Reasoning(r) => r.turn_id.as_ref(),
+        EntryKind::ToolCall(c) => c.turn_id.as_ref(),
+        _ => None,
+    };
+    if let Some(tid) = turn_id
+        && let Some(turn) = s.turn(tid)
+        && let Some(bot) = s.bot(&turn.bot_id)
+    {
+        return Some(bot);
+    }
+    if let EntryKind::ToolCall(c) = &entry.kind
+        && let Some(task_id) = &c.task_id
+        && let Some(task) = s.task(task_id)
+    {
+        return s.bot(&task.owner);
+    }
+    None
+}
+
+fn entry_bot_badge(s: &AppState, entry: &Entry) -> Option<(String, gpui::Rgba)> {
+    if let Some(bot) = entry_bot_author(s, entry) {
+        return Some((format!("@{}", bot.name), theme::bot_color(bot)));
+    }
+    if let Author::Bot { id } = &entry.author {
+        return Some((
+            format!("@{}", id.as_str()),
+            theme::bot_color_from_id(id.as_str()),
+        ));
+    }
+    None
+}
+
+/// True when `entry` belongs to a still-running bot turn and should keep
+/// displaying the streaming cursor even if another bot or tool call appends
+/// later entries in the meantime.
+pub fn is_entry_streaming(
+    s: &AppState,
+    entry: &Entry,
+    message: &swarmbot_contracts::MessageEntry,
+    is_last: bool,
+) -> bool {
+    if entry.author.is_owner() {
+        return false;
+    }
+    if let Some(tid) = &message.turn_id {
+        return s.turn(tid).is_some_and(|t| t.status == TurnStatus::Running);
+    }
+    let running = s.running_turns(&entry.conversation_id);
+    if running.is_empty() {
+        return false;
+    }
+    if running
+        .iter()
+        .any(|t| t.reply_entry_id.as_ref() == Some(&entry.id))
+    {
+        return true;
+    }
+    let Author::Bot { id } = &entry.author else {
+        return false;
+    };
+    let bot_running_without_reply_id = running
+        .iter()
+        .any(|t| &t.bot_id == id && t.reply_entry_id.is_none());
+    if !bot_running_without_reply_id {
+        return false;
+    }
+    if is_last {
+        return true;
+    }
+    s.entries(&entry.conversation_id)
+        .iter()
+        .rfind(|e| e.author == entry.author && matches!(e.kind, EntryKind::Message(_)))
+        .is_some_and(|last_by_bot| last_by_bot.id == entry.id)
+}
+
 /// Render one transcript entry as a row. `prev` is the entry before it (when
 /// any): consecutive messages by the same author group visually — the repeated
 /// name/time header is dropped and the bubbles tighten up.
@@ -351,8 +519,13 @@ pub fn entry_row(
     prev: Option<&Entry>,
     is_last: bool,
 ) -> AnyElement {
+    let group_badge = if s.open_conversation().is_some_and(|c| c.kind.is_group()) {
+        entry_bot_badge(s, entry)
+    } else {
+        None
+    };
     match &entry.kind {
-        EntryKind::Message(message) => message_row(s, entry, message, is_last, prev),
+        EntryKind::Message(message) => message_row(s, state, entry, message, is_last, prev),
         EntryKind::Reasoning(reasoning) => div()
             .w_full()
             .py_1()
@@ -361,17 +534,17 @@ pub fn entry_row(
                 s,
                 state,
                 entry,
+                group_badge,
                 "Reasoning",
                 theme::TEXT_DIM,
                 &reasoning.text,
-                true,
             ))
             .into_any_element(),
         EntryKind::ToolCall(call) => div()
             .w_full()
             .py_1()
             .pl(px(AVATAR_COL))
-            .child(tool_row(s, state, entry, call))
+            .child(tool_row(s, state, entry, call, group_badge))
             .into_any_element(),
         EntryKind::Card(card) => match cards.get(&entry.id) {
             Some(view) => div().w_full().py_1().child(view.clone()).into_any_element(),
@@ -469,8 +642,44 @@ pub fn same_group(prev: Option<&Entry>, entry: &Entry) -> bool {
     (0..300).contains(&gap.num_seconds())
 }
 
+fn attribution_line(
+    s: &AppState,
+    entry: &Entry,
+    message: &swarmbot_contracts::MessageEntry,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(reply_id) = &message.reply_to {
+        let target = s
+            .entries(&entry.conversation_id)
+            .iter()
+            .find(|e| &e.id == reply_id);
+        let who = match target.map(|e| &e.author) {
+            Some(Author::Owner) => "you".to_string(),
+            Some(Author::Bot { id }) => format!(
+                "@{}",
+                s.bot(id).map(|b| b.name.as_str()).unwrap_or(id.as_str())
+            ),
+            Some(Author::System) | None => "message".to_string(),
+        };
+        parts.push(format!("↩ replying to {who}"));
+    }
+    if let Some(target_id) = &message.addressed_to {
+        let handle = s
+            .bot(target_id)
+            .map(|b| b.name.as_str())
+            .unwrap_or(target_id.as_str());
+        parts.push(format!("→ @{handle}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
 fn message_row(
     s: &AppState,
+    state: &Entity<AppState>,
     entry: &Entry,
     message: &swarmbot_contracts::MessageEntry,
     is_last: bool,
@@ -491,14 +700,9 @@ fn message_row(
         Author::System => ("system".to_string(), rgb(theme::TEXT_DIM)),
     };
 
-    let streaming = is_last
-        && !owner
-        && s.open_conversation().is_some_and(|c| {
-            s.running_turn(&c.id)
-                .is_some_and(|t| matches!(&entry.author, Author::Bot { id } if *id == t.bot_id))
-        });
-
+    let streaming = is_entry_streaming(s, entry, message, is_last);
     let grouped = same_group(prev, entry);
+    let attribution = attribution_line(s, entry, message);
 
     // A streamed entry is committed empty and grows with deltas; until the
     // first one lands (an ACP turn can take seconds: session setup, then the
@@ -530,7 +734,7 @@ fn message_row(
             theme::BOT_BUBBLE
         }))
         .text_color(rgb(if owner { 0xffffff } else { theme::TEXT }))
-        .when(owner, |d| d.rounded_full())
+        .when(owner, |d| d.rounded_2xl())
         .when(!owner, |d| {
             d.rounded_2xl().border_1().border_color(rgb(theme::BORDER))
         });
@@ -566,6 +770,59 @@ fn message_row(
     }
     bubble = bubble.child(body);
 
+    let reply_id = entry.id.clone();
+    let state_reply = state.clone();
+    let reply_btn = div()
+        .id(SharedString::from(format!("reply-{}", entry.id)))
+        .cursor_pointer()
+        .px_1p5()
+        .py_0p5()
+        .rounded_md()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_DIM))
+        .hover(|h| {
+            h.bg(rgb(theme::SURFACE_RAISED))
+                .text_color(rgb(theme::TEXT))
+        })
+        .child("Reply")
+        .on_click(move |_, _, cx: &mut gpui::App| {
+            state_reply.update(cx, |st, cx| {
+                st.reply_to = Some(reply_id.clone());
+                cx.notify();
+            });
+        });
+
+    let mut content_col = div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .min_w_0()
+        .when(owner, |d| d.items_end())
+        .when(!owner, |d| d.items_start());
+    if let Some(attr) = attribution {
+        content_col = content_col.child(
+            div()
+                .px_1()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_DIM))
+                .child(attr),
+        );
+    }
+    content_col = content_col.child(bubble).child(
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_1()
+            .when(owner && message.post == PostState::Queued, |d| {
+                d.child(bits::badge("queued", theme::WARNING, 0x1a1400))
+            })
+            .when(owner && message.post == PostState::Steered, |d| {
+                d.child(bits::badge("steered", theme::ACCENT, 0x0a1428))
+            })
+            .child(reply_btn),
+    );
+
     let mut outer = div().w_full().flex().flex_col();
 
     // Centered timestamp separator when starting a new message group
@@ -590,14 +847,14 @@ fn message_row(
         .pb(px(2.0))
         .when(grouped, |d| d.pt(px(1.0)));
     if owner {
-        row = row.justify_end().child(bubble);
+        row = row.justify_end().child(content_col);
     } else {
         let gutter = if grouped {
             div().w(px(28.0)).h(px(1.0)).flex_none()
         } else {
             bits::avatar(color, bits::initial(&label), px(28.0))
         };
-        row = row.child(gutter).child(bubble);
+        row = row.child(gutter).child(content_col);
     }
     outer.child(row).into_any_element()
 }
@@ -607,40 +864,55 @@ fn collapsible_row(
     s: &AppState,
     state: &Entity<AppState>,
     entry: &Entry,
+    author_badge: Option<(String, gpui::Rgba)>,
     label: &str,
     color: u32,
     text: &str,
-    collapsed_by_default: bool,
 ) -> AnyElement {
     let expanded = s.is_expanded(&entry.id);
-    let _ = collapsed_by_default;
     let id = entry.id.clone();
     let state_h = state.clone();
     let toggle_id = SharedString::from(format!("tgl-{}", entry.id));
+    let mut header_row = div()
+        .id(toggle_id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .text_xs()
+        .text_color(rgb(color))
+        .child(if expanded { "▾" } else { "▸" });
+    if let Some((handle, bot_color)) = author_badge {
+        header_row = header_row.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().size(px(6.0)).flex_none().rounded_full().bg(bot_color))
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(bot_color)
+                        .child(handle),
+                ),
+        );
+    }
+    header_row = header_row
+        .child(label.to_string())
+        .on_click(move |_, _, cx: &mut gpui::App| {
+            state_h.update(cx, |st, cx| {
+                st.toggle_expanded(&id);
+                cx.notify();
+            });
+        });
+
     let mut block = div()
         .w_full()
         .overflow_hidden()
         .flex()
         .flex_col()
         .gap_1()
-        .child(
-            div()
-                .id(toggle_id)
-                .flex()
-                .items_center()
-                .gap_2()
-                .cursor_pointer()
-                .text_xs()
-                .text_color(rgb(color))
-                .child(if expanded { "▾" } else { "▸" })
-                .child(label.to_string())
-                .on_click(move |_, _, cx: &mut gpui::App| {
-                    state_h.update(cx, |st, cx| {
-                        st.toggle_expanded(&id);
-                        cx.notify();
-                    });
-                }),
-        );
+        .child(header_row);
     if expanded {
         block = block.child(
             div()
@@ -661,6 +933,7 @@ fn tool_row(
     state: &Entity<AppState>,
     entry: &Entry,
     call: &swarmbot_contracts::ToolCallEntry,
+    author_badge: Option<(String, gpui::Rgba)>,
 ) -> AnyElement {
     let expanded = s.is_expanded(&entry.id);
     let errored = matches!(
@@ -686,7 +959,29 @@ fn tool_row(
         .items_center()
         .gap_2()
         .text_xs()
-        .text_color(rgb(theme::TEXT_DIM))
+        .text_color(rgb(theme::TEXT_DIM));
+    if let Some((handle, bot_color)) = author_badge {
+        meta = meta.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_1p5()
+                .py(px(1.0))
+                .rounded_full()
+                .bg(rgb(0xffffff))
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .child(div().size(px(6.0)).flex_none().rounded_full().bg(bot_color))
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(bot_color)
+                        .child(handle),
+                ),
+        );
+    }
+    meta = meta
         .child(call.tool.clone())
         .child(bits::dot(accent, px(7.0)))
         .child(call.status.status_label());
@@ -1048,5 +1343,87 @@ mod tests {
         assert!(!same_group(Some(&event), &first));
         // …and an event after a message never groups either.
         assert!(!same_group(Some(&first), &event));
+    }
+
+    #[test]
+    fn streaming_indicator_persists_when_other_bot_appends_entries() {
+        use swarmbot_contracts::{Bot, ToolCallId, Turn, TurnInitiator};
+
+        let mut state = AppState::new("http://brain.test");
+        let group_id = ConversationId::new();
+        let b1 = Bot::new("lead", "Lead", "", "fake", ConversationId::new());
+        let b2 = Bot::new("scout", "Scout", "", "fake", ConversationId::new());
+        let b1_id = b1.id.clone();
+        let b2_id = b2.id.clone();
+        state.upsert_bot(b1);
+        state.upsert_bot(b2);
+
+        let turn1 = Turn::start(
+            b1_id.clone(),
+            group_id.clone(),
+            TurnInitiator::Owner,
+            None,
+            None,
+        );
+        let turn1_id = turn1.id.clone();
+        state.upsert_turn(turn1);
+
+        let mut msg1 = Entry::new(
+            group_id.clone(),
+            1,
+            Author::Bot { id: b1_id.clone() },
+            EntryKind::Message(Box::new(MessageEntry {
+                text: "working on it".into(),
+                attachments: Vec::new(),
+                reply_to: None,
+                post: PostState::Posted,
+                addressed_to: None,
+                turn_id: Some(turn1_id.clone()),
+            })),
+        );
+        msg1.revision = 1;
+        state.upsert_entry(msg1.clone());
+
+        // Another bot appends a tool call after `msg1` so `msg1` is no longer `is_last`.
+        let mut turn2 = Turn::start(
+            b2_id.clone(),
+            group_id.clone(),
+            TurnInitiator::Owner,
+            None,
+            None,
+        );
+        let tool = Entry::tool_call(
+            group_id.clone(),
+            2,
+            Some(turn2.id.clone()),
+            ToolCallId::new(),
+            "read_file",
+            serde_json::json!({}),
+            None,
+            None,
+        );
+        state.upsert_turn(turn2.clone());
+        state.upsert_entry(tool.clone());
+
+        let EntryKind::Message(ref m1_body) = msg1.kind else {
+            panic!("expected message");
+        };
+        assert!(
+            is_entry_streaming(&state, &msg1, m1_body, false),
+            "running turn_id must keep streaming indicator active even when is_last is false"
+        );
+        assert_eq!(
+            entry_bot_author(&state, &tool).map(|b| b.id.clone()),
+            Some(b2_id),
+            "ToolCall authored by System resolves bot author via turn_id"
+        );
+
+        // Once turn1 finishes, streaming stops; turn2 finishing clears too.
+        if let Some(t) = state.turns.iter_mut().find(|t| t.id == turn1_id) {
+            t.status = TurnStatus::Completed;
+        }
+        turn2.status = TurnStatus::Completed;
+        state.upsert_turn(turn2);
+        assert!(!is_entry_streaming(&state, &msg1, m1_body, false));
     }
 }

@@ -51,8 +51,9 @@ impl InstructionRenderer {
     }
 
     pub fn render(&self, bot: &Bot, options: RenderOptions<'_>) -> Result<String, DomainError> {
+        let has_tools = !options.tools.is_empty();
         let mut sections: Vec<String> = Vec::new();
-        sections.push(base_rules(options.messaging_enabled));
+        sections.push(base_rules_for_tools(options.messaging_enabled, has_tools));
 
         if !bot.instructions.trim().is_empty() {
             sections.push(format!("## You\n{}", bot.instructions.trim()));
@@ -62,13 +63,13 @@ impl InstructionRenderer {
             sections.push(skills_section(&bot.skills));
         }
 
-        sections.push(self.roster_section(bot)?);
+        sections.push(self.roster_section(bot, has_tools)?);
 
-        if let Some(groups) = self.groups_section(bot)? {
+        if let Some(groups) = self.groups_section(bot, has_tools)? {
             sections.push(groups);
         }
 
-        if !options.tools.is_empty() {
+        if has_tools {
             sections.push(tools_section(options.tools));
         }
 
@@ -87,8 +88,8 @@ impl InstructionRenderer {
         Ok(sections.join("\n\n"))
     }
 
-    /// One line per teammate, so a bot knows who to hand work to.
-    fn roster_section(&self, bot: &Bot) -> Result<String, DomainError> {
+    /// One line per teammate, so a bot knows who to collaborate with.
+    fn roster_section(&self, bot: &Bot, has_tools: bool) -> Result<String, DomainError> {
         let bots = self.store.list_bots()?;
         if bots.len() <= 1 {
             return Ok(
@@ -120,16 +121,21 @@ impl InstructionRenderer {
                 marker
             ));
         }
-        Ok(format!(
-            "## Your team\n{}\n\nHand a piece of work to the teammate who owns it instead of doing \
-             it yourself. `handoff_task` gives them the work and brings their result back to you; \
-             `message_bot` is for a question or a note.",
-            lines.join("\n")
-        ))
+        let guidance = if has_tools {
+            "Hand a piece of work to the teammate who owns it instead of doing it yourself. \
+             `handoff_task` gives them the work and brings their result back to you; \
+             `message_bot` is for a question or a note. In a group chat, you can also \
+             address a teammate directly with `@name`."
+        } else {
+            "Collaborate with teammates who own a piece of work instead of doing everything \
+             alone. In a group chat, address a teammate with `@name` when you need them to act \
+             or answer."
+        };
+        Ok(format!("## Your team\n{}\n\n{guidance}", lines.join("\n")))
     }
 
     /// The groups this bot is in, with the ids `post_to_group` needs.
-    fn groups_section(&self, bot: &Bot) -> Result<Option<String>, DomainError> {
+    fn groups_section(&self, bot: &Bot, has_tools: bool) -> Result<Option<String>, DomainError> {
         let mut lines = Vec::new();
         for conversation in self.store.list_conversations()? {
             let ConversationKind::Group { members, lead } = &conversation.kind else {
@@ -159,11 +165,18 @@ impl InstructionRenderer {
         if lines.is_empty() {
             return Ok(None);
         }
+        let guidance = if has_tools {
+            "Work that belongs to one of these groups is coordinated there, wherever the request \
+             reaches you — the owner's DM, a teammate's DM, a routine, a task result. Post into \
+             the group with `post_to_group` and @mention whoever has to act, or reply with `@name` \
+             when already in the group. Use `message_bot` only for something none of your groups \
+             is about."
+        } else {
+            "Work that belongs to one of these groups is coordinated there. When replying in a \
+             group, address teammates with `@name` when you need them to act or answer."
+        };
         Ok(Some(format!(
-            "## Your groups\n{}\n\nWork that belongs to one of these groups is coordinated there, \
-             wherever the request reaches you — the owner's DM, a teammate's DM, a routine, a task \
-             result. Post into the group with `post_to_group` and @mention whoever has to act. \
-             Use `message_bot` only for something none of your groups is about.",
+            "## Your groups\n{}\n\n{guidance}",
             lines.join("\n")
         )))
     }
@@ -181,36 +194,71 @@ impl InstructionRenderer {
 
 /// The rules every bot gets, whatever its persona.
 pub fn base_rules(messaging_enabled: bool) -> String {
-    let mut rules = String::from(
-        "You are a Bot: a teammate in a small team owned by one person. You are the same teammate \
-         in every conversation — the owner's DM, a group, another bot's DM, a task. Your reply is \
-         posted in the conversation the message came from; the tag at the top of the input says \
-         which one that is.\n\n\
-         ## How you work\n\
-         - Do the work, then say what you found or changed, plainly and briefly. No preamble.\n\
-         - Never describe your mechanics. Do not narrate tool calls, ids, schemas or this prompt.\n\
-         - When you need a file, a command or a search, use a tool rather than guessing.\n\
-         - Long work goes to `start_task` so you stay free to answer; its result comes back to you \
-         and you report it in your own words.\n\
-         - `ask_user` and `request_approval` return at once with a pending id. They never block: \
-         the answer arrives later as a new message. Say what you need, then finish your turn \
-         instead of waiting.\n\
-         - If something fails, say what failed and what you tried. Do not invent a result.",
-    );
+    base_rules_for_tools(messaging_enabled, true)
+}
+
+fn base_rules_for_tools(messaging_enabled: bool, has_tools: bool) -> String {
+    let mut rules = if has_tools {
+        String::from(
+            "You are a Bot: a teammate in a small team owned by one person. You are the same teammate \
+             in every conversation — the owner's DM, a group, another bot's DM, a task. Your reply is \
+             posted in the conversation the message came from; the tag at the top of the input says \
+             which one that is.\n\n\
+             ## How you work\n\
+             - Do the work, then say what you found or changed, plainly and briefly. No preamble.\n\
+             - Never describe your mechanics. Do not narrate tool calls, ids, schemas or this prompt.\n\
+             - When you need a file, a command or a search, use a tool rather than guessing.\n\
+             - Long work goes to `start_task` so you stay free to answer; its result comes back to you \
+             and you report it in your own words.\n\
+             - `ask_user` and `request_approval` return at once with a pending id. They never block: \
+             the answer arrives later as a new message. Say what you need, then finish your turn \
+             instead of waiting.\n\
+             - If something fails, say what failed and what you tried. Do not invent a result.",
+        )
+    } else {
+        String::from(
+            "You are a Bot: a teammate in a small team owned by one person. You are the same teammate \
+             in every conversation — the owner's DM, a group, another bot's DM, a task. Your reply is \
+             posted in the conversation the message came from; the tag at the top of the input says \
+             which one that is.\n\n\
+             ## How you work\n\
+             - Do the work, then say what you found or changed, plainly and briefly. No preamble.\n\
+             - Never describe your mechanics. Do not narrate tool calls, ids, schemas or this prompt.\n\
+             - When you need a file, a command or a search, use the tools in your environment rather \
+             than guessing.\n\
+             - If something fails, say what failed and what you tried. Do not invent a result.",
+        )
+    };
     if messaging_enabled {
-        rules.push_str(
-            "\n\n## Working with your team\n\
-             - Hand a piece of work to the teammate who owns it with `handoff_task`; ask a \
-             question or pass a note with `message_bot`.\n\
-             - If the user addresses or mentions a teammate by name (e.g. 'halo scout', \
-             'scout tolong...', or asks for another bot), immediately hand off that work to that \
-             teammate with `handoff_task` and report their answer back to the user.\n\
-             - @mention a teammate only when you need them to act or answer. Never mention \
-             somebody to thank them — an acknowledgement wakes them for nothing.\n\
-             - In a group, reply only when you have something to add. When you do not, answer \
-             with exactly `NO_REPLY` and nothing else, or `react` with an emoji instead.\n\
-             - You are woken at most once per teammate reply, with their final message.",
-        );
+        if has_tools {
+            rules.push_str(
+                "\n\n## Working with your team\n\
+                 - Hand a piece of work to the teammate who owns it with `handoff_task`; ask a \
+                 question or pass a direct note with `message_bot`; speak in a group from another \
+                 conversation with `post_to_group`.\n\
+                 - When replying to a teammate who messaged you in a DM, either call `message_bot` \
+                 or address them with `@name` in your reply.\n\
+                 - If the user addresses or mentions a teammate by name (e.g. 'halo scout', \
+                 'scout tolong...', or asks for another bot), collaborate or hand off that work \
+                 to that teammate with `handoff_task`, `message_bot`, or `@name` in a group chat \
+                 and report their answer back.\n\
+                 - @mention a teammate (`@name`) in group chat when you need them to act or answer. \
+                 Never mention somebody just to thank them — an acknowledgement wakes them for nothing.\n\
+                 - In a group, reply only when you have something to add. When you do not, answer \
+                 with exactly `NO_REPLY` and nothing else, or `react` with an emoji instead.\n\
+                 - You are woken at most once per teammate reply, with their final message.",
+            );
+        } else {
+            rules.push_str(
+                "\n\n## Working with your team\n\
+                 - In a group chat — or when replying to a teammate who messaged you in a DM — \
+                 address them with `@name` when you need them to act or answer. Never mention \
+                 somebody just to thank them — an acknowledgement wakes them for nothing.\n\
+                 - In a group, reply only when you have something to add. When you do not, answer \
+                 with exactly `NO_REPLY` and nothing else.\n\
+                 - You are woken at most once per teammate reply, with their final message.",
+            );
+        }
     }
     rules
 }
@@ -531,5 +579,50 @@ mod tests {
         assert!(text.contains("- git"));
         assert!(text.contains("- rust"));
         assert!(text.contains("[skills: scouting]"));
+    }
+
+    #[test]
+    fn honest_instructions_without_tools_omit_swarm_tool_names_and_explain_mentions() {
+        let (renderer, bot) = renderer_with_team();
+        let text = renderer
+            .render(
+                &bot,
+                RenderOptions {
+                    tools: &[],
+                    messaging_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!text.contains("handoff_task"));
+        assert!(!text.contains("post_to_group"));
+        assert!(!text.contains("message_bot"));
+        assert!(!text.contains("start_task"));
+        assert!(!text.contains("ask_user"));
+        assert!(!text.contains("request_approval"));
+        assert!(!text.contains("`react`"));
+        assert!(text.contains("@name"));
+        assert!(text.contains("NO_REPLY"));
+    }
+
+    #[test]
+    fn tool_enabled_instructions_highlight_bot_collaboration_tools() {
+        let (renderer, bot) = renderer_with_team();
+        let text = renderer
+            .render(
+                &bot,
+                RenderOptions {
+                    tools: &specs(),
+                    messaging_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(text.contains("handoff_task"));
+        assert!(text.contains("message_bot"));
+        assert!(text.contains("post_to_group"));
+        assert!(text.contains("When replying to a teammate who messaged you in a DM"));
+        assert!(text.contains("@name"));
+        assert!(text.contains("NO_REPLY"));
     }
 }

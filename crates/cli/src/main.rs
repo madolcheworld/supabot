@@ -157,6 +157,11 @@ enum Command {
         #[command(subcommand)]
         command: BotsCommand,
     },
+    /// Group conversations.
+    Groups {
+        #[command(subcommand)]
+        command: GroupsCommand,
+    },
     /// Print a conversation's transcript.
     Transcript {
         /// Bot handle, group title or conversation id.
@@ -189,6 +194,12 @@ enum Command {
 #[derive(Subcommand)]
 enum BotsCommand {
     /// List every bot with its backend, status and DM.
+    Ls,
+}
+
+#[derive(Subcommand)]
+enum GroupsCommand {
+    /// List every group conversation with its members and lead.
     Ls,
 }
 
@@ -317,6 +328,9 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
         }
         Command::Bots { command } => match command {
             BotsCommand::Ls => cmd_bots_ls(cli).await,
+        },
+        Command::Groups { command } => match command {
+            GroupsCommand::Ls => cmd_groups_ls(cli).await,
         },
         Command::Transcript {
             target,
@@ -629,11 +643,8 @@ fn pick_conversation(
     bot: Option<&str>,
 ) -> Result<ConversationId> {
     if let Some(title) = group {
-        let conversation = conversations
-            .iter()
-            .find(|conversation| conversation.title.as_deref() == Some(title))
-            .ok_or_else(|| anyhow!("there is no group called \"{title}\""))?;
-        return Ok(conversation.id.clone());
+        let directory = Directory::new(bots.to_vec(), conversations.to_vec());
+        return directory.resolve_group(title).map(|c| c.id);
     }
     if let Some(name) = bot {
         let handle = normalize_name(name);
@@ -643,10 +654,13 @@ fn pick_conversation(
             .ok_or_else(|| anyhow!("there is no bot called @{handle}"))?;
         return Ok(found.direct_conversation_id.clone());
     }
-    if let Some(conversation) = conversations
-        .iter()
-        .find(|conversation| conversation.title.as_deref() == Some("Team"))
-    {
+    if let Some(conversation) = conversations.iter().find(|conversation| {
+        conversation.kind.is_group()
+            && conversation
+                .title
+                .as_deref()
+                .is_some_and(|title| title.eq_ignore_ascii_case("Team"))
+    }) {
         return Ok(conversation.id.clone());
     }
     if let Some(lead) = bots.iter().find(|bot| bot.name == "lead") {
@@ -689,7 +703,7 @@ pub async fn run_once<W: Write, S: Session>(
         session.conversations()?,
         Some(options.conversation.clone()),
     );
-    let mut rx = session.subscribe(Some(options.conversation.clone()))?;
+    let mut rx = session.subscribe(None)?;
     session::drain_synced_honest(session, &mut rx, printer, &mut roster, options.json, false)
         .await?;
 
@@ -825,6 +839,9 @@ async fn cmd_chat(
         // Say which interpretation matched — a DM when a group was meant is the
         // kind of surprise a chat cannot recover from silently.
         printer.note(&format!("target: {}", resolved.describe()))?;
+        if let Some(hint) = directory.ambiguity_hint(target, &resolved) {
+            printer.note(&hint)?;
+        }
         // One notice before the first message; the daemon's backend list
         // decides, and a failed lookup stays silent (see `notice`).
         notice::warn_on_stderr(
@@ -839,6 +856,9 @@ async fn cmd_chat(
     let directory = Directory::load(&embedded.swarm)?;
     let resolved = directory.resolve(target)?;
     printer.note(&format!("target: {}", resolved.describe()))?;
+    if let Some(hint) = directory.ambiguity_hint(target, &resolved) {
+        printer.note(&hint)?;
+    }
     // Load and push the script after the team is provisioned and before the
     // first message, so the REPL's first turn is answered from the script and
     // the notice below sees a filled queue (see `cmd_run`).
@@ -881,6 +901,25 @@ fn list_bots<S: Session>(session: &S, printer: &mut Printer<std::io::Stdout>) ->
     Ok(0)
 }
 
+async fn cmd_groups_ls(cli: &Cli) -> Result<i32> {
+    let mut printer = stdout_printer(cli, false);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => list_groups(&embedded, &mut printer),
+        Backend::Remote(remote) => list_groups(&remote, &mut printer),
+    }
+}
+
+fn list_groups<S: Session>(session: &S, printer: &mut Printer<std::io::Stdout>) -> Result<i32> {
+    let lines = repl::groups_lines(&session.conversations()?, &session.bots()?);
+    if lines.is_empty() {
+        printer.note("no groups yet")?;
+    }
+    for line in lines {
+        printer.line(&line)?;
+    }
+    Ok(0)
+}
+
 async fn cmd_transcript(cli: &Cli, target: &str, limit: u32, json: bool) -> Result<i32> {
     let mut printer = stdout_printer(cli, json);
     match backend_for(cli).await? {
@@ -900,6 +939,9 @@ fn transcript<S: Session, W: Write>(
     let resolved = directory.resolve(target)?;
     if !json {
         printer.note(&format!("transcript: {}", resolved.describe()))?;
+        if let Some(hint) = directory.ambiguity_hint(target, &resolved) {
+            printer.note(&hint)?;
+        }
     }
     let entries = session.tail(resolved.conversation_id(), limit)?;
     if json {
@@ -908,11 +950,18 @@ fn transcript<S: Session, W: Write>(
             printer.json_entry(entry)?;
         }
     } else {
-        let roster = Roster::new(
+        let mut roster = Roster::new(
             session.bots()?,
             session.conversations()?,
             Some(resolved.conversation_id().clone()),
         );
+        roster.adopt_entries(entries.clone());
+        if let Ok(tasks) = session.tasks() {
+            roster.adopt_tasks(tasks);
+        }
+        if let Ok(requests) = session.pending_in(resolved.conversation_id()) {
+            roster.adopt_requests(requests);
+        }
         for entry in &entries {
             printer.entry(entry, &roster)?;
         }
@@ -1773,6 +1822,176 @@ mod tests {
         assert!(
             err.contains("only answers what a script tells it to"),
             "the warning reached stderr: {err}"
+        );
+        embedded.shutdown().await;
+    }
+
+    #[test]
+    fn group_flag_matches_case_insensitively_and_groups_ls_parses() {
+        let lead = Bot::new("lead", "Lead", "", "fake", ConversationId::new());
+        let scout = Bot::new("scout", "Scout", "", "fake", ConversationId::new());
+        let group = Conversation::group(
+            "Team",
+            vec![lead.id.clone(), scout.id.clone()],
+            lead.id.clone(),
+        )
+        .expect("group");
+        let picked = pick_conversation(
+            std::slice::from_ref(&group),
+            &[lead, scout],
+            Some("team"),
+            None,
+        )
+        .expect("case-insensitive --group");
+        assert_eq!(picked, group.id);
+
+        let missing = pick_conversation(std::slice::from_ref(&group), &[], Some("lead"), None)
+            .expect_err("bot name is not matched by --group");
+        assert!(missing.to_string().contains("no group called"), "{missing}");
+
+        let cli = Cli::try_parse_from(["swarmbot", "groups", "ls"]).expect("parses groups ls");
+        assert!(matches!(
+            cli.command,
+            Command::Groups {
+                command: GroupsCommand::Ls
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn group_run_streams_delegated_dm_and_message_bot_with_dm_labels() {
+        let dir = TempDir::new("run-group-dm").expect("temp");
+        let mut config = BrainConfig {
+            team: Some(BrainConfig::demo_team("fake")),
+            ..BrainConfig::default()
+        };
+        let script_path = dir.path().join("story.toml");
+        std::fs::write(
+            &script_path,
+            r#"
+[[turns]]
+bot = "lead"
+reasoning = "delegate search to scout"
+text = "delegating now"
+[[turns.tool_calls]]
+name = "handoff_task"
+arguments = { to = "scout", title = "probe", task = "check files" }
+
+[[turns]]
+bot = "lead"
+text = "waiting for scout"
+
+[[turns]]
+bot = "scout"
+reasoning = "reading workspace"
+[[turns.tool_calls]]
+name = "message_bot"
+arguments = { to = "lead", text = "early ping" }
+
+[[turns]]
+bot = "scout"
+text = "scout finished cleanly"
+
+[[turns]]
+bot = "lead"
+text = "NO_REPLY"
+
+[[turns]]
+bot = "lead"
+text = "all done"
+"#,
+        )
+        .expect("writes script");
+        config::per_bot_fakes_for_script(&mut config, &script_path);
+        let embedded = Embedded::build(
+            BrainParams {
+                config,
+                data_dir: dir.path().to_path_buf(),
+                roots: Vec::new(),
+                secrets: BTreeMap::new(),
+                offline: true,
+            },
+            true,
+        )
+        .expect("boots");
+        let swarm = Arc::clone(&embedded.swarm);
+        crate::script::load(&swarm, &script_path).expect("loads script");
+        let group = swarm
+            .conversations
+            .find_by_title("Team")
+            .expect("list")
+            .expect("Team");
+
+        let mut buffer = Vec::new();
+        let code = {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            run_once(
+                &embedded,
+                &RunOnce {
+                    text: "run check",
+                    conversation: group.id.clone(),
+                    wait: Duration::from_secs(30),
+                    json: false,
+                },
+                &mut printer,
+            )
+            .await
+            .expect("runs")
+        };
+        assert_eq!(code, 0);
+        let out = String::from_utf8(buffer).expect("utf8");
+        assert!(out.contains("@lead · thinking ›"), "{out}");
+        assert!(out.contains("[dm @scout]"), "{out}");
+        assert!(out.contains("@scout › scout finished cleanly"), "{out}");
+        assert!(out.contains("@lead › all done"), "{out}");
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dm_run_excludes_unrelated_group_messages() {
+        let dir = TempDir::new("run-dm-isolated").expect("temp");
+        let embedded = embedded(dir.path());
+        let swarm = Arc::clone(&embedded.swarm);
+        let group = swarm
+            .conversations
+            .find_by_title("Team")
+            .expect("list")
+            .expect("Team");
+        let scout = swarm.bots.by_name("scout").expect("scout");
+        swarm
+            .transcript
+            .bot_message(&group.id, &scout.id, "unrelated group noise", None, None)
+            .expect("seeded");
+
+        swarm
+            .backends
+            .registry()
+            .fake("fake")
+            .expect("fake")
+            .push_turn(ScriptedTurn::text("direct reply"));
+
+        let mut buffer = Vec::new();
+        let code = {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            run_once(
+                &embedded,
+                &RunOnce {
+                    text: "hello scout",
+                    conversation: scout.direct_conversation_id.clone(),
+                    wait: Duration::from_secs(30),
+                    json: false,
+                },
+                &mut printer,
+            )
+            .await
+            .expect("runs")
+        };
+        assert_eq!(code, 0);
+        let out = String::from_utf8(buffer).expect("utf8");
+        assert!(out.contains("@scout › direct reply"), "{out}");
+        assert!(
+            !out.contains("unrelated group noise"),
+            "DM run must not pull unrelated group chatter: {out}"
         );
         embedded.shutdown().await;
     }

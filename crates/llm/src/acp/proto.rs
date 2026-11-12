@@ -117,14 +117,35 @@ pub(crate) fn classify(line: &str) -> Result<Incoming, String> {
 }
 
 /// The `initialize` result. Only the fields this build acts on are typed —
-/// serde ignores the rest (`agentCapabilities`, `_meta`, future additions),
-/// which is exactly the tolerant-parsing invariant.
+/// serde ignores the rest (`_meta`, future additions), which is exactly the
+/// tolerant-parsing invariant.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct InitializeResult {
     #[serde(rename = "protocolVersion")]
     pub protocol_version: u64,
     #[serde(rename = "authMethods", default)]
     pub auth_methods: Vec<AuthMethod>,
+    #[serde(rename = "agentCapabilities", default)]
+    pub agent_capabilities: Option<AgentCapabilities>,
+}
+
+/// Capabilities advertised by the agent during `initialize`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct AgentCapabilities {
+    #[serde(rename = "mcpCapabilities", default)]
+    pub mcp_capabilities: Option<McpCapabilities>,
+}
+
+/// MCP transport capabilities advertised in `agentCapabilities.mcpCapabilities`.
+///
+/// Stdio is mandatory across all ACP agents; HTTP/SSE support is optional.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct McpCapabilities {
+    #[serde(default)]
+    pub http: Option<bool>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub sse: Option<bool>,
 }
 
 /// One authentication method an agent advertises (`claude-login`,

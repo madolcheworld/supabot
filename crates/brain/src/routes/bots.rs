@@ -201,7 +201,8 @@ pub async fn patch(
         updated.skills = skills;
     }
     let saved = state.swarm.bots.update(&updated)?;
-    // Re-enabling a bot does not restart the runner that disabling shut down.
+    // Disabling shuts down the runner; `finish` below calls `ensure_runners`,
+    // so re-enabling restarts it.
     let saved = match body.enabled {
         Some(enabled) => state.swarm.bots.set_enabled(&saved.id, enabled)?,
         None => saved,

@@ -34,7 +34,7 @@ use swarmbot_contracts::bot::{Bot, BotStatus};
 use swarmbot_contracts::config::{BackendKind, Settings};
 use swarmbot_contracts::conversation::Conversation;
 use swarmbot_contracts::entry::Entry;
-use swarmbot_contracts::id::{BotId, ConversationId, RequestId};
+use swarmbot_contracts::id::{BotId, ConversationId, EntryId, RequestId};
 use swarmbot_contracts::live::{LiveCursor, LiveEvent};
 use swarmbot_contracts::node::NodeInfo;
 use swarmbot_contracts::request::{Decision, RuntimeRequest};
@@ -42,7 +42,7 @@ use swarmbot_contracts::task::{Task, TaskStatus};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::embedded::{Embedded, short_conversation};
-use crate::session::{SendReport, Session};
+use crate::session::{SendReport, Session, request_relevant_to};
 
 /// The environment variable that carries a token when `--token` is absent.
 pub const TOKEN_ENV: &str = "SWARMBOT_TOKEN";
@@ -733,9 +733,19 @@ impl Session for Remote {
     fn send(&self, conversation: &ConversationId, text: &str) -> Result<SendReport> {
         // No `addressed` list: the brain parses the mentions itself, which is
         // what the embedded half does too, so routing cannot differ by mode.
+        self.send_with(conversation, text, &[], None)
+    }
+
+    fn send_with(
+        &self,
+        conversation: &ConversationId,
+        text: &str,
+        addressed: &[BotId],
+        reply_to: Option<&EntryId>,
+    ) -> Result<SendReport> {
         let sent = self
             .client
-            .send_message(conversation, text, &[], None)
+            .send_message(conversation, text, addressed, reply_to)
             .map_err(|err| self.honest(&err))?;
         let queued = if sent.queued.is_empty() {
             Vec::new()
@@ -793,13 +803,28 @@ impl Session for Remote {
     }
 
     fn pending_in(&self, conversation: &ConversationId) -> Result<Vec<RuntimeRequest>> {
-        let requests = self
+        let pending: Vec<RuntimeRequest> = self
             .client
             .pending_requests()
-            .map_err(|err| self.honest(&err))?;
-        Ok(requests
+            .map_err(|err| self.honest(&err))?
             .into_iter()
-            .filter(|request| request.conversation_id == *conversation && request.is_pending())
+            .filter(|request| request.is_pending())
+            .collect();
+        if pending.is_empty()
+            || pending
+                .iter()
+                .all(|request| request.conversation_id == *conversation)
+        {
+            return Ok(pending);
+        }
+        let conversations = self.conversations()?;
+        let bots = self.bots()?;
+        let tasks = self.tasks()?;
+        Ok(pending
+            .into_iter()
+            .filter(|request| {
+                request_relevant_to(request, conversation, &conversations, &bots, &tasks, &[])
+            })
             .collect())
     }
 

@@ -152,6 +152,31 @@ async fn the_blocking_client_drives_the_whole_api() {
     .expect("renamed");
     assert_eq!(renamed.title.as_deref(), Some("Pair, renamed"));
 
+    let new_members = vec![
+        brain.bot_id("lead"),
+        brain.bot_id("scout"),
+        brain.bot_id("dev"),
+    ];
+    let new_lead = brain.bot_id("dev");
+    let updated_group = step(
+        &client,
+        (group_id.clone(), new_members.clone(), new_lead.clone()),
+        |c, (id, members, lead)| c.update_group(&id, Some("Trio"), Some(&members), Some(&lead)),
+    )
+    .await
+    .expect("update_group");
+    assert_eq!(updated_group.title.as_deref(), Some("Trio"));
+    assert_eq!(updated_group.kind.participants().len(), 3);
+    assert!(
+        matches!(
+            &updated_group.kind,
+            swarmbot_contracts::conversation::ConversationKind::Group { lead, .. }
+                if lead == &new_lead
+        ),
+        "unexpected group kind: {:?}",
+        updated_group.kind
+    );
+
     let listed = step(&client, (), |c, ()| c.conversations())
         .await
         .expect("the list");

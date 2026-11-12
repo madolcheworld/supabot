@@ -61,6 +61,6 @@ pub use runners::{
 };
 pub use session::Session;
 pub use settings::SettingsHandle;
-pub use swarm::Swarm;
+pub use swarm::{McpProviderSlot, McpTurnProvider, McpTurnRegistration, McpTurnRequest, Swarm};
 pub use tasks::BackgroundTasks;
 pub use transcript::Transcript;

@@ -33,9 +33,8 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -46,7 +45,8 @@ use crate::backend::LlmError;
 use crate::openai::truncate_utf8;
 
 use super::proto::{
-    self, Incoming, InitializeResult, PROTOCOL_VERSION, PermissionRequest, RpcError,
+    self, Incoming, InitializeResult, McpCapabilities, PROTOCOL_VERSION, PermissionRequest,
+    RpcError,
 };
 use super::{AcpPermissionAsk, AcpPermissionDecision, AcpPermissions};
 
@@ -251,6 +251,8 @@ pub(crate) struct Connection {
     /// Filled after the handshake when the agent advertises auth methods:
     /// the hint that turns "session refused" into "log the agent in".
     auth_hint: Arc<Mutex<Option<String>>>,
+    /// Advertised `agentCapabilities.mcpCapabilities` from `initialize`.
+    mcp_capabilities: OnceLock<McpCapabilities>,
     kill: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -337,6 +339,7 @@ impl Connection {
             dead,
             exit_status,
             auth_hint: Arc::clone(&auth_hint),
+            mcp_capabilities: OnceLock::new(),
             kill,
         });
 
@@ -384,6 +387,12 @@ impl Connection {
                 ),
             });
         }
+        if let Some(mcp_caps) = init
+            .agent_capabilities
+            .and_then(|caps| caps.mcp_capabilities)
+        {
+            let _ = connection.mcp_capabilities.set(mcp_caps);
+        }
         if !init.auth_methods.is_empty() {
             let names: Vec<&str> = init
                 .auth_methods
@@ -402,6 +411,10 @@ impl Connection {
 
     pub(crate) fn label(&self) -> &str {
         &self.label
+    }
+
+    pub(crate) fn mcp_capabilities(&self) -> Option<McpCapabilities> {
+        self.mcp_capabilities.get().copied()
     }
 
     /// The login hint built from the agent's advertised auth methods, when it

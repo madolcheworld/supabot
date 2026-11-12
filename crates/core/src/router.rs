@@ -171,7 +171,7 @@ impl GroupRouter {
             .filter_map(|handle| {
                 members
                     .iter()
-                    .find(|m| m.name.eq_ignore_ascii_case(handle))
+                    .find(|m| handle_matches_bot(handle, m))
                     .map(|m| m.id.clone())
             })
             .collect();
@@ -188,12 +188,36 @@ impl GroupRouter {
     }
 }
 
+fn handle_matches_bot(handle: &str, bot: &Bot) -> bool {
+    if bot.name.eq_ignore_ascii_case(handle) {
+        return true;
+    }
+    let label = bot.label.trim();
+    if label.is_empty() {
+        return false;
+    }
+    if !label.chars().any(char::is_whitespace) && label.to_lowercase() == handle.to_lowercase() {
+        return true;
+    }
+    if label.chars().any(|c| c.is_ascii_alphanumeric()) {
+        let normalized = swarmbot_contracts::bot::normalize_name(label);
+        if !normalized.is_empty() && normalized.eq_ignore_ascii_case(handle) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check if a bot is directly addressed in a bot's reply (via friendly greeting or vocative).
 pub fn is_bot_addressed_in_reply(text: &str, bot: &Bot) -> bool {
     let name = &bot.name;
     let label = &bot.label;
 
     for n in [name.as_str(), label.as_str()] {
+        let n = n.trim();
+        if n.is_empty() {
+            continue;
+        }
         if contains_word_ci(text, &format!("{n},")) || contains_word_ci(text, &format!("{n}:")) {
             return true;
         }
@@ -268,34 +292,33 @@ pub fn contains_word_ci(text: &str, word: &str) -> bool {
         let match_start = search_from + byte_idx;
         let match_end = match_start + word_lower.len();
 
-        let before_ok = if match_start == 0 {
-            true
-        } else {
-            let prev_slice = &text[..match_start];
-            let last_char = prev_slice.chars().last().unwrap();
-            if last_char == '@' {
-                let before_at = &prev_slice[..prev_slice.len() - last_char.len_utf8()];
+        // Check boundaries against `text_lower` (never indexing `text` with
+        // `text_lower` byte offsets, because case-folding can expand UTF-8 byte lengths).
+        let before_ok = match text_lower[..match_start].chars().next_back() {
+            None => true,
+            Some('@') => {
+                let before_at = &text_lower[..match_start - '@'.len_utf8()];
                 before_at
                     .chars()
-                    .last()
+                    .next_back()
                     .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.')
-            } else {
-                !last_char.is_alphanumeric() && last_char != '_' && last_char != '-'
             }
+            Some(last_char) => !last_char.is_alphanumeric() && last_char != '_' && last_char != '-',
         };
 
-        let after_ok = if match_end >= text.len() {
-            true
-        } else {
-            let next_char = text[match_end..].chars().next().unwrap();
-            !next_char.is_alphanumeric() && next_char != '_' && next_char != '-'
+        let after_ok = match text_lower[match_end..].chars().next() {
+            None => true,
+            Some(next_char) => !next_char.is_alphanumeric() && next_char != '_' && next_char != '-',
         };
 
         if before_ok && after_ok {
             return true;
         }
 
-        search_from = match_start + 1;
+        let Some(step) = text_lower[match_start..].chars().next().map(char::len_utf8) else {
+            break;
+        };
+        search_from = match_start + step;
     }
     false
 }
@@ -541,5 +564,44 @@ mod tests {
             woken_narrative.is_empty(),
             "third-person reference does not wake"
         );
+    }
+
+    #[test]
+    fn contains_word_ci_handles_utf8_emoji_and_indonesian_without_panicking() {
+        // Multi-byte leading emoji + em-dash where `+ 1` byte stepping used to panic.
+        assert!(contains_word_ci("😀dev_bad — tolong cek dev!", "dev"));
+        assert!(!contains_word_ci("😀dev_bad — developer bekerja", "dev"));
+        // Case-folding expansion (`İ` 2 bytes -> `i\u{307}` 3 bytes) shifts byte offsets.
+        assert!(contains_word_ci("İstanbul 🎉 halo dev, siap?", "dev"));
+        assert!(!contains_word_ci("İdeveloper 🎉", "dev"));
+        // Indonesian punctuation & multi-byte quotes/dashes around handles.
+        assert!(contains_word_ci("Tolong cek ini ya “@scout” 🙏", "scout"));
+        assert!(contains_word_ci("Terima kasih 🙏—dev, cek berkas.", "dev"));
+        assert!(!contains_word_ci("kirim@dev.co.id", "dev"));
+    }
+
+    #[test]
+    fn wake_from_reply_matches_at_label_alongside_name() {
+        let store = testing::memory_store();
+        let mut lead = testing::seed_bot(&store, "lead");
+        lead.label = "Architect".to_string();
+        let mut dev = testing::seed_bot(&store, "dev");
+        dev.label = "Code Reviewer".to_string();
+        let scout = testing::seed_bot(&store, "scout");
+        let members = vec![lead.clone(), dev.clone(), scout.clone()];
+
+        let woken_single = GroupRouter::wake_from_reply(
+            &members,
+            "@Architect please review",
+            std::slice::from_ref(&scout.id),
+        );
+        assert_eq!(woken_single, vec![lead.id]);
+
+        let woken_normalized = GroupRouter::wake_from_reply(
+            &members,
+            "Over to @code-reviewer for a check",
+            &[scout.id],
+        );
+        assert_eq!(woken_normalized, vec![dev.id]);
     }
 }

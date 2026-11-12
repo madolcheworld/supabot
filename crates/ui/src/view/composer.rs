@@ -13,7 +13,7 @@ use std::sync::mpsc::Sender;
 use gpui::{
     App, Context, Entity, IntoElement, SharedString, Subscription, Window, div, prelude::*, px, rgb,
 };
-use swarmbot_contracts::{Bot, BotId};
+use swarmbot_contracts::{Author, Bot, BotId};
 
 use crate::actions::{SelectNext, SelectPrev, Send as SendAction};
 use crate::proto::Command;
@@ -75,6 +75,50 @@ pub fn match_members(query: &str, members: &[Bot]) -> Vec<BotId> {
     scored.into_iter().map(|(_, id)| id).collect()
 }
 
+/// One item selectable in the `@` mention picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MentionOption {
+    Everyone,
+    Bot(BotId),
+}
+
+/// Rank the mention candidates matching `query`. In group conversations,
+/// `@everyone` is offered alongside member bots when `"everyone"` matches.
+pub fn match_mentions(query: &str, members: &[Bot], is_group: bool) -> Vec<MentionOption> {
+    let q = query.trim().to_lowercase();
+    let mut out = Vec::new();
+    let everyone_prefix = is_group && "everyone".starts_with(&q);
+    if everyone_prefix {
+        out.push(MentionOption::Everyone);
+    }
+    for id in match_members(query, members) {
+        out.push(MentionOption::Bot(id));
+    }
+    if is_group && !everyone_prefix && "everyone".contains(&q) {
+        out.push(MentionOption::Everyone);
+    }
+    out
+}
+
+/// Dynamic placeholder string for the composer given the currently open
+/// conversation.
+pub fn composer_placeholder(s: &AppState) -> String {
+    match s.open_conversation() {
+        Some(conv) if conv.kind.is_group() => format!("Message #{}", s.conversation_title(conv)),
+        Some(conv) => {
+            let handle = conv
+                .direct_bot()
+                .and_then(|id| s.bot(id))
+                .map(|b| b.name.as_str());
+            match handle {
+                Some(name) => format!("Message @{name}"),
+                None => format!("Message {}", s.conversation_title(conv)),
+            }
+        }
+        None => "Select a conversation…".to_string(),
+    }
+}
+
 /// Check if a word/name appears in `text` on word boundaries, case-insensitively.
 fn contains_word(text: &str, word: &str) -> bool {
     if word.is_empty() || text.is_empty() {
@@ -91,31 +135,70 @@ fn contains_word(text: &str, word: &str) -> bool {
         let before_ok = if match_start == 0 {
             true
         } else {
-            let prev_slice = &text[..match_start];
-            let last_char = prev_slice.chars().last().unwrap();
-            if last_char == '@' {
-                let before_at = &prev_slice[..prev_slice.len() - last_char.len_utf8()];
-                before_at
-                    .chars()
-                    .last()
-                    .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.')
-            } else {
-                !last_char.is_alphanumeric() && last_char != '_' && last_char != '-'
+            let prev_slice = &text_lower[..match_start];
+            match prev_slice.chars().last() {
+                Some('@') => {
+                    let before_at = &prev_slice[..prev_slice.len() - 1];
+                    before_at
+                        .chars()
+                        .last()
+                        .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.')
+                }
+                Some(last_char) => {
+                    !last_char.is_alphanumeric() && last_char != '_' && last_char != '-'
+                }
+                None => true,
             }
         };
 
-        let after_ok = if match_end >= text.len() {
+        let after_ok = if match_end >= text_lower.len() {
             true
         } else {
-            let next_char = text[match_end..].chars().next().unwrap();
-            !next_char.is_alphanumeric() && next_char != '_' && next_char != '-'
+            text_lower[match_end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '-')
         };
 
         if before_ok && after_ok {
             return true;
         }
 
-        search_from = match_start + 1;
+        if let Some(ch) = text_lower[match_start..].chars().next() {
+            search_from = match_start + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+/// True when `text` explicitly addresses `@everyone` at a mention boundary.
+fn has_at_everyone(text: &str) -> bool {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let (idx, ch) = chars[i];
+        let at_boundary = idx == 0 || text[..idx].chars().last().is_some_and(char::is_whitespace);
+        if ch == '@' && at_boundary {
+            let mut j = i + 1;
+            let mut token = String::new();
+            while j < chars.len() {
+                let (_, c) = chars[j];
+                if c.is_alphanumeric() || c == '_' || c == '-' {
+                    token.push(c);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if token.eq_ignore_ascii_case("everyone") {
+                return true;
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        i += 1;
     }
     false
 }
@@ -169,7 +252,7 @@ pub fn addressed_bots(text: &str, members: &[Bot]) -> Vec<BotId> {
 
 struct Picker {
     range: Range<usize>,
-    matches: Vec<BotId>,
+    matches: Vec<MentionOption>,
     selected: usize,
 }
 
@@ -184,9 +267,12 @@ pub struct Composer {
 
 impl Composer {
     pub fn new(state: Entity<AppState>, commands: Sender<Command>, cx: &mut Context<Self>) -> Self {
-        let disabled = !state.read(cx).conn.is_online();
+        let (disabled, initial_placeholder) = {
+            let s = state.read(cx);
+            (!s.conn.is_online(), composer_placeholder(s))
+        };
         let input = cx.new(|cx| {
-            TextInput::new("Message Waypoint", cx)
+            TextInput::new(&initial_placeholder, cx)
                 .multiline()
                 .disabled(disabled)
         });
@@ -195,12 +281,16 @@ impl Composer {
         // window is built before the live socket exists, so without this sync
         // the field stays disabled *behind a footer that already says "Enter
         // sends"* — it looks live and swallows every keystroke. `set_disabled`
-        // is a no-op unless the value actually flips, so riding every state
-        // notify is cheap.
+        // and `set_placeholder` are no-ops unless values change, so riding
+        // every state notify is cheap.
         let observe_state = cx.observe(&state, |this, state, cx| {
-            let online = state.read(cx).conn.is_online();
-            this.input
-                .update(cx, |input, cx| input.set_disabled(!online, cx));
+            let s = state.read(cx);
+            let online = s.conn.is_online();
+            let placeholder = composer_placeholder(s);
+            this.input.update(cx, |input, cx| {
+                input.set_disabled(!online, cx);
+                input.set_placeholder(placeholder, cx);
+            });
         });
         Self {
             input,
@@ -216,15 +306,18 @@ impl Composer {
         self.input.read(cx).focus(window);
     }
 
-    fn member_bots(&self, cx: &App) -> Vec<Bot> {
+    fn member_bots(&self, cx: &App) -> (bool, Vec<Bot>) {
         let s = self.state.read(cx);
         let Some(conversation) = s.open_conversation() else {
-            return Vec::new();
+            return (false, Vec::new());
         };
-        s.members(&conversation.id)
+        let is_group = conversation.kind.is_group();
+        let bots = s
+            .members(&conversation.id)
             .iter()
             .filter_map(|id| s.bot(id).cloned())
-            .collect()
+            .collect();
+        (is_group, bots)
     }
 
     fn recompute(&mut self, input: Entity<TextInput>, cx: &mut Context<Self>) {
@@ -232,10 +325,10 @@ impl Composer {
             let ti = input.read(cx);
             (ti.content().to_string(), ti.cursor())
         };
-        let members = self.member_bots(cx);
+        let (is_group, members) = self.member_bots(cx);
         match mention_query(&content, cursor) {
             Some((range, query)) => {
-                let matches = match_members(&query, &members);
+                let matches = match_mentions(&query, &members, is_group);
                 if matches.is_empty() {
                     self.picker = None;
                 } else {
@@ -257,24 +350,39 @@ impl Composer {
         cx.notify();
     }
 
-    fn confirm_picker(&mut self, cx: &mut Context<Self>) {
+    fn insert_mention(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(picker) = self.picker.take() else {
             return;
         };
-        let Some(bot_id) = picker.matches.get(picker.selected) else {
+        let Some(option) = picker.matches.get(index) else {
             return;
         };
-        let name = self
-            .state
-            .read(cx)
-            .bot(bot_id)
-            .map(|b| b.name.clone())
-            .unwrap_or_else(|| bot_id.as_str().to_string());
+        let replacement = match option {
+            MentionOption::Everyone => "@everyone ".to_string(),
+            MentionOption::Bot(bot_id) => {
+                let name = self
+                    .state
+                    .read(cx)
+                    .bot(bot_id)
+                    .map(|b| b.name.clone())
+                    .unwrap_or_else(|| bot_id.as_str().to_string());
+                format!("@{name} ")
+            }
+        };
         let range = picker.range.clone();
-        let replacement = format!("@{name} ");
         self.input
             .update(cx, |ti, cx| ti.splice(range, &replacement, cx));
         cx.notify();
+    }
+
+    fn confirm_picker(&mut self, cx: &mut Context<Self>) {
+        let idx = self.picker.as_ref().map(|p| p.selected).unwrap_or(0);
+        self.insert_mention(idx, cx);
+    }
+
+    fn pick_mention(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_mention(index, cx);
+        self.focus_input(window, cx);
     }
 
     fn on_send(&mut self, _: &SendAction, _: &mut Window, cx: &mut Context<Self>) {
@@ -287,8 +395,14 @@ impl Composer {
     }
 
     fn send_now(&mut self, cx: &mut Context<Self>) {
-        let online = self.state.read(cx).conn.is_online();
-        let conversation = self.state.read(cx).open_conversation.clone();
+        let (online, conversation, reply_to) = {
+            let s = self.state.read(cx);
+            (
+                s.conn.is_online(),
+                s.open_conversation.clone(),
+                s.reply_to.clone(),
+            )
+        };
         let text = self.input.read(cx).content().to_string();
         if text.trim().is_empty() {
             return;
@@ -301,14 +415,27 @@ impl Composer {
             self.set_toast("offline — the message was not sent", cx);
             return;
         }
-        let members = self.member_bots(cx);
-        let addressed = addressed_bots(&text, &members);
+        let (is_group, members) = self.member_bots(cx);
+        // GroupRouter only enters its `@everyone` broadcast path when explicit
+        // `addressed` is empty; pass empty when `@everyone` is present so an
+        // accompanying `@bot` doesn't suppress the broadcast.
+        let addressed = if is_group && has_at_everyone(&text) {
+            Vec::new()
+        } else {
+            addressed_bots(&text, &members)
+        };
         let _ = self.commands.send(Command::Send {
             conversation,
             text,
             addressed,
-            reply_to: None,
+            reply_to,
         });
+        if self.state.read(cx).reply_to.is_some() {
+            self.state.update(cx, |s, cx| {
+                s.reply_to = None;
+                cx.notify();
+            });
+        }
         self.input.update(cx, |ti, cx| ti.clear(cx));
         self.picker = None;
         cx.notify();
@@ -355,9 +482,39 @@ impl Composer {
 
 impl gpui::Render for Composer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (online, _reason) = {
+        let (online, running_conv, reply_preview) = {
             let s = self.state.read(cx);
-            (s.conn.is_online(), s.conn.label())
+            let running_conv = s
+                .open_conversation
+                .as_ref()
+                .filter(|id| s.running_turn(id).is_some())
+                .cloned();
+            let reply_preview = s.reply_to.as_ref().and_then(|target_id| {
+                let conv_id = s.open_conversation.as_ref()?;
+                let target = s.entries(conv_id).iter().find(|e| &e.id == target_id);
+                let who = match target.map(|e| &e.author) {
+                    Some(Author::Owner) => "you".to_string(),
+                    Some(Author::Bot { id }) => format!(
+                        "@{}",
+                        s.bot(id).map(|b| b.name.as_str()).unwrap_or(id.as_str())
+                    ),
+                    Some(Author::System) | None => "message".to_string(),
+                };
+                let snippet = target
+                    .and_then(|e| e.kind.text())
+                    .map(|t| {
+                        let line = t.lines().next().unwrap_or("").trim();
+                        if line.chars().count() > 64 {
+                            let short: String = line.chars().take(64).collect();
+                            format!("{short}…")
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .unwrap_or_default();
+                Some((who, snippet))
+            });
+            (s.conn.is_online(), running_conv, reply_preview)
         };
 
         let mut body = div()
@@ -390,15 +547,27 @@ impl gpui::Render for Composer {
                 .flex_col()
                 .gap_0p5();
             let matches = picker.matches.clone();
-            for (i, bot_id) in matches.iter().enumerate() {
+            for (i, option) in matches.iter().enumerate() {
                 let selected = i == picker.selected;
-                let bot = self.state.read(cx).bot(bot_id).cloned();
-                let (label, color) = match &bot {
-                    Some(b) => (b.label.clone(), theme::bot_color(b)),
-                    None => (
-                        bot_id.as_str().to_string(),
-                        theme::bot_color_from_id(bot_id.as_str()),
+                let (avatar_color, avatar_glyph, handle, subtitle) = match option {
+                    MentionOption::Everyone => (
+                        rgb(theme::ACCENT),
+                        '@',
+                        "@everyone".to_string(),
+                        "Notify every member".to_string(),
                     ),
+                    MentionOption::Bot(bot_id) => {
+                        let bot = self.state.read(cx).bot(bot_id).cloned();
+                        let (label, name, color) = match &bot {
+                            Some(b) => (b.label.clone(), b.name.clone(), theme::bot_color(b)),
+                            None => (
+                                bot_id.as_str().to_string(),
+                                bot_id.as_str().to_string(),
+                                theme::bot_color_from_id(bot_id.as_str()),
+                            ),
+                        };
+                        (color, bits::initial(&label), format!("@{name}"), label)
+                    }
                 };
                 popup = popup.child(
                     div()
@@ -410,27 +579,76 @@ impl gpui::Render for Composer {
                         .py_1()
                         .rounded_lg()
                         .cursor_pointer()
+                        .hover(|h| h.bg(rgb(theme::SURFACE)))
                         .when(selected, |d| d.bg(rgb(theme::SURFACE_RAISED)))
-                        .child(bits::avatar(color, bits::initial(&label), px(20.0)))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(theme::TEXT))
-                                .child(format!("@{}", bot.map(|b| b.name).unwrap_or_default())),
-                        )
+                        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                            this.pick_mention(i, window, cx);
+                        }))
+                        .child(bits::avatar(avatar_color, avatar_glyph, px(20.0)))
+                        .child(div().text_sm().text_color(rgb(theme::TEXT)).child(handle))
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(rgb(theme::TEXT_MUTED))
-                                .child(label),
+                                .child(subtitle),
                         ),
                 );
             }
             body = body.child(popup);
         }
 
+        // Reply target banner above the composer pill.
+        if let Some((who, snippet)) = reply_preview {
+            let label = if snippet.is_empty() {
+                format!("Replying to {who}")
+            } else {
+                format!("Replying to {who}: {snippet}")
+            };
+            body = body.child(
+                div()
+                    .id("composer-reply-pill")
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .bg(rgb(theme::SURFACE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .id("composer-reply-cancel")
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|h| h.bg(rgb(theme::SURFACE_RAISED)))
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child("✕")
+                            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                                this.state.update(cx, |s, cx| {
+                                    s.reply_to = None;
+                                    cx.notify();
+                                });
+                            })),
+                    ),
+            );
+        }
+
         // Floating rounded pill bar matching screenshot
-        let pill = div()
+        let mut pill = div()
             .w_full()
             .flex()
             .items_center()
@@ -461,27 +679,51 @@ impl gpui::Render for Composer {
             .child(
                 // Center text input field
                 div().flex_1().min_w_0().px_1().child(self.input.clone()),
-            )
-            .child(
-                // Right circular black microphone / send button
+            );
+
+        if let Some(conv_id) = running_conv {
+            pill = pill.child(
                 div()
-                    .id("composer-send")
-                    .size(px(30.0))
+                    .id("composer-stop")
+                    .px_2p5()
+                    .py_1()
                     .flex_none()
                     .rounded_full()
-                    .bg(rgb(0x000000))
+                    .bg(rgb(0xfee2e2))
+                    .border_1()
+                    .border_color(rgb(theme::DANGER))
                     .cursor_pointer()
-                    .hover(|h| h.bg(rgb(0x222222)))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(rgb(0xffffff))
+                    .hover(|h| h.bg(rgb(0xfecaca)))
                     .text_xs()
-                    .child(if online { "🎤" } else { "✕" })
-                    .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
-                        this.send_now(cx);
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(theme::DANGER))
+                    .child("Stop")
+                    .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, _| {
+                        let _ = this.commands.send(Command::Interrupt(conv_id.clone()));
                     })),
             );
+        }
+
+        pill = pill.child(
+            // Right circular send button
+            div()
+                .id("composer-send")
+                .size(px(30.0))
+                .flex_none()
+                .rounded_full()
+                .bg(rgb(0x000000))
+                .cursor_pointer()
+                .hover(|h| h.bg(rgb(0x222222)))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(theme::BACKGROUND))
+                .text_xs()
+                .child(if online { "↑" } else { "✕" })
+                .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                    this.send_now(cx);
+                })),
+        );
 
         body.child(pill)
     }
@@ -490,7 +732,7 @@ impl gpui::Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use swarmbot_contracts::{Bot, ConversationId};
+    use swarmbot_contracts::{Bot, Conversation, ConversationId};
 
     fn bot(name: &str, label: &str) -> Bot {
         Bot::new(name, label, "", "fake", ConversationId::new())
@@ -552,5 +794,56 @@ mod tests {
 
         // Word boundary avoids substrings
         assert!(addressed_bots("developer sedang bekerja", &members).is_empty());
+    }
+
+    #[test]
+    fn match_mentions_includes_everyone_in_groups_only() {
+        let members = vec![bot("scout", "Scout"), bot("editor", "Editor")];
+        let in_group = match_mentions("e", &members, true);
+        assert_eq!(in_group[0], MentionOption::Everyone);
+        assert!(in_group.contains(&MentionOption::Bot(members[1].id.clone())));
+
+        let in_dm = match_mentions("e", &members, false);
+        assert!(!in_dm.contains(&MentionOption::Everyone));
+        assert_eq!(in_dm, vec![MentionOption::Bot(members[1].id.clone())]);
+
+        let all_group = match_mentions("", &members, true);
+        assert_eq!(all_group.len(), 3);
+        assert_eq!(all_group[0], MentionOption::Everyone);
+    }
+
+    #[test]
+    fn composer_placeholder_follows_open_conversation() {
+        let mut s = AppState::new("http://brain.test");
+        assert_eq!(composer_placeholder(&s), "Select a conversation…");
+
+        let scout = bot("scout", "Scout");
+        let dm = Conversation::direct(scout.id.clone());
+        let dm_id = dm.id.clone();
+        s.upsert_bot(scout.clone());
+        s.upsert_conversation(dm);
+        s.open(dm_id);
+        assert_eq!(composer_placeholder(&s), "Message @scout");
+
+        let dev = bot("dev", "Dev");
+        let group = Conversation::group(
+            "Launch Team",
+            vec![scout.id.clone(), dev.id.clone()],
+            scout.id,
+        )
+        .expect("group");
+        let gid = group.id.clone();
+        s.upsert_bot(dev);
+        s.upsert_conversation(group);
+        s.open(gid);
+        assert_eq!(composer_placeholder(&s), "Message #Launch Team");
+    }
+
+    #[test]
+    fn has_at_everyone_detects_explicit_broadcast_mention() {
+        assert!(has_at_everyone("@everyone hello"));
+        assert!(has_at_everyone("cc @everyone and @scout"));
+        assert!(!has_at_everyone("mail@everyone.com"));
+        assert!(!has_at_everyone("hello everyone"));
     }
 }

@@ -54,8 +54,17 @@ pub fn durable(
     let store: Arc<dyn Persistence> =
         Arc::new(SqliteStore::open(&data_dir.join("swarmbot.sqlite"))?);
     let mirror = Arc::new(JsonlMirror::new(data_dir.join("transcripts")));
-    // The store is the source of truth for settings: a ceiling the owner tightened
-    // at runtime survives a restart, and the config file only seeds a fresh one.
+    // A brand-new data dir has no stored settings, and `settings()` answers with
+    // the built-in defaults in that case — which would silently throw away the
+    // `[settings]` the operator wrote (their safety ceilings above all). Seed it
+    // once while the store is empty; checking nodes too prevents overwriting
+    // settings after a boot that had `team = None`.
+    let fresh = store.list_bots()?.is_empty()
+        && store.list_conversations()?.is_empty()
+        && store.list_nodes()?.is_empty();
+    if fresh {
+        store.put_settings(&config.settings)?;
+    }
     let settings = store.settings().unwrap_or_default();
     let backends = BackendSet::from_config(&config, secrets)?;
     let parts = parts(
@@ -87,7 +96,10 @@ pub fn memory(
     gateway: Arc<NodeGateway>,
 ) -> Result<Arc<Swarm>, DomainError> {
     let store: Arc<dyn Persistence> = Arc::new(MemoryStore::default());
-    let settings = Settings::default();
+    // An in-memory store is always fresh, so seed `config.settings` before
+    // building `SwarmParts` so `PolicyEngine` honours configured ceilings too.
+    store.put_settings(&config.settings)?;
+    let settings = config.settings.clone();
     let backends = BackendSet::from_config(&config, secrets)?;
     let parts = parts(
         data_dir,
@@ -278,6 +290,60 @@ mod tests {
         swarm.boot().expect("boots");
         assert!(dir.path().join("swarmbot.sqlite").exists());
         assert!(dir.path().join("workspaces").is_dir());
+        swarm.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn memory_compose_seeds_configured_settings_and_safety_ceilings() {
+        use swarmbot_contracts::{BotId, ConversationId, Invocation, ToolCallId, ToolCallRequest};
+        use swarmbot_tools::{ApprovalGate, ToolContext};
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let gateway = NodeGateway::new("http://127.0.0.1:1");
+        let mut config = BrainConfig::default();
+        config.settings.bot_messaging = false;
+        config.settings.max_hops = 3;
+        config
+            .settings
+            .safety
+            .set(Surface::Shell, PolicyCeiling::Never);
+
+        let swarm =
+            memory(config, dir.path(), vec![], &BTreeMap::new(), gateway).expect("a memory swarm");
+        let stored = swarm.settings.get();
+        assert!(!stored.bot_messaging);
+        assert_eq!(stored.max_hops, 3);
+        assert_eq!(stored.safety.get(Surface::Shell), PolicyCeiling::Never);
+
+        let workspace = dir.path().join("workspaces/test");
+        let spool = workspace.join(".spool");
+        std::fs::create_dir_all(&spool).expect("mkdir");
+        let ctx = ToolContext::local(
+            Invocation::new(BotId::from_suffix("test"), ConversationId::from_suffix("c")),
+            workspace,
+            Arc::clone(&swarm.gate) as Arc<dyn ApprovalGate>,
+            Arc::clone(&swarm.nodes),
+            spool,
+        );
+        let result = swarm
+            .tools
+            .dispatch(
+                &ctx,
+                ToolCallRequest {
+                    id: ToolCallId::new(),
+                    name: "shell".into(),
+                    args: serde_json::json!({"command": "echo should-not-run"}),
+                },
+            )
+            .await;
+        assert!(
+            result.is_error,
+            "shell must be blocked by PolicyCeiling::Never"
+        );
+        assert!(
+            swarm.store.pending_requests().expect("requests").is_empty(),
+            "Never ceiling refuses without queuing an approval request"
+        );
         swarm.shutdown().await;
     }
 }

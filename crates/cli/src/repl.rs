@@ -24,14 +24,14 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use swarmbot_contracts::bot::Bot;
 use swarmbot_contracts::conversation::Conversation;
-use swarmbot_contracts::id::ConversationId;
+use swarmbot_contracts::id::{ConversationId, EntryId};
 use swarmbot_contracts::live::LiveEvent;
 use swarmbot_contracts::request::{Decision, RequestKind, RuntimeRequest};
 use swarmbot_contracts::task::Task;
 
 use crate::embedded::emit_event;
 use crate::render::{Printer, Roster};
-use crate::resolve::Target;
+use crate::resolve::{Directory, Target};
 use crate::session::{Session, drain_synced_honest};
 
 /// A local slash command.
@@ -40,6 +40,8 @@ pub enum Command {
     Bots,
     Groups,
     Tasks,
+    Open(String),
+    Reply { entry: String, text: String },
     Stop,
     New,
     Quit,
@@ -61,11 +63,20 @@ pub fn classify(line: &str) -> Input {
     let Some(rest) = trimmed.strip_prefix('/') else {
         return Input::Message(line.trim_end().to_string());
     };
-    let name = rest.split_whitespace().next().unwrap_or("");
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("");
+    let arg = parts.next().unwrap_or("").trim();
     let command = match name {
         "bots" => Command::Bots,
         "groups" => Command::Groups,
         "tasks" => Command::Tasks,
+        "open" => Command::Open(arg.to_string()),
+        "reply" => {
+            let mut reply_parts = arg.splitn(2, char::is_whitespace);
+            let entry = reply_parts.next().unwrap_or("").trim().to_string();
+            let text = reply_parts.next().unwrap_or("").trim().to_string();
+            Command::Reply { entry, text }
+        }
         "stop" => Command::Stop,
         "new" => Command::New,
         "quit" | "exit" => Command::Quit,
@@ -201,9 +212,11 @@ async fn chat_with<W: Write, S: Session, F: FnOnce(String) -> Lines>(
 ) -> Result<i32> {
     let conversation = target.conversation_id().clone();
     printer.heading(&format!("── chat: {} ──", target.describe()))?;
-    printer.note("commands: /bots /groups /tasks /stop /new /quit — anything else is a message")?;
+    printer.note(
+        "commands: /bots /groups /tasks /open /reply /stop /new /quit — anything else is a message",
+    )?;
 
-    let mut rx = session.subscribe(Some(conversation.clone()))?;
+    let mut rx = session.subscribe(None)?;
     let mut roster = Roster::new(
         session.bots()?,
         session.conversations()?,
@@ -222,8 +235,8 @@ async fn chat_with<W: Write, S: Session, F: FnOnce(String) -> Lines>(
     let lines = source(prompt_for(pending_card.is_some()));
     chat_loop(
         session,
-        &conversation,
-        target,
+        conversation,
+        target.clone(),
         printer,
         &mut roster,
         &mut pending_card,
@@ -238,8 +251,8 @@ async fn chat_with<W: Write, S: Session, F: FnOnce(String) -> Lines>(
 #[allow(clippy::too_many_arguments)]
 async fn chat_loop<W: Write, S: Session>(
     session: &S,
-    conversation: &ConversationId,
-    target: &Target,
+    mut conversation: ConversationId,
+    mut target: Target,
     printer: &mut Printer<W>,
     roster: &mut Roster,
     pending_card: &mut Option<RuntimeRequest>,
@@ -258,8 +271,15 @@ async fn chat_loop<W: Write, S: Session>(
                 match maybe_line {
                     Some(line) => {
                         quit = handle_input(
-                            session, conversation, target, printer, pending_card, &line,
-                        ).await?;
+                            session,
+                            &mut conversation,
+                            &mut target,
+                            roster,
+                            printer,
+                            pending_card,
+                            &line,
+                        )
+                        .await?;
                         // The prompt is the acknowledgement: the reader prints
                         // it only after this line was fully handled, so output
                         // and prompts cannot interleave. On quit there is no
@@ -277,8 +297,8 @@ async fn chat_loop<W: Write, S: Session>(
             event = rx.recv(), if stream_open => {
                 match event {
                     Some(event) => {
-                        track_card(&event, conversation, pending_card);
                         emit_event(printer, roster, &event, false, false)?;
+                        track_card(&event, &conversation, roster, pending_card);
                     }
                     None => {
                         stream_open = false;
@@ -308,22 +328,29 @@ async fn chat_loop<W: Write, S: Session>(
     Ok(0)
 }
 
-/// Keep the input mode in sync with the request stream: a pending card in
-/// this conversation takes over the next line; settling it hands the line
-/// back to messages.
+/// Keep the input mode in sync with the request stream: a pending card
+/// relevant to this conversation (including delegated group DM tasks) takes over
+/// the next line; settling it hands the line back to messages.
 fn track_card(
     event: &LiveEvent,
     conversation: &ConversationId,
+    roster: &Roster,
     pending_card: &mut Option<RuntimeRequest>,
 ) {
     let LiveEvent::RequestUpsert { request, .. } = event else {
         return;
     };
-    if request.conversation_id != *conversation {
+    if !roster.is_request_relevant(request, conversation) {
         return;
     }
     if request.is_pending() {
-        *pending_card = Some(request.clone());
+        if pending_card.is_none()
+            || pending_card
+                .as_ref()
+                .is_some_and(|card| card.id == request.id)
+        {
+            *pending_card = Some(request.clone());
+        }
     } else if pending_card
         .as_ref()
         .is_some_and(|card| card.id == request.id)
@@ -387,15 +414,25 @@ fn stdin_reader(
 #[allow(clippy::too_many_arguments)]
 async fn handle_input<W: Write, S: Session>(
     session: &S,
-    conversation: &ConversationId,
-    target: &Target,
+    conversation: &mut ConversationId,
+    target: &mut Target,
+    roster: &mut Roster,
     printer: &mut Printer<W>,
     pending_card: &mut Option<RuntimeRequest>,
     line: &str,
 ) -> Result<bool> {
     match classify(line) {
         Input::Command(command) => {
-            handle_command(session, conversation, target, printer, &command).await
+            handle_command(
+                session,
+                conversation,
+                target,
+                roster,
+                printer,
+                pending_card,
+                &command,
+            )
+            .await
         }
         Input::Message(text) => {
             if let Some(request) = pending_card.clone() {
@@ -414,7 +451,12 @@ async fn handle_input<W: Write, S: Session>(
                                 .map(|decision| format!(" ({})", decision_label(decision)))
                                 .unwrap_or_default()
                         ))?;
-                        *pending_card = None;
+                        *pending_card = session
+                            .pending_in(conversation)
+                            .ok()
+                            .into_iter()
+                            .flatten()
+                            .find(|next| next.is_pending());
                     }
                     CardAction::LeavePending => {
                         printer.note("left pending — the bot keeps waiting")?;
@@ -426,30 +468,76 @@ async fn handle_input<W: Write, S: Session>(
             if text.trim().is_empty() {
                 return Ok(false);
             }
-            match session.send(conversation, &text) {
-                // A send that fails is a note, not an error that ends the chat:
-                // the human is sitting there and can retry, and losing the
-                // session because one message did not land is worse.
-                Ok(sent) => {
-                    if !sent.queued.is_empty() {
-                        printer.note(&format!(
-                            "queued behind other work: {}",
-                            sent.queued.join(", ")
-                        ))?;
-                    }
-                }
-                Err(err) => printer.note(&format!("cannot send: {err}"))?,
-            }
+            send_message_and_note(session, conversation, printer, &text, None)?;
             Ok(false)
         }
     }
 }
 
-async fn handle_command<W: Write, S: Session>(
+fn send_message_and_note<W: Write, S: Session>(
     session: &S,
     conversation: &ConversationId,
-    target: &Target,
     printer: &mut Printer<W>,
+    text: &str,
+    reply_to: Option<&EntryId>,
+) -> Result<()> {
+    match session.send_with(conversation, text, &[], reply_to) {
+        // A send that fails is a note, not an error that ends the chat:
+        // the human is sitting there and can retry, and losing the
+        // session because one message did not land is worse.
+        Ok(sent) => {
+            if !sent.queued.is_empty() {
+                printer.note(&format!(
+                    "queued behind other work: {}",
+                    sent.queued.join(", ")
+                ))?;
+            }
+        }
+        Err(err) => printer.note(&format!("cannot send: {err}"))?,
+    }
+    Ok(())
+}
+
+fn resolve_reply_entry(
+    roster: &Roster,
+    conversation: &ConversationId,
+    raw: &str,
+) -> std::result::Result<EntryId, String> {
+    let key = raw.trim();
+    if let Some(exact) = roster
+        .entries()
+        .iter()
+        .find(|e| e.conversation_id == *conversation && e.id.as_str() == key)
+    {
+        return Ok(exact.id.clone());
+    }
+    let matches: Vec<&EntryId> = roster
+        .entries()
+        .iter()
+        .filter(|e| e.conversation_id == *conversation)
+        .map(|e| &e.id)
+        .filter(|id| id.as_str().ends_with(key) || id.as_str().starts_with(key))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0].clone()),
+        n if n > 1 => Err(format!(
+            "ambiguous entry id `{key}` ({n} matches) — type more characters"
+        )),
+        _ => match EntryId::parse(key) {
+            Ok(id) => Ok(id),
+            Err(_) => Err(format!("no entry `{key}` in this conversation")),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_command<W: Write, S: Session>(
+    session: &S,
+    conversation: &mut ConversationId,
+    target: &mut Target,
+    roster: &mut Roster,
+    printer: &mut Printer<W>,
+    pending_card: &mut Option<RuntimeRequest>,
     command: &Command,
 ) -> Result<bool> {
     match command {
@@ -478,6 +566,52 @@ async fn handle_command<W: Write, S: Session>(
                 printer.line(&line)?;
             }
         }
+        Command::Open(raw) => {
+            if raw.trim().is_empty() {
+                printer.note("usage: /open <bot|group|conversation-id>")?;
+                return Ok(false);
+            }
+            let directory = Directory::new(session.bots()?, session.conversations()?);
+            match directory.resolve(raw) {
+                Ok(new_target) => {
+                    let new_conversation = new_target.conversation_id().clone();
+                    roster.set_focus(Some(new_conversation.clone()));
+                    printer.heading(&format!("── chat: {} ──", new_target.describe()))?;
+                    if let Some(hint) = directory.ambiguity_hint(raw, &new_target) {
+                        printer.note(&hint)?;
+                    }
+                    let tail = session.tail(&new_conversation, 50)?;
+                    roster.adopt_entries(tail.clone());
+                    for entry in &tail {
+                        printer.entry(entry, roster)?;
+                    }
+                    printer.finish()?;
+                    *pending_card = session
+                        .pending_in(&new_conversation)?
+                        .into_iter()
+                        .find(|request| request.is_pending());
+                    *conversation = new_conversation;
+                    *target = new_target;
+                }
+                Err(err) => printer.note(&format!("cannot open {raw}: {err}"))?,
+            }
+        }
+        Command::Reply { entry, text } => {
+            if entry.is_empty() || text.is_empty() {
+                printer.note("usage: /reply <entry-id> <text>")?;
+                return Ok(false);
+            }
+            if pending_card.is_some() {
+                printer.note("answer or skip the pending card first (enter leaves it pending)")?;
+                return Ok(false);
+            }
+            match resolve_reply_entry(roster, conversation, entry) {
+                Ok(entry_id) => {
+                    send_message_and_note(session, conversation, printer, text, Some(&entry_id))?
+                }
+                Err(reason) => printer.note(&reason)?,
+            }
+        }
         Command::Stop => {
             let stopped = session.interrupt(conversation)?;
             printer.note(if stopped {
@@ -500,7 +634,7 @@ async fn handle_command<W: Write, S: Session>(
         },
         Command::Quit => return Ok(true),
         Command::Help => printer.note(
-            "/bots /groups /tasks /stop (interrupt the current turn) /new (fresh session) /quit",
+            "/bots /groups /tasks /open <target> /reply <entry-id> <text> /stop (interrupt the current turn) /new (fresh session) /quit",
         )?,
         Command::Unknown(name) => {
             printer.note(&format!("unknown command /{name} — /help lists them"))?
@@ -682,6 +816,17 @@ mod tests {
         assert_eq!(
             classify("/not-a-command is this"),
             Input::Command(Command::Unknown("not-a-command".into()))
+        );
+        assert_eq!(
+            classify("/open #Team"),
+            Input::Command(Command::Open("#Team".into()))
+        );
+        assert_eq!(
+            classify("/reply ent_123 look here"),
+            Input::Command(Command::Reply {
+                entry: "ent_123".into(),
+                text: "look here".into(),
+            })
         );
     }
 
@@ -1027,6 +1172,255 @@ mod tests {
         assert!(
             !out.contains("only answers what a script tells it to"),
             "stdout stays clean: {out}"
+        );
+        swarm.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn group_chat_surfaces_and_answers_delegated_dm_cards_inline() {
+        let dir = TempDir::new("repl-group-dm-card").expect("temp");
+        let embedded = booted(dir.path());
+        let swarm = Arc::clone(&embedded.swarm);
+        let directory = Directory::load(&swarm).expect("roster");
+        let target = directory.resolve("Team").expect("Team group");
+        let lead = swarm.bots.by_name("lead").expect("lead");
+        let scout = swarm.bots.by_name("scout").expect("scout");
+
+        let mut handoff = Task::handoff(
+            lead.id.clone(),
+            scout.id.clone(),
+            target.conversation_id().clone(),
+            "inspect build",
+            "check files",
+            None,
+        );
+        handoff.start(chrono::Utc::now(), None);
+        swarm.store.insert_task(&handoff).expect("insert task");
+
+        let mut request = RuntimeRequest::approval(
+            scout.id.clone(),
+            scout.direct_conversation_id.clone(),
+            Surface::Shell,
+            "shell",
+            "cargo check",
+            None,
+        );
+        request.task_id = Some(handoff.id.clone());
+        swarm.approval.raise_async(&mut request).expect("raised");
+
+        let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<String>();
+        line_tx.send(Some("y".to_string())).expect("answer");
+        line_tx.send(Some("/quit".to_string())).expect("quit");
+        drop(line_tx);
+
+        let mut buffer = Vec::new();
+        let code = {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            chat_with(&embedded, &target, &mut printer, move |_prompt| Lines {
+                rx: line_rx,
+                ack: ack_tx,
+            })
+            .await
+            .expect("chat runs")
+        };
+        assert_eq!(code, 0);
+        assert!(ack_rx.try_recv().is_ok());
+
+        let settled = swarm
+            .store
+            .get_request(&request.id)
+            .expect("store")
+            .expect("request");
+        assert_eq!(settled.status, RequestStatus::Answered);
+        assert_eq!(settled.decision, Some(Decision::AllowOnce));
+
+        let out = String::from_utf8(buffer).expect("utf8");
+        assert!(out.contains("[dm @scout]"), "{out}");
+        assert!(out.contains("approval · @scout"), "{out}");
+        assert!(out.contains("request answered:  (allowed once)"), "{out}");
+        handoff.succeed(chrono::Utc::now(), "done");
+        swarm.store.update_task(&handoff).expect("complete task");
+        assert!(swarm.wait_for_idle(Duration::from_secs(20)).await);
+        swarm.shutdown().await;
+    }
+
+    #[test]
+    fn track_card_tracks_live_delegated_dm_cards_and_clears_when_settled() {
+        let lead_dm = ConversationId::new();
+        let scout_dm = ConversationId::new();
+        let other_dm = ConversationId::new();
+        let lead = Bot::new("lead", "Lead", "", "fake", lead_dm.clone());
+        let scout = Bot::new("scout", "Scout", "", "fake", scout_dm.clone());
+        let other = Bot::new("other", "Other", "", "fake", other_dm.clone());
+        let group = Conversation::group(
+            "Team",
+            vec![lead.id.clone(), scout.id.clone()],
+            lead.id.clone(),
+        )
+        .expect("group");
+        let other_group = Conversation::group(
+            "Other",
+            vec![other.id.clone(), scout.id.clone()],
+            other.id.clone(),
+        )
+        .expect("other group");
+        let mut dm_scout = Conversation::direct(scout.id.clone());
+        dm_scout.id = scout_dm.clone();
+        let mut roster = Roster::new(
+            vec![lead, scout.clone(), other.clone()],
+            vec![dm_scout, group.clone(), other_group.clone()],
+            Some(group.id.clone()),
+        );
+        let team_task = Task::handoff(
+            group.kind.participants()[0].clone(),
+            scout.id.clone(),
+            group.id.clone(),
+            "team work",
+            "brief",
+            None,
+        );
+        let other_task = Task::handoff(
+            other.id.clone(),
+            scout.id.clone(),
+            other_group.id.clone(),
+            "other work",
+            "brief",
+            None,
+        );
+        roster.adopt_tasks(vec![team_task.clone(), other_task.clone()]);
+
+        let mut foreign_req = RuntimeRequest::approval(
+            scout.id.clone(),
+            scout_dm.clone(),
+            Surface::Shell,
+            "shell",
+            "pwd",
+            None,
+        );
+        foreign_req.task_id = Some(other_task.id.clone());
+
+        let mut team_req = RuntimeRequest::approval(
+            scout.id.clone(),
+            scout_dm,
+            Surface::Shell,
+            "shell",
+            "cargo test",
+            None,
+        );
+        team_req.task_id = Some(team_task.id.clone());
+
+        let cursor = swarmbot_contracts::live::LiveCursor::new(1, 1);
+        let mut pending = None;
+        track_card(
+            &LiveEvent::RequestUpsert {
+                cursor,
+                request: foreign_req,
+            },
+            &group.id,
+            &roster,
+            &mut pending,
+        );
+        assert!(
+            pending.is_none(),
+            "delegated task from another group is ignored"
+        );
+
+        track_card(
+            &LiveEvent::RequestUpsert {
+                cursor,
+                request: team_req.clone(),
+            },
+            &group.id,
+            &roster,
+            &mut pending,
+        );
+        assert_eq!(
+            pending.as_ref().map(|r| &r.id),
+            Some(&team_req.id),
+            "delegated DM task card belonging to this group is tracked"
+        );
+
+        team_req.status = RequestStatus::Answered;
+        team_req.decision = Some(Decision::AllowOnce);
+        track_card(
+            &LiveEvent::RequestUpsert {
+                cursor,
+                request: team_req,
+            },
+            &group.id,
+            &roster,
+            &mut pending,
+        );
+        assert!(pending.is_none(), "settling the card clears pending state");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_and_reply_commands_switch_focus_and_forward_reply_to() {
+        let dir = TempDir::new("repl-open-reply").expect("temp");
+        let embedded = booted(dir.path());
+        let swarm = Arc::clone(&embedded.swarm);
+        let directory = Directory::load(&swarm).expect("roster");
+        let target = directory.resolve("Team").expect("Team group");
+        let scout = swarm.bots.by_name("scout").expect("scout");
+        let seeded = swarm
+            .transcript
+            .bot_message(
+                target.conversation_id(),
+                &scout.id,
+                "initial group note",
+                None,
+                None,
+            )
+            .expect("seeded entry");
+
+        let (line_tx, line_rx) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<String>();
+        let short_id = &seeded.id.as_str()[seeded.id.as_str().len().saturating_sub(6)..];
+        line_tx
+            .send(Some(format!("/reply {short_id} follow up")))
+            .expect("reply");
+        line_tx
+            .send(Some("/open @scout".to_string()))
+            .expect("open");
+        line_tx.send(Some("/quit".to_string())).expect("quit");
+        drop(line_tx);
+
+        let mut buffer = Vec::new();
+        let code = {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            chat_with(&embedded, &target, &mut printer, move |_prompt| Lines {
+                rx: line_rx,
+                ack: ack_tx,
+            })
+            .await
+            .expect("chat runs")
+        };
+        assert_eq!(code, 0);
+        assert!(ack_rx.try_recv().is_ok());
+        assert!(swarm.wait_for_idle(Duration::from_secs(20)).await);
+
+        let out = String::from_utf8(buffer).expect("utf8");
+        assert!(out.contains("── chat: group \"Team\""), "{out}");
+        assert!(out.contains("── chat: bot @scout"), "{out}");
+
+        // `/reply` resolved the short id and routed to @scout without an `@scout`
+        // mention in the text.
+        let group_tail = swarm
+            .conversations
+            .tail(target.conversation_id(), 50)
+            .expect("tail");
+        assert!(
+            group_tail
+                .iter()
+                .any(|e| e.kind.text() == Some("follow up")),
+            "reply landed in group: {group_tail:?}"
+        );
+        assert!(
+            group_tail.iter().any(|e| e.author
+                == swarmbot_contracts::entry::Author::bot(scout.id.clone())
+                && e.id != seeded.id),
+            "@scout woke from reply_to without an @scout mention in text"
         );
         swarm.shutdown().await;
     }

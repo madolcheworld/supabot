@@ -26,9 +26,11 @@ use swarmbot_contracts::entry::{
     Author, CardEntry, Entry, EntryKind, EventEntry, MessageEntry, NoticeEntry, NoticeLevel,
     PostState, ReasoningEntry, ToolCallEntry, ToolCallStatus,
 };
-use swarmbot_contracts::id::{BotId, ConversationId, EntryId, NodeId, TurnId};
+use swarmbot_contracts::id::{BotId, ConversationId, EntryId, NodeId, TaskId, TurnId};
 use swarmbot_contracts::live::{LiveEvent, Snapshot};
-use swarmbot_contracts::request::{RequestKind, RequestStatus};
+use swarmbot_contracts::request::{RequestKind, RequestStatus, RuntimeRequest};
+use swarmbot_contracts::task::Task;
+use swarmbot_contracts::turn::{Turn, TurnInitiator};
 
 /// How many lines of a tool result are shown before the "more lines" marker.
 const TOOL_RESULT_LINES: usize = 6;
@@ -108,12 +110,27 @@ pub fn hex_color(hex: &str) -> Option<Color> {
     Some(Color::Rgb { r, g, b })
 }
 
+/// Maximum number of transcript entries kept in [`Roster`] for reply-target
+/// lookup without letting long sessions grow without bound.
+const ROSTER_ENTRY_CAP: usize = 512;
+
+fn upsert_by_id<T>(items: &mut Vec<T>, item: T, same: impl Fn(&T, &T) -> bool) {
+    match items.iter_mut().find(|existing| same(existing, &item)) {
+        Some(slot) => *slot = item,
+        None => items.push(item),
+    }
+}
+
 /// Who is who, and where: the roster an entry's author id is looked up in,
 /// plus the conversation titles a multi-conversation stream labels lines with.
 #[derive(Clone, Debug, Default)]
 pub struct Roster {
     bots: Vec<Bot>,
     conversations: Vec<Conversation>,
+    turns: Vec<Turn>,
+    tasks: Vec<Task>,
+    requests: Vec<RuntimeRequest>,
+    entries: Vec<Entry>,
     /// The conversation in focus; entries from anywhere else get a label.
     /// `None` (the demo) labels everything but the chosen stage.
     focus: Option<ConversationId>,
@@ -128,6 +145,10 @@ impl Roster {
         Self {
             bots,
             conversations,
+            turns: Vec::new(),
+            tasks: Vec::new(),
+            requests: Vec::new(),
+            entries: Vec::new(),
             focus,
         }
     }
@@ -135,28 +156,313 @@ impl Roster {
     pub fn adopt_snapshot(&mut self, snapshot: &Snapshot) {
         self.bots = snapshot.bots.clone();
         self.conversations = snapshot.conversations.clone();
+        self.turns = snapshot.turns.clone();
+        self.tasks = snapshot.tasks.clone();
+        self.requests = snapshot.requests.clone();
+        self.entries.clear();
+        self.adopt_entries(snapshot.entries.clone());
     }
 
-    pub fn upsert_bot(&mut self, bot: Bot) {
-        match self.bots.iter_mut().find(|b| b.id == bot.id) {
-            Some(slot) => *slot = bot,
-            None => self.bots.push(bot),
+    pub fn adopt_tasks(&mut self, tasks: Vec<Task>) {
+        for task in tasks {
+            self.upsert_task(task);
         }
     }
 
+    pub fn adopt_requests(&mut self, requests: Vec<RuntimeRequest>) {
+        for request in requests {
+            self.upsert_request(request);
+        }
+    }
+
+    pub fn adopt_entries(&mut self, entries: Vec<Entry>) {
+        for entry in entries {
+            self.upsert_entry(entry);
+        }
+    }
+
+    pub fn set_focus(&mut self, focus: Option<ConversationId>) {
+        self.focus = focus;
+    }
+
+    pub fn focus(&self) -> Option<&ConversationId> {
+        self.focus.as_ref()
+    }
+
+    pub fn bots(&self) -> &[Bot] {
+        &self.bots
+    }
+
+    pub fn conversations(&self) -> &[Conversation] {
+        &self.conversations
+    }
+
+    pub fn tasks(&self) -> &[Task] {
+        &self.tasks
+    }
+
+    pub fn turns(&self) -> &[Turn] {
+        &self.turns
+    }
+
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    pub fn entry(&self, id: &EntryId) -> Option<&Entry> {
+        self.entries.iter().find(|e| &e.id == id)
+    }
+
+    pub fn upsert_bot(&mut self, bot: Bot) {
+        upsert_by_id(&mut self.bots, bot, |a, b| a.id == b.id);
+    }
+
     pub fn upsert_conversation(&mut self, conversation: Conversation) {
-        match self
-            .conversations
-            .iter_mut()
-            .find(|c| c.id == conversation.id)
-        {
-            Some(slot) => *slot = conversation,
-            None => self.conversations.push(conversation),
+        upsert_by_id(&mut self.conversations, conversation, |a, b| a.id == b.id);
+    }
+
+    pub fn upsert_turn(&mut self, turn: Turn) {
+        upsert_by_id(&mut self.turns, turn, |a, b| a.id == b.id);
+    }
+
+    pub fn upsert_task(&mut self, task: Task) {
+        upsert_by_id(&mut self.tasks, task, |a, b| a.id == b.id);
+    }
+
+    pub fn upsert_request(&mut self, request: RuntimeRequest) {
+        upsert_by_id(&mut self.requests, request, |a, b| a.id == b.id);
+    }
+
+    pub fn upsert_entry(&mut self, entry: Entry) {
+        upsert_by_id(&mut self.entries, entry, |a, b| a.id == b.id);
+        if self.entries.len() > ROSTER_ENTRY_CAP {
+            let excess = self.entries.len() - ROSTER_ENTRY_CAP;
+            self.entries.drain(..excess);
+        }
+    }
+
+    /// Update roster state from a live event without printing anything.
+    pub fn observe_event(&mut self, event: &LiveEvent) {
+        match event {
+            LiveEvent::Snapshot(snapshot) => self.adopt_snapshot(snapshot),
+            LiveEvent::EntryUpsert { entry, .. } => self.upsert_entry(entry.clone()),
+            LiveEvent::BotUpsert { bot, .. } => self.upsert_bot(bot.clone()),
+            LiveEvent::BotStatus { bot_id, status, .. } => {
+                if let Some(bot) = self.bots.iter_mut().find(|b| &b.id == bot_id) {
+                    bot.status = status.clone();
+                }
+            }
+            LiveEvent::ConversationUpsert { conversation, .. } => {
+                self.upsert_conversation(conversation.clone());
+            }
+            LiveEvent::ConversationDeleted {
+                conversation_id, ..
+            } => {
+                self.conversations.retain(|c| &c.id != conversation_id);
+            }
+            LiveEvent::TurnUpsert { turn, .. } => self.upsert_turn(turn.clone()),
+            LiveEvent::TaskUpsert { task, .. } => self.upsert_task(task.clone()),
+            LiveEvent::RequestUpsert { request, .. } => self.upsert_request(request.clone()),
+            _ => {}
         }
     }
 
     pub fn bot(&self, id: &BotId) -> Option<&Bot> {
         self.bots.iter().find(|b| &b.id == id)
+    }
+
+    pub fn conversation(&self, id: &ConversationId) -> Option<&Conversation> {
+        self.conversations.iter().find(|c| &c.id == id)
+    }
+
+    pub fn is_group(&self, id: &ConversationId) -> bool {
+        self.conversation(id).is_some_and(|c| c.kind.is_group())
+    }
+
+    pub fn is_group_focus(&self) -> bool {
+        self.focus.as_ref().is_some_and(|id| self.is_group(id))
+    }
+
+    pub(crate) fn is_request_relevant(
+        &self,
+        request: &RuntimeRequest,
+        focus: &ConversationId,
+    ) -> bool {
+        crate::session::request_relevant_to(
+            request,
+            focus,
+            &self.conversations,
+            &self.bots,
+            &self.tasks,
+            &self.turns,
+        )
+    }
+
+    /// Whether a streamed/snapshot entry belongs in the focused view.
+    ///
+    /// - Focused conversation entries always show.
+    /// - Entries belonging to a delegated [`Task`] show iff `task.origin == focus`.
+    /// - When focused on a group, off-focus bot-to-bot DMs between members of
+    ///   that group (`message_bot`) show, whereas private owner DMs, routines,
+    ///   non-member DMs, and other groups stay hidden.
+    /// - When focused on a DM, unrelated groups and other DMs stay hidden.
+    pub fn should_show(&self, entry: &Entry) -> bool {
+        let Some(focused) = &self.focus else {
+            return true;
+        };
+        if &entry.conversation_id == focused {
+            return true;
+        }
+        if let Some(task_id) = self.entry_task_id(entry)
+            && let Some(task) = self.tasks.iter().find(|t| t.id == task_id)
+        {
+            return &task.origin == focused;
+        }
+        let Some(conv) = self.conversation(focused) else {
+            return false;
+        };
+        if !conv.kind.is_group() {
+            return false;
+        }
+        let participants = conv.kind.participants();
+        let in_member_dm = participants.iter().any(|bot_id| {
+            self.bot(bot_id)
+                .is_some_and(|bot| bot.direct_conversation_id == entry.conversation_id)
+        });
+        if !in_member_dm {
+            return false;
+        }
+        if let Some(turn_id) = entry_turn(entry)
+            && let Some(turn) = self.turns.iter().find(|t| t.id == turn_id)
+        {
+            return match &turn.initiator {
+                TurnInitiator::Bot { bot_id } => participants.contains(bot_id),
+                TurnInitiator::Task { task_id } => self
+                    .tasks
+                    .iter()
+                    .find(|t| &t.id == task_id)
+                    .is_some_and(|t| &t.origin == focused),
+                TurnInitiator::Request => participants.contains(&turn.bot_id),
+                TurnInitiator::Owner | TurnInitiator::Routine { .. } | TurnInitiator::System => {
+                    false
+                }
+            };
+        }
+        match &entry.author {
+            Author::Owner => false,
+            Author::Bot { id } => participants.contains(id),
+            Author::System => true,
+        }
+    }
+
+    fn entry_task_id(&self, entry: &Entry) -> Option<TaskId> {
+        match &entry.kind {
+            EntryKind::ToolCall(call) => call.task_id.clone().or_else(|| {
+                call.turn_id.as_ref().and_then(|tid| {
+                    self.turns
+                        .iter()
+                        .find(|t| &t.id == tid)
+                        .and_then(|t| t.task_id.clone())
+                })
+            }),
+            EntryKind::Card(card) => self
+                .requests
+                .iter()
+                .find(|r| r.id == card.request_id)
+                .and_then(|r| {
+                    r.task_id.clone().or_else(|| {
+                        r.turn_id.as_ref().and_then(|tid| {
+                            self.turns
+                                .iter()
+                                .find(|t| &t.id == tid)
+                                .and_then(|t| t.task_id.clone())
+                        })
+                    })
+                }),
+            _ => entry_turn(entry).and_then(|tid| {
+                self.turns
+                    .iter()
+                    .find(|t| t.id == tid)
+                    .and_then(|t| t.task_id.clone())
+            }),
+        }
+    }
+
+    fn resolve_entry_bot(&self, entry: &Entry) -> Option<BotId> {
+        if let Some(id) = entry.author.bot_id() {
+            return Some(id.clone());
+        }
+        match &entry.kind {
+            EntryKind::ToolCall(call) => {
+                if let Some(turn_id) = &call.turn_id
+                    && let Some(turn) = self.turns.iter().find(|t| &t.id == turn_id)
+                {
+                    return Some(turn.bot_id.clone());
+                }
+                if let Some(task_id) = &call.task_id
+                    && let Some(task) = self.tasks.iter().find(|t| &t.id == task_id)
+                {
+                    return Some(task.owner.clone());
+                }
+                self.conversation(&entry.conversation_id)
+                    .and_then(|c| c.direct_bot().cloned())
+            }
+            EntryKind::Card(card) => {
+                if let Some(req) = self.requests.iter().find(|r| r.id == card.request_id) {
+                    return Some(req.bot_id.clone());
+                }
+                if let Some(bot_id) = self
+                    .conversation(&entry.conversation_id)
+                    .and_then(|c| c.direct_bot())
+                {
+                    return Some(bot_id.clone());
+                }
+                // `ApprovalService::raise` emits the Card entry right before
+                // `RequestUpsert`; if exactly one bot turn is currently active
+                // in this conversation, attribute cleanly without guessing
+                // across concurrent speakers.
+                let active: Vec<&Turn> = self
+                    .turns
+                    .iter()
+                    .filter(|t| {
+                        t.conversation_id == entry.conversation_id && !t.status.is_terminal()
+                    })
+                    .collect();
+                if active.len() == 1 {
+                    Some(active[0].bot_id.clone())
+                } else {
+                    None
+                }
+            }
+            _ => entry_turn(entry).and_then(|tid| {
+                self.turns
+                    .iter()
+                    .find(|t| t.id == tid)
+                    .map(|t| t.bot_id.clone())
+            }),
+        }
+    }
+
+    fn entry_bot_label(&self, entry: &Entry) -> Option<(String, Option<Color>)> {
+        let multi_bot =
+            self.is_group(&entry.conversation_id) || self.is_group_focus() || self.focus.is_none();
+        let bot_id = self.resolve_entry_bot(entry)?;
+        if !multi_bot {
+            let same_dm_bot = self
+                .focus
+                .as_ref()
+                .and_then(|id| self.conversation(id))
+                .and_then(|c| c.direct_bot())
+                .is_some_and(|dm_bot| dm_bot == &bot_id);
+            let unknown_focus = self
+                .focus
+                .as_ref()
+                .is_some_and(|id| self.conversation(id).is_none());
+            if same_dm_bot || unknown_focus {
+                return None;
+            }
+        }
+        Some((self.handle(&bot_id), self.bot_color(&bot_id)))
     }
 
     /// `@name`, or `@unknown` for a deleted bot — a transcript outlives its
@@ -189,15 +495,52 @@ impl Roster {
 /// Render one entry, or `None` when it must not appear (an empty streaming
 /// placeholder, a kind suppressed by `--quiet`).
 pub fn render_entry(entry: &Entry, roster: &Roster, theme: &Theme) -> Option<String> {
+    let author = roster.entry_bot_label(entry);
+    let author_ref = author
+        .as_ref()
+        .map(|(handle, color)| (handle.as_str(), *color));
     match &entry.kind {
         EntryKind::Message(message) => render_message(entry, message, roster, theme),
-        EntryKind::Reasoning(reasoning) => Some(render_reasoning(reasoning, theme)),
-        EntryKind::ToolCall(call) => Some(render_tool_call(call, theme)),
-        EntryKind::Card(card) => Some(render_card(card, theme)),
+        EntryKind::Reasoning(reasoning) => Some(render_reasoning(reasoning, author_ref, theme)),
+        EntryKind::ToolCall(call) => Some(render_tool_call(call, author_ref, theme)),
+        EntryKind::Card(card) => Some(render_card(card, author_ref, theme)),
         EntryKind::Event(event) => Some(render_event(event, theme)),
         EntryKind::Notice(notice) => Some(render_notice(notice, theme)),
         // A newer schema than this build: say so instead of pretending.
         EntryKind::Unknown => Some(theme.dim("(an entry kind this build does not know)")),
+    }
+}
+
+fn format_bot_handle(id: &BotId, roster: &Roster, theme: &Theme) -> String {
+    let handle = roster.handle(id);
+    paint_handle(&handle, roster.bot_color(id), theme)
+}
+
+fn paint_handle(handle: &str, color: Option<Color>, theme: &Theme) -> String {
+    match color {
+        Some(color) => theme.paint(handle, color),
+        None => handle.to_string(),
+    }
+}
+
+fn format_reply_tag(reply_id: &EntryId, roster: &Roster, theme: &Theme) -> String {
+    let Some(parent) = roster.entry(reply_id) else {
+        return theme.dim(&format!("(↩ {})", short_id(reply_id.as_str())));
+    };
+    let who = match &parent.author {
+        Author::Owner => "you".to_string(),
+        Author::Bot { id } => roster.handle(id),
+        Author::System => "system".to_string(),
+    };
+    let preview = match &parent.kind {
+        EntryKind::Message(m) if !m.text.trim().is_empty() => collapse(m.text.trim(), 32),
+        EntryKind::Card(c) if !c.title.trim().is_empty() => collapse(c.title.trim(), 32),
+        _ => String::new(),
+    };
+    if preview.is_empty() {
+        theme.dim(&format!("(↩ {who})"))
+    } else {
+        theme.dim(&format!("(↩ {who}: \"{preview}\")"))
     }
 }
 
@@ -214,14 +557,28 @@ fn render_message(
     if message.text.is_empty() {
         return None;
     }
-    let prefix = match &entry.author {
-        Author::Owner => format!("{} › ", theme.attribute("you", Attribute::Bold)),
-        Author::Bot { id } => match roster.bot_color(id) {
-            Some(color) => format!("{} › ", theme.paint(&roster.handle(id), color)),
-            None => format!("{} › ", roster.handle(id)),
-        },
-        Author::System => format!("{} › ", theme.dim("system")),
+    let sender = match &entry.author {
+        Author::Owner => theme.attribute("you", Attribute::Bold),
+        Author::Bot { id } => format_bot_handle(id, roster, theme),
+        Author::System => theme.dim("system"),
     };
+    let target = message
+        .addressed_to
+        .as_ref()
+        .map(|id| {
+            format!(
+                " {} {}",
+                theme.dim("→"),
+                format_bot_handle(id, roster, theme)
+            )
+        })
+        .unwrap_or_default();
+    let reply = message
+        .reply_to
+        .as_ref()
+        .map(|id| format!(" {}", format_reply_tag(id, roster, theme)))
+        .unwrap_or_default();
+    let prefix = format!("{sender}{target}{reply} › ");
     let suffix = match message.post {
         PostState::Posted => String::new(),
         // The bot is busy elsewhere: the owner should see the message waiting.
@@ -233,21 +590,40 @@ fn render_message(
 
 /// Reasoning is decoration around an answer: dim, one line, unless `--verbose`
 /// asks to read the bot's mind in full.
-fn render_reasoning(reasoning: &ReasoningEntry, theme: &Theme) -> String {
+fn render_reasoning(
+    reasoning: &ReasoningEntry,
+    author: Option<(&str, Option<Color>)>,
+    theme: &Theme,
+) -> String {
     let body = if theme.verbose {
         reasoning.text.clone()
     } else {
         collapse(&reasoning.text, REASONING_WIDTH)
     };
-    theme.dim(&format!("thinking › {body}"))
+    match author {
+        Some((handle, color)) => format!(
+            "{} {}",
+            paint_handle(handle, color, theme),
+            theme.dim(&format!("· thinking › {body}"))
+        ),
+        None => theme.dim(&format!("thinking › {body}")),
+    }
 }
 
 /// `⚙ shell {"command":"cargo test"} → exit=0 (1.2s, node local)` plus at most
 /// [`TOOL_RESULT_LINES`] lines of the result, errors in red.
-fn render_tool_call(call: &ToolCallEntry, theme: &Theme) -> String {
+fn render_tool_call(
+    call: &ToolCallEntry,
+    author: Option<(&str, Option<Color>)>,
+    theme: &Theme,
+) -> String {
     let args = collapse(&compact_json(&call.args), ARGS_WIDTH);
+    let actor = author
+        .map(|(handle, color)| format!("{} ", paint_handle(handle, color, theme)))
+        .unwrap_or_default();
     let mut head = format!(
-        "{} {} {}",
+        "{}{} {} {}",
+        actor,
         theme.paint("⚙", Color::Cyan),
         theme.attribute(&call.tool, Attribute::Bold),
         theme.dim(&args),
@@ -323,13 +699,17 @@ fn render_tool_call(call: &ToolCallEntry, theme: &Theme) -> String {
 }
 
 /// A boxed prompt: title, body, what to type, and how long is left.
-fn render_card(card: &CardEntry, theme: &Theme) -> String {
+fn render_card(card: &CardEntry, author: Option<(&str, Option<Color>)>, theme: &Theme) -> String {
     let kind = match card.card {
         RequestKind::Approval => "approval",
         RequestKind::Question => "question",
         RequestKind::Form => "form",
         RequestKind::Secret => "secret needed",
         RequestKind::Handoff => "handoff",
+    };
+    let label = match author {
+        Some((handle, _)) => format!("{kind} · {handle}"),
+        None => kind.to_string(),
     };
     let mut rows: Vec<String> = Vec::new();
     rows.push(card.title.clone());
@@ -358,7 +738,7 @@ fn render_card(card: &CardEntry, theme: &Theme) -> String {
     } else {
         Color::DarkGrey
     };
-    box_lines(kind, &rows, theme, edge, pending)
+    box_lines(&label, &rows, theme, edge, pending)
 }
 
 fn status_label(status: RequestStatus) -> &'static str {
@@ -729,16 +1109,40 @@ fn entry_turn(entry: &Entry) -> Option<TurnId> {
     }
 }
 
-/// `--quiet` means "only the bots' words": their message text, nothing else —
-/// no prefix, no colour, no events, no tool calls.
+/// `--quiet` means "only the bots' words": no events, tool calls or colour.
+/// Inside a group (or off-conversation DM), keep the `@bot` / `[dm @bot]`
+/// speaker prefix so multiple bots' outputs stay attributable.
 fn quiet_text(entry: &Entry, roster: &Roster) -> Option<String> {
-    let _ = roster;
-    match (&entry.author, &entry.kind) {
-        (Author::Bot { .. }, EntryKind::Message(message)) if !message.text.is_empty() => {
-            Some(message.text.clone())
-        }
-        _ => None,
+    let Author::Bot { id } = &entry.author else {
+        return None;
+    };
+    let EntryKind::Message(message) = &entry.kind else {
+        return None;
+    };
+    if message.text.is_empty() {
+        return None;
     }
+    let multi_bot = roster.is_group(&entry.conversation_id) || roster.is_group_focus();
+    let label = roster.conversation_label(&entry.conversation_id);
+    let target = message
+        .addressed_to
+        .as_ref()
+        .map(|target_id| format!(" → {}", roster.handle(target_id)))
+        .unwrap_or_default();
+    if let Some(label) = label {
+        return Some(format!(
+            "[{label}] {}{target} › {}",
+            roster.handle(id),
+            message.text
+        ));
+    }
+    if multi_bot {
+        return Some(format!("{}{target} › {}", roster.handle(id), message.text));
+    }
+    if let Some(target_id) = &message.addressed_to {
+        return Some(format!("{} {}", roster.handle(target_id), message.text));
+    }
+    Some(message.text.clone())
 }
 
 /// Feed one live event to the printer and the roster. `with_snapshot` decides
@@ -750,19 +1154,21 @@ pub fn print_event(
     event: &LiveEvent,
     with_snapshot: bool,
 ) -> Result<()> {
+    roster.observe_event(event);
     match event {
         LiveEvent::Snapshot(snapshot) => {
-            roster.adopt_snapshot(snapshot);
             if with_snapshot {
                 for entry in &snapshot.entries {
-                    printer.entry(entry, roster)?;
+                    if roster.should_show(entry) {
+                        printer.entry(entry, roster)?;
+                    }
                 }
             }
         }
-        LiveEvent::EntryUpsert { entry, .. } => printer.entry(entry, roster)?,
-        LiveEvent::BotUpsert { bot, .. } => roster.upsert_bot(bot.clone()),
-        LiveEvent::ConversationUpsert { conversation, .. } => {
-            roster.upsert_conversation(conversation.clone())
+        LiveEvent::EntryUpsert { entry, .. } => {
+            if roster.should_show(entry) {
+                printer.entry(entry, roster)?;
+            }
         }
         LiveEvent::TurnUpsert { turn, .. } => {
             // The turn ended: its streamed entries are final. Committing here
@@ -777,9 +1183,8 @@ pub fn print_event(
                 .theme
                 .paint(&format!("stream error [{code}]: {message}"), Color::Red),
         )?,
-        // Status/turn/task/node events are machinery: the transcript entries
-        // they cause are the story. `chat` reads RequestUpsert separately to
-        // drive its card prompt.
+        // Status/turn/task/node events are already recorded into `roster` above;
+        // `chat` reads RequestUpsert separately to drive its card prompt.
         _ => {}
     }
     Ok(())
@@ -1043,6 +1448,7 @@ mod tests {
             tool_entry(ToolCallStatus::Failed, Some("ERROR: cargo exploded"))
                 .as_tool_call()
                 .expect("a tool call"),
+            None,
             &theme,
         );
         assert!(failed.contains("→ failed"), "{failed}");
@@ -1061,6 +1467,7 @@ mod tests {
             tool_entry(ToolCallStatus::Completed, Some(&long))
                 .as_tool_call()
                 .expect("a tool call"),
+            None,
             &theme,
         );
         assert!(rendered.contains("… 14 more lines"), "{rendered}");
@@ -1075,6 +1482,7 @@ mod tests {
             tool_entry(ToolCallStatus::Completed, Some("exit=0\nhi"))
                 .as_tool_call()
                 .expect("a tool call"),
+            None,
             &theme,
         );
         assert_eq!(rendered.matches("exit=0").count(), 1, "{rendered}");
@@ -1091,12 +1499,12 @@ mod tests {
             text: "first thought\nsecond thought".into(),
             turn_id: None,
         };
-        let rendered = render_reasoning(&reasoning, &theme);
+        let rendered = render_reasoning(&reasoning, None, &theme);
         assert!(
             rendered.contains("first thought\nsecond thought"),
             "{rendered}"
         );
-        let collapsed = render_reasoning(&reasoning, &Theme::plain());
+        let collapsed = render_reasoning(&reasoning, None, &Theme::plain());
         assert!(
             collapsed.contains("first thought second thought"),
             "{collapsed}"
@@ -1396,5 +1804,407 @@ mod tests {
         assert_eq!(result.text_only(), "x");
         let usage = Usage::default();
         assert_eq!(usage.total_tokens(), 0);
+    }
+
+    #[test]
+    fn group_entries_attribute_reasoning_tool_calls_and_cards() {
+        let mut group_roster = {
+            let lead_dm = ConversationId::new();
+            let scout_dm = ConversationId::new();
+            let lead = Bot::new("lead", "Lead", "", "fake", lead_dm.clone());
+            let scout = Bot::new("scout", "Scout", "", "fake", scout_dm.clone());
+            let group = Conversation::group(
+                "Team",
+                vec![lead.id.clone(), scout.id.clone()],
+                lead.id.clone(),
+            )
+            .expect("group");
+            let mut dm_lead = Conversation::direct(lead.id.clone());
+            dm_lead.id = lead_dm;
+            let mut dm_scout = Conversation::direct(scout.id.clone());
+            dm_scout.id = scout_dm;
+            let group_id = group.id.clone();
+            Roster::new(
+                vec![lead, scout],
+                vec![dm_lead, dm_scout, group],
+                Some(group_id),
+            )
+        };
+        let group_id = group_roster.focus().expect("focus").clone();
+        let scout = group_roster.bots()[1].clone();
+        let turn = Turn::start(
+            scout.id.clone(),
+            group_id.clone(),
+            TurnInitiator::Owner,
+            None,
+            None,
+        );
+        group_roster.upsert_turn(turn.clone());
+
+        let request = RuntimeRequest::approval(
+            scout.id.clone(),
+            group_id.clone(),
+            Surface::Shell,
+            "shell",
+            "cargo check",
+            None,
+        );
+        group_roster.upsert_request(request.clone());
+
+        let reasoning = Entry::new(
+            group_id.clone(),
+            1,
+            Author::bot(scout.id.clone()),
+            EntryKind::Reasoning(Box::new(ReasoningEntry {
+                text: "checking imports".into(),
+                turn_id: Some(turn.id.clone()),
+            })),
+        );
+        let tool = Entry::new(
+            group_id.clone(),
+            2,
+            Author::System,
+            EntryKind::ToolCall(Box::new(ToolCallEntry {
+                call_id: ToolCallId::new(),
+                tool: "shell".into(),
+                args: serde_json::json!({"command": "cargo check"}),
+                status: ToolCallStatus::Completed,
+                result_text: Some("exit=0".into()),
+                node_id: Some(NodeId::local()),
+                task_id: None,
+                spill_path: None,
+                started_at: Utc::now(),
+                ended_at: Some(Utc::now()),
+                duration_ms: Some(120),
+                turn_id: Some(turn.id.clone()),
+            })),
+        );
+        let card = Entry::new(
+            group_id,
+            3,
+            Author::System,
+            EntryKind::Card(Box::new(CardEntry {
+                request_id: request.id.clone(),
+                card: RequestKind::Approval,
+                status: RequestStatus::Pending,
+                title: request.title(),
+                body: String::new(),
+                payload: serde_json::Value::Null,
+                expires_at: None,
+            })),
+        );
+
+        let theme = Theme::plain();
+        let r_out = render_entry(&reasoning, &group_roster, &theme).expect("reasoning");
+        let t_out = render_entry(&tool, &group_roster, &theme).expect("tool");
+        let c_out = render_entry(&card, &group_roster, &theme).expect("card");
+        assert!(
+            r_out.contains("@scout · thinking › checking imports"),
+            "{r_out}"
+        );
+        assert!(t_out.contains("@scout ⚙ shell"), "{t_out}");
+        assert!(c_out.contains("approval · @scout"), "{c_out}");
+    }
+
+    #[test]
+    fn messages_render_addressed_to_and_reply_to_attribution() {
+        let mut group_roster = roster();
+        let lead = group_roster.bots()[0].clone();
+        let scout_dm = ConversationId::new();
+        let scout = Bot::new("scout", "Scout", "", "fake", scout_dm);
+        group_roster.upsert_bot(scout.clone());
+
+        let mut dm_ask = message_entry(Author::bot(lead.id.clone()), "inspect build");
+        dm_ask.as_message_mut().expect("message").addressed_to = Some(scout.id.clone());
+        group_roster.upsert_entry(dm_ask.clone());
+
+        let rendered_ask =
+            render_entry(&dm_ask, &group_roster, &Theme::plain()).expect("renders ask");
+        assert!(
+            rendered_ask.contains("@lead → @scout › inspect build"),
+            "{rendered_ask}"
+        );
+
+        let mut reply = message_entry(Author::Owner, "focus on Cargo.toml");
+        reply.as_message_mut().expect("message").reply_to = Some(dm_ask.id.clone());
+        let rendered_reply =
+            render_entry(&reply, &group_roster, &Theme::plain()).expect("renders reply");
+        assert!(
+            rendered_reply.contains("you (↩ @lead: \"inspect build\") › focus on Cargo.toml"),
+            "{rendered_reply}"
+        );
+
+        let missing = EntryId::new();
+        let mut orphan_reply = message_entry(Author::Owner, "ping");
+        orphan_reply.as_message_mut().expect("message").reply_to = Some(missing.clone());
+        let rendered_orphan =
+            render_entry(&orphan_reply, &group_roster, &Theme::plain()).expect("renders");
+        assert!(rendered_orphan.contains("(↩ "), "{rendered_orphan}");
+        assert!(rendered_orphan.contains("ping"), "{rendered_orphan}");
+    }
+
+    #[test]
+    fn quiet_keeps_bot_attribution_in_groups_and_off_focus_dms() {
+        let lead_dm = ConversationId::new();
+        let scout_dm = ConversationId::new();
+        let lead = Bot::new("lead", "Lead", "", "fake", lead_dm.clone());
+        let scout = Bot::new("scout", "Scout", "", "fake", scout_dm.clone());
+        let group = Conversation::group(
+            "Team",
+            vec![lead.id.clone(), scout.id.clone()],
+            lead.id.clone(),
+        )
+        .expect("group");
+        let mut dm_scout = Conversation::direct(scout.id.clone());
+        dm_scout.id = scout_dm.clone();
+        let mut dm_lead = Conversation::direct(lead.id.clone());
+        dm_lead.id = lead_dm;
+        let roster = Roster::new(
+            vec![lead.clone(), scout.clone()],
+            vec![dm_lead, dm_scout, group.clone()],
+            Some(group.id.clone()),
+        );
+
+        let mut group_msg = Entry::new(
+            group.id.clone(),
+            1,
+            Author::bot(lead.id.clone()),
+            EntryKind::Message(Box::new(MessageEntry {
+                text: "please check".into(),
+                attachments: Vec::new(),
+                reply_to: None,
+                post: PostState::Posted,
+                addressed_to: Some(scout.id.clone()),
+                turn_id: None,
+            })),
+        );
+        let dm_msg = Entry::new(
+            scout_dm,
+            1,
+            Author::bot(scout.id),
+            EntryKind::Message(Box::new(MessageEntry {
+                text: "found two issues".into(),
+                attachments: Vec::new(),
+                reply_to: None,
+                post: PostState::Posted,
+                addressed_to: None,
+                turn_id: None,
+            })),
+        );
+        let mut buffer = Vec::new();
+        {
+            let mut printer = Printer::new(
+                &mut buffer,
+                Theme {
+                    quiet: true,
+                    ..Theme::plain()
+                },
+                false,
+            );
+            printer.entry(&group_msg, &roster).expect("group msg");
+            printer.entry(&dm_msg, &roster).expect("dm msg");
+            group_msg.as_message_mut().expect("message").addressed_to = None;
+            printer.entry(&group_msg, &roster).expect("plain group msg");
+            printer.finish().expect("finish");
+        }
+        let out = String::from_utf8(buffer).expect("utf8");
+        assert!(
+            out.contains("@lead → @scout › please check"),
+            "group addressee attribution preserved under --quiet: {out:?}"
+        );
+        assert!(
+            out.contains("[dm @scout] @scout › found two issues"),
+            "off-focus DM label & speaker preserved under --quiet: {out:?}"
+        );
+        assert!(
+            out.contains("@lead › please check"),
+            "group speaker preserved under --quiet: {out:?}"
+        );
+    }
+
+    #[test]
+    fn print_event_filters_unrelated_conversations_while_showing_group_dm_delegation() {
+        let lead_dm = ConversationId::new();
+        let scout_dm = ConversationId::new();
+        let outsider_dm = ConversationId::new();
+        let lead = Bot::new("lead", "Lead", "", "fake", lead_dm.clone());
+        let scout = Bot::new("scout", "Scout", "", "fake", scout_dm.clone());
+        let outsider = Bot::new("outsider", "Outsider", "", "fake", outsider_dm.clone());
+        let team = Conversation::group(
+            "Team",
+            vec![lead.id.clone(), scout.id.clone()],
+            lead.id.clone(),
+        )
+        .expect("team");
+        let other_group = Conversation::group(
+            "Other",
+            vec![scout.id.clone(), outsider.id.clone()],
+            outsider.id.clone(),
+        )
+        .expect("other");
+        let mut conv_lead = Conversation::direct(lead.id.clone());
+        conv_lead.id = lead_dm.clone();
+        let mut conv_scout = Conversation::direct(scout.id.clone());
+        conv_scout.id = scout_dm.clone();
+        let mut conv_outsider = Conversation::direct(outsider.id.clone());
+        conv_outsider.id = outsider_dm.clone();
+
+        let mut team_task = Task::handoff(
+            lead.id.clone(),
+            scout.id.clone(),
+            team.id.clone(),
+            "inspect",
+            "brief",
+            None,
+        );
+        let mut other_task = Task::handoff(
+            outsider.id.clone(),
+            scout.id.clone(),
+            other_group.id.clone(),
+            "other",
+            "brief",
+            None,
+        );
+        let team_turn = Turn::start(
+            scout.id.clone(),
+            scout_dm.clone(),
+            TurnInitiator::Task {
+                task_id: team_task.id.clone(),
+            },
+            None,
+            Some(team_task.id.clone()),
+        );
+        let other_turn = Turn::start(
+            scout.id.clone(),
+            scout_dm.clone(),
+            TurnInitiator::Task {
+                task_id: other_task.id.clone(),
+            },
+            None,
+            Some(other_task.id.clone()),
+        );
+        let owner_dm_turn = Turn::start(
+            scout.id.clone(),
+            scout_dm.clone(),
+            TurnInitiator::Owner,
+            None,
+            None,
+        );
+        let bot_dm_turn = Turn::start(
+            scout.id.clone(),
+            scout_dm.clone(),
+            TurnInitiator::Bot {
+                bot_id: lead.id.clone(),
+            },
+            None,
+            None,
+        );
+        team_task.status = swarmbot_contracts::task::TaskStatus::Running;
+        other_task.status = swarmbot_contracts::task::TaskStatus::Running;
+
+        let mut roster = Roster::new(
+            vec![lead.clone(), scout.clone(), outsider.clone()],
+            vec![
+                conv_lead,
+                conv_scout,
+                conv_outsider,
+                team.clone(),
+                other_group.clone(),
+            ],
+            Some(team.id.clone()),
+        );
+        roster.adopt_tasks(vec![team_task, other_task]);
+        roster.upsert_turn(team_turn.clone());
+        roster.upsert_turn(other_turn.clone());
+        roster.upsert_turn(owner_dm_turn.clone());
+        roster.upsert_turn(bot_dm_turn.clone());
+
+        let msg = |conv: &ConversationId, author: Author, text: &str, turn: Option<&Turn>| {
+            Entry::new(
+                conv.clone(),
+                1,
+                author,
+                EntryKind::Message(Box::new(MessageEntry {
+                    text: text.into(),
+                    attachments: Vec::new(),
+                    reply_to: None,
+                    post: PostState::Posted,
+                    addressed_to: None,
+                    turn_id: turn.map(|t| t.id.clone()),
+                })),
+            )
+        };
+
+        let mut buffer = Vec::new();
+        {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            for entry in [
+                msg(&team.id, Author::bot(lead.id.clone()), "in-team", None),
+                msg(
+                    &scout_dm,
+                    Author::bot(scout.id.clone()),
+                    "delegated-for-team",
+                    Some(&team_turn),
+                ),
+                msg(
+                    &scout_dm,
+                    Author::bot(scout.id.clone()),
+                    "member-bot-dm",
+                    Some(&bot_dm_turn),
+                ),
+                msg(
+                    &scout_dm,
+                    Author::bot(scout.id.clone()),
+                    "delegated-for-other",
+                    Some(&other_turn),
+                ),
+                msg(
+                    &scout_dm,
+                    Author::bot(scout.id.clone()),
+                    "private-owner-dm",
+                    Some(&owner_dm_turn),
+                ),
+                msg(
+                    &other_group.id,
+                    Author::bot(outsider.id.clone()),
+                    "other-group",
+                    None,
+                ),
+                msg(
+                    &outsider_dm,
+                    Author::bot(outsider.id.clone()),
+                    "outsider-dm",
+                    None,
+                ),
+            ] {
+                print_event(
+                    &mut printer,
+                    &mut roster,
+                    &LiveEvent::EntryUpsert {
+                        cursor: LiveCursor::new(1, 1),
+                        entry,
+                    },
+                    false,
+                )
+                .expect("prints");
+            }
+            printer.finish().expect("finish");
+        }
+        let out = String::from_utf8(buffer).expect("utf8");
+        assert!(out.contains("in-team"), "{out}");
+        assert!(
+            out.contains("[dm @scout] @scout › delegated-for-team"),
+            "{out}"
+        );
+        assert!(out.contains("[dm @scout] @scout › member-bot-dm"), "{out}");
+        assert!(!out.contains("delegated-for-other"), "{out}");
+        assert!(!out.contains("private-owner-dm"), "{out}");
+        assert!(!out.contains("other-group"), "{out}");
+        assert!(!out.contains("outsider-dm"), "{out}");
+
+        // Switching focus to a single DM suppresses group chatter.
+        roster.set_focus(Some(lead_dm.clone()));
+        assert!(!roster.should_show(&msg(&team.id, Author::bot(lead.id), "team-noise", None)));
+        assert!(roster.should_show(&msg(&lead_dm, Author::Owner, "dm-direct", None)));
     }
 }

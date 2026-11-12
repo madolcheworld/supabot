@@ -762,6 +762,151 @@ async fn groups_are_created_renamed_paged_and_deleted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn groups_update_title_members_and_lead_and_validate_inputs() {
+    let brain = TestBrain::start().await;
+    let client = brain.client();
+    let lead = brain.bot_id("lead");
+    let scout = brain.bot_id("scout");
+    let dev = brain.bot_id("dev");
+    let sentinel = brain.bot_id("sentinel");
+
+    let created = body(
+        post(
+            &client,
+            &brain.url("/api/conversations"),
+            &json!({"title": "Squad", "members": ["lead", "scout"]}),
+        )
+        .await,
+    )
+    .await;
+    let group_id = id_of(&created);
+    assert_eq!(created["title"], json!("Squad"));
+    assert_eq!(created["kind"]["lead"], json!(lead.to_string()));
+
+    // Rename-only payload stays compatible.
+    let renamed = body(
+        patch(
+            &client,
+            &brain.url(&format!("/api/conversations/{group_id}")),
+            &json!({"title": "Squad Two"}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(renamed["title"], json!("Squad Two"));
+    assert_eq!(renamed["kind"]["lead"], json!(lead.to_string()));
+    assert_eq!(
+        renamed["kind"]["members"],
+        json!([lead.to_string(), scout.to_string()])
+    );
+
+    // Update title, members (mixed ids and handles), and lead together.
+    let updated = body(
+        patch(
+            &client,
+            &brain.url(&format!("/api/conversations/{group_id}")),
+            &json!({
+                "title": "Build Squad",
+                "members": [scout.to_string(), dev.to_string(), "sentinel"],
+                "lead": "dev"
+            }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(updated["title"], json!("Build Squad"));
+    assert_eq!(updated["kind"]["lead"], json!(dev.to_string()));
+    assert_eq!(
+        updated["kind"]["members"],
+        json!([scout.to_string(), dev.to_string(), sentinel.to_string()])
+    );
+
+    // Update lead alone among the new members.
+    let relinked = body(
+        patch(
+            &client,
+            &brain.url(&format!("/api/conversations/{group_id}")),
+            &json!({"lead": sentinel.to_string()}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(relinked["kind"]["lead"], json!(sentinel.to_string()));
+
+    // Invalid inputs and missing bots map cleanly to 400 / 404 / 409.
+    expect_error(
+        patch(
+            &client,
+            &brain.url(&format!("/api/conversations/{group_id}")),
+            &json!({"members": ["dev"]}),
+        )
+        .await,
+        400,
+        "invalid_input",
+    )
+    .await;
+    expect_error(
+        patch(
+            &client,
+            &brain.url(&format!("/api/conversations/{group_id}")),
+            &json!({"members": ["dev", "dev"]}),
+        )
+        .await,
+        400,
+        "invalid_input",
+    )
+    .await;
+    expect_error(
+        patch(
+            &client,
+            &brain.url(&format!("/api/conversations/{group_id}")),
+            &json!({"lead": "lead"}),
+        )
+        .await,
+        400,
+        "invalid_input",
+    )
+    .await;
+    expect_error(
+        patch(
+            &client,
+            &brain.url(&format!("/api/conversations/{group_id}")),
+            &json!({"members": ["dev", "nobody"]}),
+        )
+        .await,
+        404,
+        "not_found",
+    )
+    .await;
+    expect_error(
+        patch(
+            &client,
+            &brain.url(&format!("/api/conversations/{group_id}")),
+            &json!({"lead": "nobody"}),
+        )
+        .await,
+        404,
+        "not_found",
+    )
+    .await;
+
+    let dm = brain.bot("lead").direct_conversation_id;
+    expect_error(
+        patch(
+            &client,
+            &brain.url(&format!("/api/conversations/{dm}")),
+            &json!({"members": ["lead", "scout"], "lead": "lead"}),
+        )
+        .await,
+        409,
+        "conflict",
+    )
+    .await;
+
+    brain.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transcripts_page_forward_and_show_their_tail() {
     let brain = TestBrain::start().await;
     let client = brain.client();

@@ -7,7 +7,7 @@
 //! backend was constructed, and the brain can add one without touching core.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tracing::info;
 
@@ -18,6 +18,7 @@ use swarmbot_llm::{BackendRegistry, BackendStatus, LlmBackend};
 pub struct BackendSet {
     registry: Arc<BackendRegistry>,
     specs: HashMap<String, BackendSpec>,
+    overrides: RwLock<HashMap<String, Arc<dyn LlmBackend>>>,
 }
 
 impl BackendSet {
@@ -29,12 +30,34 @@ impl BackendSet {
             .into_iter()
             .map(|spec| (spec.id.clone(), spec))
             .collect();
-        Arc::new(Self { registry, specs })
+        Arc::new(Self {
+            registry,
+            specs,
+            overrides: RwLock::new(HashMap::new()),
+        })
+    }
+
+    /// Register or override a backend adapter by id (used by tests and custom
+    /// adapters built outside `BackendRegistry`).
+    pub fn register(&self, id: impl Into<String>, backend: Arc<dyn LlmBackend>) {
+        self.overrides
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.into(), backend);
     }
 
     /// The live backend for a bot. A missing id is a configuration error the
     /// owner can see, not a panic.
     pub fn backend(&self, id: &str) -> Result<Arc<dyn LlmBackend>, DomainError> {
+        if let Some(backend) = self
+            .overrides
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+        {
+            return Ok(backend);
+        }
         self.registry
             .get(id)
             .map_err(|err| DomainError::BackendUnavailable {
@@ -105,10 +128,18 @@ impl BackendSet {
     /// True when a backend runs its own tool loop, so the runner must not drive
     /// one and must read tool activity from the backend's events instead.
     pub fn owns_tool_loop(&self, id: &str) -> bool {
-        self.spec(id).is_some_and(|spec| spec.kind.owns_tool_loop())
+        self.kind(id).is_some_and(|kind| kind.owns_tool_loop())
     }
 
     pub fn kind(&self, id: &str) -> Option<BackendKind> {
+        if let Some(backend) = self
+            .overrides
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+        {
+            return Some(backend.kind());
+        }
         self.spec(id).map(|spec| spec.kind)
     }
 

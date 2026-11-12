@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use swarmbot_contracts::{BackendKind, BackendSpec};
 use swarmbot_llm::{
     AcpAgent, AcpTransport, AgentHandle, AgentLaunch, BackendRegistry, ChatMessage, ChatRequest,
-    FinishReason, LlmBackend, LlmError, LlmEvent, PermissionMode, ProcessTransport,
+    FinishReason, LlmBackend, LlmError, LlmEvent, McpServerSpec, PermissionMode, ProcessTransport,
 };
 
 // ---------------------------------------------------------------------------
@@ -56,6 +56,10 @@ enum Behavior {
     /// `session/new` advertises configOptions for "model" (current `m1`, available `m1`+`m2`);
     /// `session/set_config_option` works.
     ConfigOptionsWithSetConfigOption,
+    /// `initialize` advertises `mcpCapabilities: { http: true, sse: false }`.
+    McpHttpSupported,
+    /// `initialize` advertises `mcpCapabilities: { http: false, sse: false }`.
+    McpHttpUnsupported,
 }
 
 type Log = Arc<Mutex<Vec<Value>>>;
@@ -132,13 +136,22 @@ async fn play_agent(io: DuplexStream, behavior: Behavior, log: Log, died: Arc<At
         let id = value["id"].as_u64();
         match method {
             "initialize" => {
+                let agent_capabilities = match behavior {
+                    Behavior::McpHttpSupported => json!({
+                        "mcpCapabilities": {"http": true, "sse": false},
+                    }),
+                    Behavior::McpHttpUnsupported => json!({
+                        "mcpCapabilities": {"http": false, "sse": false},
+                    }),
+                    _ => json!({}),
+                };
                 respond(
                     &writer,
                     id,
                     json!({
                         "protocolVersion": 1,
                         "authMethods": [],
-                        "agentCapabilities": {},
+                        "agentCapabilities": agent_capabilities,
                     }),
                 )
                 .await;
@@ -1352,5 +1365,103 @@ async fn each_bot_cwd_gets_its_own_connection_and_session_cwd() {
             ws_b.to_string_lossy().to_string(),
             ws_a.to_string_lossy().to_string(),
         ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// per-turn MCP servers on session/new
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn chat_serializes_http_and_stdio_mcp_servers_in_session_new() {
+    for behavior in [Behavior::McpHttpSupported, Behavior::Normal] {
+        let (backend, log) = agent(behavior);
+        let (tx, rx) = mpsc::channel(32);
+        let events = collect_events(rx);
+
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".into(), "Bearer tok-123".into());
+        let mut env = BTreeMap::new();
+        env.insert("RUST_LOG".into(), "info".into());
+        let mut req = request_with_history();
+        req.mcp_servers = vec![
+            McpServerSpec::Http {
+                name: "swarmbot".into(),
+                url: "http://127.0.0.1:8788/mcp/t/turn-1".into(),
+                headers,
+            },
+            McpServerSpec::Stdio {
+                name: "helper".into(),
+                command: "/usr/bin/helper-mcp".into(),
+                args: vec!["--stdio".into()],
+                env,
+            },
+        ];
+
+        backend
+            .chat(req, tx, CancellationToken::new())
+            .await
+            .expect("turn completes");
+        events.await.expect("joined");
+
+        let entries = wait_for_log(&log, "session/new", |entries| {
+            find_request(entries, "session/new").is_some()
+        })
+        .await;
+        let new_session = find_request(&entries, "session/new").expect("session/new sent");
+        assert_eq!(
+            new_session["params"]["mcpServers"],
+            json!([
+                {
+                    "type": "http",
+                    "name": "swarmbot",
+                    "url": "http://127.0.0.1:8788/mcp/t/turn-1",
+                    "headers": [{"name": "Authorization", "value": "Bearer tok-123"}],
+                },
+                {
+                    "name": "helper",
+                    "command": "/usr/bin/helper-mcp",
+                    "args": ["--stdio"],
+                    "env": [{"name": "RUST_LOG", "value": "info"}],
+                }
+            ]),
+            "behavior {behavior:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn chat_skips_http_mcp_server_when_agent_advertises_http_false_but_keeps_stdio() {
+    let (backend, log) = agent(Behavior::McpHttpUnsupported);
+    let (tx, rx) = mpsc::channel(32);
+    let events = collect_events(rx);
+
+    let mut req = request_with_history();
+    req.mcp_servers = vec![
+        McpServerSpec::http("swarmbot", "http://127.0.0.1:8788/mcp/t/turn-2"),
+        McpServerSpec::stdio("helper", "helper-mcp"),
+    ];
+
+    backend
+        .chat(req, tx, CancellationToken::new())
+        .await
+        .expect("turn completes cleanly even when HTTP MCP is skipped");
+    events.await.expect("joined");
+
+    let entries = wait_for_log(&log, "session/new", |entries| {
+        find_request(entries, "session/new").is_some()
+    })
+    .await;
+    let new_session = find_request(&entries, "session/new").expect("session/new sent");
+    assert_eq!(
+        new_session["params"]["mcpServers"],
+        json!([
+            {
+                "name": "helper",
+                "command": "helper-mcp",
+                "args": [],
+                "env": [],
+            }
+        ])
     );
 }

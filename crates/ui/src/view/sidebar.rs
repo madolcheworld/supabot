@@ -23,7 +23,7 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
         .border_r_1()
         .border_color(rgb(theme::BORDER))
         // Top search bar and new button
-        .child(header_search(state, commands))
+        .child(header_search(s, state))
         // Scrollable bot conversations list
         .child(
             div()
@@ -42,9 +42,9 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
         .child(footer(s, state, commands))
 }
 
-fn header_search(state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::Div {
-    let state_group = state.clone();
-    let commands_h = commands.clone();
+fn header_search(s: &AppState, state: &Entity<AppState>) -> gpui::Div {
+    let state_plus = state.clone();
+    let menu_open = s.plus_menu_open;
     div()
         .flex_none()
         .px_3()
@@ -70,12 +70,16 @@ fn header_search(state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::
                 .child(div().text_color(rgb(theme::TEXT_MUTED)).child("Search")),
         )
         .child(
-            // Plus button for adding a bot or creating a group
+            // Plus button opening the Add Bot / Create Group choice menu
             div()
-                .id("nav-new-group")
+                .id("nav-plus-menu")
                 .size(px(36.0))
                 .rounded_xl()
-                .bg(rgb(0xebebee))
+                .bg(if menu_open {
+                    rgb(0xdcdce0)
+                } else {
+                    rgb(0xebebee)
+                })
                 .cursor_pointer()
                 .hover(|h| h.bg(rgb(0xdcdce0)))
                 .flex()
@@ -86,24 +90,11 @@ fn header_search(state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .child("+")
                 .on_click(move |_, _, cx: &mut gpui::App| {
-                    state_group.update(cx, |st, cx| {
-                        st.create_group_title = "Team Chat".to_string();
-                        st.create_group_members = st
-                            .bots
-                            .iter()
-                            .take(swarmbot_contracts::MAX_GROUP_MEMBERS)
-                            .map(|b| b.id.clone())
-                            .collect();
-                        if st.bots.len() < swarmbot_contracts::MIN_GROUP_MEMBERS {
-                            st.create_bot_open = true;
-                            st.create_group_open = false;
-                        } else {
-                            st.create_group_open = true;
-                            st.create_bot_open = false;
-                        }
+                    cx.stop_propagation();
+                    state_plus.update(cx, |st, cx| {
+                        st.plus_menu_open = !st.plus_menu_open;
                         cx.notify();
                     });
-                    let _ = commands_h.send(Command::FetchBackends);
                 }),
         )
 }
@@ -132,12 +123,16 @@ fn bots_list(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>)
             let title = s.conversation_title(group);
             let conv_id = group.id.clone();
             let selected = s.open_conversation.as_ref() == Some(&conv_id);
+            let working = s.is_group_working(group);
             let preview = s
                 .preview(&conv_id)
                 .unwrap_or_else(|| "No messages yet".to_string());
             let unread = s.unread(&conv_id);
             let state_h = state.clone();
             let conv_c = conv_id.clone();
+
+            let state_edit = state.clone();
+            let group_edit = (*group).clone();
 
             let state_del = state.clone();
             let conv_del = conv_id.clone();
@@ -152,8 +147,8 @@ fn bots_list(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>)
                 &preview,
                 unread > 0,
                 selected,
-                false,
-                0,
+                working,
+                s.spinner_phase,
                 move |cx| {
                     let conv = conv_c.clone();
                     state_h.update(cx, |st, cx| {
@@ -161,6 +156,13 @@ fn bots_list(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>)
                         cx.notify();
                     });
                 },
+                Some(Box::new(move |cx: &mut gpui::App| {
+                    let conv = group_edit.clone();
+                    state_edit.update(cx, |st, cx| {
+                        st.open_edit_group(&conv);
+                        cx.notify();
+                    });
+                })),
                 Some(Box::new(move |cx: &mut gpui::App| {
                     let conv = conv_del.clone();
                     let t = title_del.clone();
@@ -217,6 +219,7 @@ fn bots_list(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>)
                         cx.notify();
                     });
                 },
+                None,
                 Some(Box::new(move |cx: &mut gpui::App| {
                     let bid = bot_id.clone();
                     let blab = bot_label.clone();
@@ -273,8 +276,7 @@ fn bots_list(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>)
                         .child("+ Add Bot")
                         .on_click(move |_, _, cx: &mut gpui::App| {
                             state_add.update(cx, |st, cx| {
-                                st.create_bot_open = true;
-                                st.create_group_open = false;
+                                st.open_create_bot();
                                 cx.notify();
                             });
                             let _ = commands_add.send(Command::FetchBackends);
@@ -286,7 +288,7 @@ fn bots_list(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>)
     list
 }
 
-type DeleteCallback = Box<dyn Fn(&mut gpui::App) + 'static>;
+type ActionCallback = Box<dyn Fn(&mut gpui::App) + 'static>;
 
 #[allow(clippy::too_many_arguments)]
 fn bot_item(
@@ -301,7 +303,8 @@ fn bot_item(
     working: bool,
     spinner_phase: usize,
     on_click: impl Fn(&mut gpui::App) + 'static,
-    on_delete: Option<DeleteCallback>,
+    on_edit: Option<ActionCallback>,
+    on_delete: Option<ActionCallback>,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(SharedString::from(id.to_string()))
@@ -352,6 +355,26 @@ fn bot_item(
                                             .text_xs()
                                             .text_color(rgb(theme::TEXT_DIM))
                                             .child(time.to_string()),
+                                    )
+                                })
+                                .when_some(on_edit, |d, on_ed| {
+                                    d.child(
+                                        div()
+                                            .id(SharedString::from(format!("edit-{}", id)))
+                                            .cursor_pointer()
+                                            .px_1()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_DIM))
+                                            .hover(|h| {
+                                                h.text_color(rgb(theme::ACCENT))
+                                                    .bg(rgb(theme::SURFACE_RAISED))
+                                            })
+                                            .child("✎")
+                                            .on_click(move |_, _, cx: &mut gpui::App| {
+                                                cx.stop_propagation();
+                                                on_ed(cx);
+                                            }),
                                     )
                                 })
                                 .when_some(on_delete, |d, on_del| {

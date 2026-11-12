@@ -30,7 +30,7 @@ use gpui::{
     SharedString, Window, div, list, prelude::*, px, rgb,
 };
 use swarmbot_client::NewBotRequest;
-use swarmbot_contracts::{EntryId, EntryKind, FormField, RequestId};
+use swarmbot_contracts::{BotId, ConversationKind, EntryId, EntryKind, FormField, RequestId};
 
 use crate::RENDERS;
 use crate::actions::{CancelOverlay, FocusComposer, StopTurn, ToggleGraph, TogglePalette};
@@ -55,10 +55,14 @@ pub struct Root {
     routine_name: Entity<TextInput>,
     routine_prompt: Entity<TextInput>,
     group_title_input: Entity<TextInput>,
+    edit_group_title_input: Entity<TextInput>,
     bot_handle_input: Entity<TextInput>,
     bot_label_input: Entity<TextInput>,
     bot_instructions_input: Entity<TextInput>,
     cards: HashMap<EntryId, Entity<CardView>>,
+    /// Pending approval/question cards surfaced into a group view from
+    /// delegated DM `handoff_task` turns (whose entries live in a bot's DM).
+    surfaced_cards: HashMap<RequestId, Entity<CardView>>,
     transcript: ListState,
     /// Interior mutability so the transcript can reset its item count from a
     /// `&self` render pass (a `ListState::reset` is itself `&self`).
@@ -66,7 +70,7 @@ pub struct Root {
     focus_handle: FocusHandle,
     /// Held, not read: dropping the root must stop the worker threads.
     _worker: Option<Worker>,
-    _observe: gpui::Subscription,
+    _observations: Vec<gpui::Subscription>,
 }
 
 impl Root {
@@ -82,16 +86,30 @@ impl Root {
         let provider_model = cx.new(|cx| TextInput::new("Search or enter model ID...", cx));
         let routine_name = cx.new(|cx| TextInput::new("Routine name (e.g. Daily Standup)", cx));
         let routine_prompt = cx.new(|cx| TextInput::new("Prompt for the bot…", cx).multiline());
-        let group_title_input = cx.new(|cx| TextInput::new("Group title (e.g. Team Chat)", cx));
+        let group_title_input = cx.new(|cx| TextInput::new("Group title (e.g. Group Chat)", cx));
+        let edit_group_title_input = cx.new(|cx| TextInput::new("Group title", cx));
         let bot_handle_input = cx.new(|cx| TextInput::new("handle (e.g. researcher)", cx));
         let bot_label_input = cx.new(|cx| TextInput::new("Display name (e.g. Researcher)", cx));
         let bot_instructions_input =
             cx.new(|cx| TextInput::new("Instructions / role for this bot…", cx).multiline());
         let focus_handle = cx.focus_handle();
-        let observe = cx.observe(&state, |this, _, cx| {
-            this.sync_cards(cx);
-            cx.notify();
-        });
+        let observations = vec![
+            cx.observe(&state, |this, state, cx| {
+                if let Some(seed) = state.read(cx).edit_group_title_seed.clone() {
+                    state.update(cx, |s, _| {
+                        s.edit_group_title_seed = None;
+                    });
+                    this.edit_group_title_input
+                        .update(cx, |input, cx| input.set_content(&seed, cx));
+                }
+                this.sync_cards(cx);
+                cx.notify();
+            }),
+            // Re-render Root when the user types into the Add Bot fields so
+            // submit availability updates immediately even while idle.
+            cx.observe(&bot_handle_input, |_, _, cx| cx.notify()),
+            cx.observe(&bot_label_input, |_, _, cx| cx.notify()),
+        ];
         // The transcript is a chat log: bottom-aligned, so the newest entry is
         // always in view and a streaming reply grows upward from the baseline.
         let transcript = ListState::new(0, ListAlignment::Bottom, px(200.0));
@@ -105,41 +123,68 @@ impl Root {
             routine_name,
             routine_prompt,
             group_title_input,
+            edit_group_title_input,
             bot_handle_input,
             bot_label_input,
             bot_instructions_input,
             cards: HashMap::new(),
+            surfaced_cards: HashMap::new(),
             transcript,
             transcript_count: Cell::new(0),
             focus_handle,
             _worker: worker,
-            _observe: observe,
+            _observations: observations,
         };
         root.sync_cards(cx);
         root
     }
 
-    /// Ensure every card entry in the open conversation has a [`CardView`]
-    /// entity (created once, so its field inputs survive re-renders).
+    /// Ensure every card entry in the open conversation (and any pending card
+    /// surfaced from a group's delegated tasks) has a [`CardView`] entity
+    /// created once so its field inputs survive re-renders.
     fn sync_cards(&mut self, cx: &mut Context<Self>) {
-        let needed: Vec<(EntryId, RequestId, Vec<FormField>)> = {
+        type CardNeed = (EntryId, RequestId, Vec<FormField>);
+        let (needed, surfaced_needed, still_pending): (
+            Vec<CardNeed>,
+            Vec<CardNeed>,
+            Vec<RequestId>,
+        ) = {
             let s = self.state.read(cx);
             let mut needed = Vec::new();
+            let mut surfaced_needed = Vec::new();
+            let mut still_pending = Vec::new();
             if let Some(conversation) = s.open_conversation() {
+                let mut inline_req_ids = Vec::new();
                 for entry in s.entries(&conversation.id) {
-                    if let EntryKind::Card(card) = &entry.kind
-                        && !self.cards.contains_key(&entry.id)
-                    {
-                        let fields = s
-                            .request(&card.request_id)
-                            .map(|r| r.fields.clone())
-                            .unwrap_or_default();
-                        needed.push((entry.id.clone(), card.request_id.clone(), fields));
+                    if let EntryKind::Card(card) = &entry.kind {
+                        inline_req_ids.push(card.request_id.clone());
+                        if !self.cards.contains_key(&entry.id) {
+                            let fields = s
+                                .request(&card.request_id)
+                                .map(|r| r.fields.clone())
+                                .unwrap_or_default();
+                            needed.push((entry.id.clone(), card.request_id.clone(), fields));
+                        }
+                    }
+                }
+                if conversation.kind.is_group() {
+                    for req in s.group_pending_requests(conversation) {
+                        if !inline_req_ids.contains(&req.id) {
+                            still_pending.push(req.id.clone());
+                            if !self.surfaced_cards.contains_key(&req.id) {
+                                let eid = req.card_entry_id.clone().unwrap_or_else(|| {
+                                    EntryId::from_suffix(&format!("surfaced-{}", req.id))
+                                });
+                                surfaced_needed.push((eid, req.id.clone(), req.fields.clone()));
+                            }
+                        }
                     }
                 }
             }
-            needed
+            (needed, surfaced_needed, still_pending)
         };
+        self.surfaced_cards
+            .retain(|id, _| still_pending.contains(id));
         for (entry_id, request_id, fields) in needed {
             let state = self.state.clone();
             let commands = self.commands.clone();
@@ -154,6 +199,21 @@ impl Root {
                 )
             });
             self.cards.insert(entry_id, view);
+        }
+        for (entry_id, request_id, fields) in surfaced_needed {
+            let state = self.state.clone();
+            let commands = self.commands.clone();
+            let view = cx.new(|cx| {
+                CardView::new(
+                    request_id.clone(),
+                    entry_id.clone(),
+                    &fields,
+                    state.clone(),
+                    commands.clone(),
+                    cx,
+                )
+            });
+            self.surfaced_cards.insert(request_id, view);
         }
     }
 
@@ -172,6 +232,9 @@ impl Root {
         let opening = !self.state.read(cx).palette_open;
         self.state.update(cx, |s, cx| {
             s.palette_open = opening;
+            if opening {
+                s.plus_menu_open = false;
+            }
             cx.notify();
         });
         if opening {
@@ -217,6 +280,7 @@ impl Root {
                 s.create_bot_open = false;
                 cx.notify();
             });
+            self.composer.read(cx).focus_input(window, cx);
             return;
         }
         if self.state.read(cx).create_group_open {
@@ -224,11 +288,28 @@ impl Root {
                 s.create_group_open = false;
                 cx.notify();
             });
+            self.composer.read(cx).focus_input(window, cx);
+            return;
+        }
+        if self.state.read(cx).edit_group_id.is_some() {
+            self.state.update(cx, |s, cx| {
+                s.edit_group_id = None;
+                s.edit_group_title_seed = None;
+                cx.notify();
+            });
+            self.composer.read(cx).focus_input(window, cx);
             return;
         }
         if self.state.read(cx).bot_menu_open {
             self.state.update(cx, |s, cx| {
                 s.bot_menu_open = false;
+                cx.notify();
+            });
+            return;
+        }
+        if self.state.read(cx).plus_menu_open {
+            self.state.update(cx, |s, cx| {
+                s.plus_menu_open = false;
                 cx.notify();
             });
             return;
@@ -241,10 +322,23 @@ impl Root {
             self.composer.read(cx).focus_input(window, cx);
             return;
         }
-        // Otherwise let the composer close its mention picker.
-        self.composer.update(cx, |composer, cx| {
-            composer.close_picker(cx);
-        });
+        // Otherwise let the composer close its mention picker; if none was open
+        // and a turn is running in the open conversation, Escape stops it.
+        let had_picker = self
+            .composer
+            .update(cx, |composer, cx| composer.close_picker(cx));
+        if !had_picker {
+            let running_conv = {
+                let s = self.state.read(cx);
+                s.open_conversation
+                    .as_ref()
+                    .filter(|id| s.running_turn(id).is_some())
+                    .cloned()
+            };
+            if let Some(conv) = running_conv {
+                let _ = self.commands.send(Command::Interrupt(conv));
+            }
+        }
     }
 
     fn on_stop(&mut self, _: &StopTurn, _: &mut Window, cx: &mut Context<Self>) {
@@ -308,8 +402,9 @@ impl Root {
         let transcript_area = if s.open_conversation().is_none() {
             let state_h = self.state.clone();
             let commands_h = self.commands.clone();
+            let handle_input = self.bot_handle_input.clone();
             let headline = if s.bots.is_empty() {
-                "No bots in your team yet"
+                "No bots yet"
             } else {
                 "No conversation selected"
             };
@@ -346,12 +441,12 @@ impl Root {
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(rgb(theme::BACKGROUND))
                         .child("+ Add Bot")
-                        .on_click(move |_, _, cx: &mut App| {
+                        .on_click(move |_, window, cx: &mut App| {
                             state_h.update(cx, |st, cx| {
-                                st.create_bot_open = true;
-                                st.create_group_open = false;
+                                st.open_create_bot();
                                 cx.notify();
                             });
+                            handle_input.read(cx).focus(window);
                             let _ = commands_h.send(Command::FetchBackends);
                         }),
                 )
@@ -382,6 +477,26 @@ impl Root {
             transcript.into_any_element()
         };
 
+        let surfaced_pending: Vec<Entity<CardView>> = s
+            .open_conversation()
+            .filter(|c| c.kind.is_group())
+            .map(|conv| {
+                let inline_req_ids: Vec<&RequestId> = s
+                    .entries(&conv.id)
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        EntryKind::Card(card) => Some(&card.request_id),
+                        _ => None,
+                    })
+                    .collect();
+                s.group_pending_requests(conv)
+                    .into_iter()
+                    .filter(|r| !inline_req_ids.contains(&&r.id))
+                    .filter_map(|r| self.surfaced_cards.get(&r.id).cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         div()
             .relative()
             .flex_1()
@@ -402,6 +517,25 @@ impl Root {
                     .py_2()
                     .child(transcript_area),
             )
+            .when(!surfaced_pending.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id("group-surfaced-cards")
+                        .w_full()
+                        .max_h(px(260.0))
+                        .overflow_y_scroll()
+                        .px_4()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(rgb(theme::BORDER))
+                        .bg(rgb(theme::SURFACE))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(bits::section_label("PENDING APPROVALS & QUESTIONS"))
+                        .children(surfaced_pending),
+                )
+            })
             .child(self.composer.clone())
             // Last child = painted last = above the transcript it floats over.
             .children(provider_menu::render(
@@ -491,128 +625,302 @@ impl Root {
             )
     }
 
-    fn render_create_tabs(&self, active_is_bot: bool) -> gpui::Div {
+    fn render_plus_menu(&self, s: &AppState) -> gpui::Stateful<gpui::Div> {
+        let state_backdrop = self.state.clone();
         let state_bot = self.state.clone();
         let commands_bot = self.commands.clone();
+        let handle_input = self.bot_handle_input.clone();
         let state_group = self.state.clone();
+        let group_title_input = self.group_title_input.clone();
+
+        let group_subtitle = if s.bots.len() < swarmbot_contracts::MIN_GROUP_MEMBERS {
+            format!(
+                "Requires at least {} bots",
+                swarmbot_contracts::MIN_GROUP_MEMBERS
+            )
+        } else {
+            "Start a multi-bot chat".to_string()
+        };
 
         div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .p_1()
-            .rounded_xl()
-            .bg(rgb(theme::SURFACE_RAISED))
-            .border_1()
-            .border_color(rgb(theme::BORDER))
+            .id("plus-menu-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_click(move |_, _, cx: &mut App| {
+                state_backdrop.update(cx, |st, cx| {
+                    st.plus_menu_open = false;
+                    cx.notify();
+                });
+            })
             .child(
                 div()
-                    .id("modal-tab-add-bot")
-                    .flex_1()
-                    .py_1p5()
-                    .rounded_lg()
+                    .id("plus-menu-card")
+                    .occlude()
+                    .absolute()
+                    .top(px(54.0))
+                    // Right-align with the `+` button at the top-right of the left sidebar.
+                    .left(theme::space::SIDEBAR_W - px(12.0) - px(220.0))
+                    .w(px(220.0))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .bg(rgb(theme::BACKGROUND))
+                    .shadow_lg()
+                    .p_1p5()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .when(active_is_bot, |d| {
-                        d.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BACKGROUND))
+                    .flex_col()
+                    .gap_1()
+                    .on_click(|_, _, cx| {
+                        cx.stop_propagation();
                     })
-                    .when(!active_is_bot, |d| {
-                        d.cursor_pointer()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .hover(|h| h.bg(rgb(0xebebee)).text_color(rgb(theme::TEXT)))
-                            .on_click(move |_, _, cx: &mut App| {
-                                state_bot.update(cx, |st, cx| {
-                                    st.create_bot_open = true;
-                                    st.create_group_open = false;
-                                    cx.notify();
-                                });
-                                let _ = commands_bot.send(Command::FetchBackends);
-                            })
-                    })
-                    .child("+ Add Bot"),
-            )
-            .child(
-                div()
-                    .id("modal-tab-create-group")
-                    .flex_1()
-                    .py_1p5()
-                    .rounded_lg()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .when(!active_is_bot, |d| {
-                        d.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BACKGROUND))
-                    })
-                    .when(active_is_bot, |d| {
-                        d.cursor_pointer()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .hover(|h| h.bg(rgb(0xebebee)).text_color(rgb(theme::TEXT)))
-                            .on_click(move |_, _, cx: &mut App| {
-                                state_group.update(cx, |st, cx| {
-                                    st.create_group_open = true;
-                                    st.create_bot_open = false;
-                                    cx.notify();
-                                });
-                            })
-                    })
-                    .child("Create Group"),
+                    .child(plus_menu_item(
+                        "plus-menu-add-bot",
+                        "+",
+                        0xeff6ff,
+                        theme::ACCENT,
+                        "Add Bot",
+                        "Create a standalone bot",
+                        move |window, cx| {
+                            state_bot.update(cx, |st, cx| {
+                                st.open_create_bot();
+                                cx.notify();
+                            });
+                            handle_input.read(cx).focus(window);
+                            let _ = commands_bot.send(Command::FetchBackends);
+                        },
+                    ))
+                    .child(plus_menu_item(
+                        "plus-menu-create-group",
+                        "#",
+                        0xf5f3ff,
+                        0x7c3aed,
+                        "Create Group",
+                        &group_subtitle,
+                        move |window, cx| {
+                            group_title_input.update(cx, |input, cx| input.clear(cx));
+                            state_group.update(cx, |st, cx| {
+                                st.open_create_group();
+                                cx.notify();
+                            });
+                            group_title_input.read(cx).focus(window);
+                        },
+                    )),
             )
     }
 
-    fn render_create_group(&self, s: &AppState) -> gpui::Div {
+    fn render_create_group(&self, s: &AppState) -> gpui::Stateful<gpui::Div> {
+        let selected_bots = s.create_group_members.clone();
+        let active_lead = s
+            .create_group_lead
+            .clone()
+            .filter(|id| selected_bots.contains(id))
+            .or_else(|| selected_bots.first().cloned());
         let state_h = self.state.clone();
         let commands = self.commands.clone();
         let title_input = self.group_title_input.clone();
-        let selected_bots = s.create_group_members.clone();
-        let count = selected_bots.len();
-        let can_create = (swarmbot_contracts::MIN_GROUP_MEMBERS
-            ..=swarmbot_contracts::MAX_GROUP_MEMBERS)
-            .contains(&count);
+        let composer_create = self.composer.clone();
+        let composer_close = self.composer.clone();
 
         let on_close = {
             let state_h = state_h.clone();
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                 state_h.update(cx, |st, cx| {
                     st.create_group_open = false;
                     cx.notify();
                 });
+                composer_close.read(cx).focus_input(window, cx);
             }
         };
 
-        let on_create = {
+        let on_submit = {
             let state_h = state_h.clone();
-            let commands = commands.clone();
             let title_input = title_input.clone();
             let selected_bots = selected_bots.clone();
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            let active_lead = active_lead.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                 let typed = title_input.read(cx).content().trim().to_string();
                 let title = if typed.is_empty() {
-                    "Team Chat".to_string()
+                    "Group Chat".to_string()
                 } else {
                     typed
                 };
-                let lead = selected_bots.first().cloned();
                 let _ = commands.send(Command::CreateGroup {
                     title,
                     members: selected_bots.clone(),
-                    lead,
+                    lead: active_lead.clone(),
                 });
+                title_input.update(cx, |input, cx| input.set_content("", cx));
                 state_h.update(cx, |st, cx| {
                     st.create_group_open = false;
                     cx.notify();
                 });
+                composer_create.read(cx).focus_input(window, cx);
             }
         };
 
+        self.render_group_modal(
+            s,
+            GroupModalConfig {
+                id_prefix: "create-group",
+                heading: "Create Group",
+                submit_label: "Create Group",
+                title_input: &self.group_title_input,
+                selected_bots: &selected_bots,
+                active_lead: active_lead.as_ref(),
+                on_toggle_member: Box::new(move |bid, st| {
+                    if let Some(pos) = st.create_group_members.iter().position(|id| id == &bid) {
+                        st.create_group_members.remove(pos);
+                        if st.create_group_lead.as_ref() == Some(&bid) {
+                            st.create_group_lead = st.create_group_members.first().cloned();
+                        }
+                    } else if st.create_group_members.len() < swarmbot_contracts::MAX_GROUP_MEMBERS
+                    {
+                        if st.create_group_lead.is_none() {
+                            st.create_group_lead = Some(bid.clone());
+                        }
+                        st.create_group_members.push(bid);
+                    }
+                }),
+                on_pick_lead: Box::new(move |bid, st| {
+                    st.create_group_lead = Some(bid);
+                }),
+                on_close: Box::new(on_close),
+                on_submit: Box::new(on_submit),
+            },
+        )
+    }
+
+    fn render_edit_group(&self, s: &AppState) -> gpui::Stateful<gpui::Div> {
+        let Some(conv_id) = s.edit_group_id.clone() else {
+            return div().id("edit-group-empty");
+        };
+        let existing = s.conversation(&conv_id).cloned();
+        let selected_bots = s.edit_group_members.clone();
+        let active_lead = s
+            .edit_group_lead
+            .clone()
+            .filter(|id| selected_bots.contains(id))
+            .or_else(|| selected_bots.first().cloned());
+        let state_h = self.state.clone();
+        let commands = self.commands.clone();
+        let title_input = self.edit_group_title_input.clone();
+        let composer_save = self.composer.clone();
+        let composer_close = self.composer.clone();
+
+        let on_close = {
+            let state_h = state_h.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                state_h.update(cx, |st, cx| {
+                    st.edit_group_id = None;
+                    st.edit_group_title_seed = None;
+                    cx.notify();
+                });
+                composer_close.read(cx).focus_input(window, cx);
+            }
+        };
+
+        let on_submit = {
+            let state_h = state_h.clone();
+            let selected_bots = selected_bots.clone();
+            let active_lead = active_lead.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                let typed = title_input.read(cx).content().trim().to_string();
+                let (title_patch, members_patch, lead_patch) = match &existing {
+                    Some(conv) => {
+                        let old_title = state_h.read(cx).conversation_title(conv);
+                        let title_patch =
+                            (!typed.is_empty() && typed != old_title).then_some(typed);
+                        let (old_members, old_lead) = match &conv.kind {
+                            ConversationKind::Group { members, lead } => {
+                                (Some(members), Some(lead))
+                            }
+                            _ => (None, None),
+                        };
+                        let members_patch =
+                            (old_members != Some(&selected_bots)).then_some(selected_bots.clone());
+                        let lead_patch = if active_lead.as_ref() != old_lead {
+                            active_lead.clone()
+                        } else {
+                            None
+                        };
+                        (title_patch, members_patch, lead_patch)
+                    }
+                    None => (
+                        (!typed.is_empty()).then_some(typed),
+                        Some(selected_bots.clone()),
+                        active_lead.clone(),
+                    ),
+                };
+                if title_patch.is_some() || members_patch.is_some() || lead_patch.is_some() {
+                    let _ = commands.send(Command::UpdateGroup {
+                        id: conv_id.clone(),
+                        title: title_patch,
+                        members: members_patch,
+                        lead: lead_patch,
+                    });
+                } else {
+                    state_h.update(cx, |st, cx| {
+                        st.edit_group_id = None;
+                        st.edit_group_title_seed = None;
+                        cx.notify();
+                    });
+                }
+                composer_save.read(cx).focus_input(window, cx);
+            }
+        };
+
+        self.render_group_modal(
+            s,
+            GroupModalConfig {
+                id_prefix: "edit-group",
+                heading: "Edit Group",
+                submit_label: "Save Changes",
+                title_input: &self.edit_group_title_input,
+                selected_bots: &selected_bots,
+                active_lead: active_lead.as_ref(),
+                on_toggle_member: Box::new(move |bid, st| {
+                    if let Some(pos) = st.edit_group_members.iter().position(|id| id == &bid) {
+                        st.edit_group_members.remove(pos);
+                        if st.edit_group_lead.as_ref() == Some(&bid) {
+                            st.edit_group_lead = st.edit_group_members.first().cloned();
+                        }
+                    } else if st.edit_group_members.len() < swarmbot_contracts::MAX_GROUP_MEMBERS {
+                        if st.edit_group_lead.is_none() {
+                            st.edit_group_lead = Some(bid.clone());
+                        }
+                        st.edit_group_members.push(bid);
+                    }
+                }),
+                on_pick_lead: Box::new(move |bid, st| {
+                    st.edit_group_lead = Some(bid);
+                }),
+                on_close: Box::new(on_close),
+                on_submit: Box::new(on_submit),
+            },
+        )
+    }
+
+    fn render_group_modal<'a>(
+        &self,
+        s: &AppState,
+        cfg: GroupModalConfig<'a>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let count = cfg.selected_bots.len();
+        let can_submit = (swarmbot_contracts::MIN_GROUP_MEMBERS
+            ..=swarmbot_contracts::MAX_GROUP_MEMBERS)
+            .contains(&count);
+        let state_h = self.state.clone();
+        let on_toggle_member = std::rc::Rc::new(cfg.on_toggle_member);
+        let on_pick_lead = std::rc::Rc::new(cfg.on_pick_lead);
+        let on_close = std::rc::Rc::new(cfg.on_close);
+        let prefix = cfg.id_prefix;
+
         let mut bot_list = div()
-            .id("create-group-bot-list")
+            .id(SharedString::from(format!("{prefix}-bot-list")))
             .flex_1()
-            .max_h(px(220.0))
+            .max_h(px(200.0))
             .overflow_y_scroll()
             .flex()
             .flex_col()
@@ -620,12 +928,14 @@ impl Root {
 
         for bot in &s.bots {
             let bot_id = bot.id.clone();
-            let checked = selected_bots.contains(&bot_id);
-            let state_h = state_h.clone();
+            let checked = cfg.selected_bots.contains(&bot_id);
+            let is_lead = checked && cfg.active_lead == Some(&bot_id);
+            let state_row = state_h.clone();
+            let toggle = on_toggle_member.clone();
             let bot_id_c = bot_id.clone();
             bot_list = bot_list.child(
                 div()
-                    .id(SharedString::from(format!("create-group-bot-{}", bot.id)))
+                    .id(SharedString::from(format!("{prefix}-bot-{}", bot.id)))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -661,21 +971,16 @@ impl Root {
                                     .text_xs()
                                     .text_color(rgb(theme::TEXT_DIM))
                                     .child(format!("@{}", bot.name)),
-                            ),
+                            )
+                            .when(is_lead, |d| {
+                                d.child(bits::badge("lead", theme::ACCENT, 0x0a1428))
+                            }),
                     )
                     .child(div().text_sm().child(if checked { "✓" } else { "○" }))
                     .on_click(move |_, _, cx: &mut App| {
                         let bid = bot_id_c.clone();
-                        state_h.update(cx, |st, cx| {
-                            if let Some(pos) =
-                                st.create_group_members.iter().position(|id| id == &bid)
-                            {
-                                st.create_group_members.remove(pos);
-                            } else if st.create_group_members.len()
-                                < swarmbot_contracts::MAX_GROUP_MEMBERS
-                            {
-                                st.create_group_members.push(bid);
-                            }
+                        state_row.update(cx, |st, cx| {
+                            toggle(bid, st);
                             cx.notify();
                         });
                     }),
@@ -683,194 +988,233 @@ impl Root {
         }
 
         if s.bots.len() < swarmbot_contracts::MIN_GROUP_MEMBERS {
-            let state_go = self.state.clone();
-            let commands_go = self.commands.clone();
             let msg = if s.bots.is_empty() {
-                "No bots added yet. Add at least 2 bots to form a group."
+                "No bots added yet. Add at least 2 bots first via '+' -> Add Bot."
             } else {
-                "Add 1 more bot to form a group chat (minimum 2)."
+                "Add 1 more bot first via '+' -> Add Bot (minimum 2)."
             };
             bot_list = bot_list.child(
                 div()
                     .p_3()
                     .rounded_xl()
                     .bg(rgb(theme::SURFACE_RAISED))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .child(msg),
-                    )
-                    .child(
-                        div()
-                            .id("group-empty-go-add-bot")
-                            .px_3()
-                            .py_1p5()
-                            .rounded_lg()
-                            .bg(rgb(theme::ACCENT))
-                            .hover(|h| h.bg(rgb(theme::ACCENT_HOVER)))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(theme::BACKGROUND))
-                            .child("+ Add Bot First")
-                            .on_click(move |_, _, cx: &mut App| {
-                                state_go.update(cx, |st, cx| {
-                                    st.create_group_open = false;
-                                    st.create_bot_open = true;
-                                    cx.notify();
-                                });
-                                let _ = commands_go.send(Command::FetchBackends);
-                            }),
-                    ),
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(msg),
             );
         }
 
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .w_full()
-            .h_full()
+        let mut lead_row = div().w_full().flex().flex_wrap().items_center().gap_1p5();
+        for member_id in cfg.selected_bots {
+            let Some(bot) = s.bot(member_id) else {
+                continue;
+            };
+            let selected_lead = cfg.active_lead == Some(member_id);
+            let state_lead = state_h.clone();
+            let pick = on_pick_lead.clone();
+            let bid = member_id.clone();
+            lead_row = lead_row.child(
+                div()
+                    .id(SharedString::from(format!("{prefix}-lead-{}", bot.id)))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_full()
+                    .border_1()
+                    .text_xs()
+                    .when(selected_lead, |d| {
+                        d.bg(rgb(0xede9fe))
+                            .border_color(rgb(0x8b5cf6))
+                            .text_color(rgb(0x5b21b6))
+                            .font_weight(gpui::FontWeight::BOLD)
+                    })
+                    .when(!selected_lead, |d| {
+                        d.bg(rgb(theme::SURFACE))
+                            .border_color(rgb(theme::BORDER))
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .hover(|h| h.bg(rgb(theme::SURFACE_RAISED)))
+                    })
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(theme::bot_color(bot)),
+                    )
+                    .child(format!("@{}", bot.name))
+                    .on_click(move |_, _, cx: &mut App| {
+                        let bid = bid.clone();
+                        state_lead.update(cx, |st, cx| {
+                            pick(bid, st);
+                            cx.notify();
+                        });
+                    }),
+            );
+        }
+
+        let on_close_header = on_close.clone();
+        let on_close_cancel = on_close.clone();
+        let on_close_backdrop = on_close.clone();
+
+        let mut card = div()
+            .id(SharedString::from(format!("{prefix}-card")))
+            .occlude()
+            .w(px(460.0))
+            .max_h(px(580.0))
+            .rounded_2xl()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb(theme::SURFACE))
+            .shadow_lg()
+            .p_5()
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::Rgba {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.5,
+            .flex_col()
+            .gap_3()
+            .on_click(|_, _, cx| {
+                cx.stop_propagation();
             })
             .child(
                 div()
-                    .w(px(460.0))
-                    .max_h(px(540.0))
-                    .rounded_2xl()
-                    .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .bg(rgb(theme::SURFACE))
-                    .shadow_lg()
-                    .p_5()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(theme::TEXT))
+                            .child(cfg.heading),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("{prefix}-close")))
+                            .cursor_pointer()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .hover(|h| h.text_color(rgb(theme::TEXT)))
+                            .child("✕")
+                            .on_click(move |ev, window, cx| on_close_header(ev, window, cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(format!(
+                        "Select {}-{} bots to collaborate in this group.",
+                        swarmbot_contracts::MIN_GROUP_MEMBERS,
+                        swarmbot_contracts::MAX_GROUP_MEMBERS
+                    )),
+            )
+            .child(
+                div()
                     .flex()
                     .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(theme::TEXT))
-                                    .child("Create Group Chat"),
-                            )
-                            .child(
-                                div()
-                                    .id("create-group-close")
-                                    .cursor_pointer()
-                                    .text_color(rgb(theme::TEXT_MUTED))
-                                    .hover(|h| h.text_color(rgb(theme::TEXT)))
-                                    .child("✕")
-                                    .on_click(on_close.clone()),
-                            ),
-                    )
-                    .child(self.render_create_tabs(false))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .child(format!(
-                                "Select {}-{} bots to collaborate in this room.",
-                                swarmbot_contracts::MIN_GROUP_MEMBERS,
-                                swarmbot_contracts::MAX_GROUP_MEMBERS
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgb(theme::TEXT_DIM))
-                                    .child("GROUP TITLE"),
-                            )
-                            .child(self.group_title_input.clone()),
-                    )
+                    .gap_1()
                     .child(
                         div()
                             .text_xs()
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(rgb(theme::TEXT_DIM))
-                            .child(format!("SELECT MEMBERS ({count}/6)")),
+                            .child("GROUP TITLE"),
                     )
-                    .child(bot_list)
+                    .child(cfg.title_input.clone()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(theme::TEXT_DIM))
+                    .child(format!(
+                        "SELECT MEMBERS ({count}/{})",
+                        swarmbot_contracts::MAX_GROUP_MEMBERS
+                    )),
+            )
+            .child(bot_list);
+
+        if !cfg.selected_bots.is_empty() {
+            card = card.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(rgb(theme::BORDER))
-                            .child(
-                                div()
-                                    .id("create-group-cancel")
-                                    .px_3()
-                                    .py_1p5()
-                                    .rounded_lg()
-                                    .cursor_pointer()
-                                    .text_sm()
-                                    .text_color(rgb(theme::TEXT_MUTED))
-                                    .hover(|h| h.text_color(rgb(theme::TEXT)))
-                                    .child("Cancel")
-                                    .on_click(on_close),
-                            )
-                            .child(
-                                div()
-                                    .id("create-group-submit")
-                                    .px_4()
-                                    .py_1p5()
-                                    .rounded_lg()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .when(can_create, |d| {
-                                        d.cursor_pointer()
-                                            .bg(rgb(theme::ACCENT))
-                                            .text_color(rgb(theme::BACKGROUND))
-                                            .on_click(on_create)
-                                    })
-                                    .when(!can_create, |d| {
-                                        d.bg(rgb(0xd1d5db)).text_color(rgb(theme::TEXT_DIM))
-                                    })
-                                    .child("Create Group"),
-                            ),
-                    ),
-            )
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(theme::TEXT_DIM))
+                            .child("LEAD BOT"),
+                    )
+                    .child(lead_row),
+            );
+        }
+
+        card = card.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .pt_2()
+                .border_t_1()
+                .border_color(rgb(theme::BORDER))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{prefix}-cancel")))
+                        .px_3()
+                        .py_1p5()
+                        .rounded_lg()
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .hover(|h| h.text_color(rgb(theme::TEXT)))
+                        .child("Cancel")
+                        .on_click(move |ev, window, cx| on_close_cancel(ev, window, cx)),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{prefix}-submit")))
+                        .px_4()
+                        .py_1p5()
+                        .rounded_lg()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .when(can_submit, |d| {
+                            d.cursor_pointer()
+                                .bg(rgb(theme::ACCENT))
+                                .text_color(rgb(theme::BACKGROUND))
+                                .on_click(cfg.on_submit)
+                        })
+                        .when(!can_submit, |d| {
+                            d.bg(rgb(0xd1d5db)).text_color(rgb(theme::TEXT_DIM))
+                        })
+                        .child(cfg.submit_label),
+                ),
+        );
+
+        modal_backdrop(
+            SharedString::from(format!("{prefix}-backdrop")),
+            card,
+            move |ev, window, cx| on_close_backdrop(ev, window, cx),
+        )
     }
 
-    fn render_create_bot(&self, s: &AppState, cx: &App) -> gpui::Div {
+    fn render_create_bot(&self, s: &AppState, cx: &App) -> gpui::Stateful<gpui::Div> {
         let state_close = self.state.clone();
-        let on_close = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+        let composer_close = self.composer.clone();
+        let on_close = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             state_close.update(cx, |st, cx| {
                 st.create_bot_open = false;
                 cx.notify();
             });
+            composer_close.read(cx).focus_input(window, cx);
         };
 
         let state_create = self.state.clone();
         let commands = self.commands.clone();
+        let composer_create = self.composer.clone();
         let handle_input = self.bot_handle_input.clone();
         let label_input = self.bot_label_input.clone();
         let instructions_input = self.bot_instructions_input.clone();
@@ -885,25 +1229,16 @@ impl Root {
             .cloned()
             .unwrap_or_else(|| "opencode".to_string());
 
-        let live_handle = {
-            let typed = normalize_bot_handle(handle_input.read(cx).content());
-            if typed.is_empty() {
-                normalize_bot_handle(label_input.read(cx).content())
-            } else {
-                typed
-            }
-        };
+        let live_handle = resolve_bot_handle(
+            handle_input.read(cx).content(),
+            label_input.read(cx).content(),
+        );
         let can_create = !live_handle.is_empty();
 
         let chosen_backend = selected_backend.clone();
-        let on_create = move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-            let handle_typed = normalize_bot_handle(handle_input.read(cx).content());
+        let on_create = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             let label_raw = label_input.read(cx).content().trim().to_string();
-            let handle = if handle_typed.is_empty() {
-                normalize_bot_handle(&label_raw)
-            } else {
-                handle_typed
-            };
+            let handle = resolve_bot_handle(handle_input.read(cx).content(), &label_raw);
             let instructions = instructions_input.read(cx).content().trim().to_string();
 
             if handle.is_empty() {
@@ -933,6 +1268,7 @@ impl Root {
                 st.create_bot_open = false;
                 cx.notify();
             });
+            composer_create.read(cx).focus_input(window, cx);
         };
 
         let mut backend_row = div()
@@ -989,148 +1325,137 @@ impl Root {
             }
         }
 
-        div()
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .w_full()
-            .h_full()
+        let card = div()
+            .id("create-bot-card")
+            .occlude()
+            .w(px(460.0))
+            .rounded_2xl()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb(theme::SURFACE))
+            .shadow_lg()
+            .p_5()
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::Rgba {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.5,
+            .flex_col()
+            .gap_3p5()
+            .on_click(|_, _, cx| {
+                cx.stop_propagation();
             })
             .child(
                 div()
-                    .w(px(460.0))
-                    .rounded_2xl()
-                    .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .bg(rgb(theme::SURFACE))
-                    .shadow_lg()
-                    .p_5()
                     .flex()
-                    .flex_col()
-                    .gap_3p5()
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(theme::TEXT))
-                                    .child("Add Bot to Team"),
-                            )
-                            .child(
-                                div()
-                                    .id("create-bot-close")
-                                    .cursor_pointer()
-                                    .text_color(rgb(theme::TEXT_MUTED))
-                                    .hover(|h| h.text_color(rgb(theme::TEXT)))
-                                    .child("✕")
-                                    .on_click(on_close.clone()),
-                            ),
+                            .text_base()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(theme::TEXT))
+                            .child("Add Bot"),
                     )
-                    .child(self.render_create_tabs(true))
+                    .child(
+                        div()
+                            .id("create-bot-close")
+                            .cursor_pointer()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .hover(|h| h.text_color(rgb(theme::TEXT)))
+                            .child("✕")
+                            .on_click(on_close.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child("Configure a new autonomous bot with its own workspace."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .child("Configure a new autonomous teammate for your workspace."),
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(theme::TEXT_DIM))
+                            .child("BOT HANDLE (@NAME, OPTIONAL)"),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgb(theme::TEXT_DIM))
-                                    .child("BOT HANDLE (@NAME, OPTIONAL)"),
-                            )
-                            .child(self.bot_handle_input.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgb(theme::TEXT_DIM))
-                                    .child("DISPLAY NAME"),
-                            )
-                            .child(self.bot_label_input.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgb(theme::TEXT_DIM))
-                                    .child("SYSTEM PROMPT / ROLE"),
-                            )
-                            .child(self.bot_instructions_input.clone()),
-                    )
-                    .child(backend_row)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap_2()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(rgb(theme::BORDER))
-                            .child(
-                                div()
-                                    .id("create-bot-cancel")
-                                    .px_3()
-                                    .py_1p5()
-                                    .rounded_lg()
-                                    .cursor_pointer()
-                                    .text_sm()
-                                    .text_color(rgb(theme::TEXT_MUTED))
-                                    .hover(|h| h.text_color(rgb(theme::TEXT)))
-                                    .child("Cancel")
-                                    .on_click(on_close),
-                            )
-                            .child(
-                                div()
-                                    .id("create-bot-submit")
-                                    .px_4()
-                                    .py_1p5()
-                                    .rounded_lg()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .when(can_create, |d| {
-                                        d.cursor_pointer()
-                                            .bg(rgb(theme::ACCENT))
-                                            .text_color(rgb(theme::BACKGROUND))
-                                            .on_click(on_create)
-                                    })
-                                    .when(!can_create, |d| {
-                                        d.bg(rgb(0xd1d5db)).text_color(rgb(theme::TEXT_DIM))
-                                    })
-                                    .child("Add Bot"),
-                            ),
-                    ),
+                    .child(self.bot_handle_input.clone()),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(theme::TEXT_DIM))
+                            .child("DISPLAY NAME"),
+                    )
+                    .child(self.bot_label_input.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(theme::TEXT_DIM))
+                            .child("SYSTEM PROMPT / ROLE"),
+                    )
+                    .child(self.bot_instructions_input.clone()),
+            )
+            .child(backend_row)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(
+                        div()
+                            .id("create-bot-cancel")
+                            .px_3()
+                            .py_1p5()
+                            .rounded_lg()
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .hover(|h| h.text_color(rgb(theme::TEXT)))
+                            .child("Cancel")
+                            .on_click(on_close.clone()),
+                    )
+                    .child(
+                        div()
+                            .id("create-bot-submit")
+                            .px_4()
+                            .py_1p5()
+                            .rounded_lg()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .when(can_create, |d| {
+                                d.cursor_pointer()
+                                    .bg(rgb(theme::ACCENT))
+                                    .text_color(rgb(theme::BACKGROUND))
+                                    .on_click(on_create)
+                            })
+                            .when(!can_create, |d| {
+                                d.bg(rgb(0xd1d5db)).text_color(rgb(theme::TEXT_DIM))
+                            })
+                            .child("Add Bot"),
+                    ),
+            );
+
+        modal_backdrop("create-bot-backdrop", card, on_close)
     }
 
     fn render_confirm_delete(&self, s: &AppState) -> gpui::Div {
@@ -1332,11 +1657,17 @@ impl Render for Root {
         if s.needs_login {
             root = root.child(self.render_login(s, cx.listener(Self::on_submit_login)));
         }
+        if s.plus_menu_open {
+            root = root.child(self.render_plus_menu(s));
+        }
         if s.palette_open {
             root = root.child(self.render_palette_overlay());
         }
         if s.create_group_open {
             root = root.child(self.render_create_group(s));
+        }
+        if s.edit_group_id.is_some() {
+            root = root.child(self.render_edit_group(s));
         }
         if s.create_bot_open {
             root = root.child(self.render_create_bot(s, cx));
@@ -1345,6 +1676,119 @@ impl Render for Root {
             root = root.child(self.render_confirm_delete(s));
         }
         root
+    }
+}
+
+type GroupBotCallback = Box<dyn Fn(BotId, &mut AppState)>;
+type ModalClickCallback = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+
+struct GroupModalConfig<'a> {
+    id_prefix: &'static str,
+    heading: &'static str,
+    submit_label: &'static str,
+    title_input: &'a Entity<TextInput>,
+    selected_bots: &'a [BotId],
+    active_lead: Option<&'a BotId>,
+    on_toggle_member: GroupBotCallback,
+    on_pick_lead: GroupBotCallback,
+    on_close: ModalClickCallback,
+    on_submit: ModalClickCallback,
+}
+
+/// Wrap a modal card in an occluding dimmed backdrop that closes on outside click.
+fn modal_backdrop(
+    backdrop_id: impl Into<gpui::ElementId>,
+    card: impl IntoElement,
+    on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(backdrop_id)
+        .occlude()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::Rgba {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.5,
+        })
+        .on_click(on_close)
+        .child(card)
+}
+
+fn plus_menu_item(
+    id: &str,
+    icon: &str,
+    icon_bg: u32,
+    icon_fg: u32,
+    title: &str,
+    subtitle: &str,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(SharedString::from(id.to_string()))
+        .flex()
+        .items_center()
+        .gap_2p5()
+        .px_2p5()
+        .py_2()
+        .rounded_lg()
+        .cursor_pointer()
+        .hover(|h| h.bg(rgb(theme::SURFACE_RAISED)))
+        .on_click(move |_, window, cx: &mut App| {
+            cx.stop_propagation();
+            on_click(window, cx);
+        })
+        .child(
+            div()
+                .size(px(28.0))
+                .flex_none()
+                .rounded_lg()
+                .bg(rgb(icon_bg))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(icon_fg))
+                .child(icon.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(theme::TEXT))
+                        .child(title.to_string()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .truncate()
+                        .child(subtitle.to_string()),
+                ),
+        )
+}
+
+/// Resolve the canonical bot `@handle` from an explicit handle field or fall
+/// back to the normalized display name when the handle field is left blank.
+fn resolve_bot_handle(handle_raw: &str, label_raw: &str) -> String {
+    let typed = normalize_bot_handle(handle_raw);
+    if typed.is_empty() {
+        normalize_bot_handle(label_raw)
+    } else {
+        typed
     }
 }
 
@@ -1432,4 +1876,19 @@ fn render_top_bar(
                 .id("toggle-palette")
                 .on_click(on_palette),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_bot_handle;
+
+    #[test]
+    fn resolve_bot_handle_prefers_explicit_handle_or_falls_back_to_display_name() {
+        assert_eq!(
+            resolve_bot_handle("@CodeReviewer", "Display"),
+            "codereviewer"
+        );
+        assert_eq!(resolve_bot_handle("  ", "Code Reviewer"), "code-reviewer");
+        assert_eq!(resolve_bot_handle("   ", "   "), "");
+    }
 }

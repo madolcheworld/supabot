@@ -91,6 +91,12 @@ pub enum Command {
         members: Vec<BotId>,
         lead: Option<BotId>,
     },
+    UpdateGroup {
+        id: ConversationId,
+        title: Option<String>,
+        members: Option<Vec<BotId>>,
+        lead: Option<BotId>,
+    },
     CreateBot(NewBotRequest),
     DeleteBot(BotId),
     DeleteGroup(ConversationId),
@@ -172,6 +178,7 @@ pub enum CommandResult {
     CancelTask(Result<Task, ClientError>),
     TaskDetail(Result<TaskDetail, ClientError>),
     CreateGroup(Result<Conversation, ClientError>),
+    GroupUpdated(Result<Conversation, ClientError>),
     CreateBot(Result<Bot, ClientError>),
     DeleteBot {
         bot: BotId,

@@ -30,6 +30,7 @@
 //! exists and answers `--version` — enough for the Settings screen to show
 //! "claude CLI installed / not found" before the adapter itself exists.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -64,8 +65,13 @@ pub struct ClaudeCli {
     /// the brain writes it, pointing the harness at our MCP servers.
     mcp_config_path: PathBuf,
     /// Most recent native session id returned by the CLI (`subtype: "init"` or
-    /// `"result"`), used to resume multi-turn conversations via `--resume`.
+    /// `"result"`), used to resume multi-turn conversations via `--resume`
+    /// when `request.cwd` is unset.
     last_session_id: Arc<Mutex<Option<String>>>,
+    /// Per-workspace native session ids so bots with distinct `request.cwd`
+    /// directories sharing one `ClaudeCli` backend never resume each other's
+    /// sessions.
+    sessions_by_cwd: Arc<Mutex<HashMap<PathBuf, String>>>,
 }
 
 impl ClaudeCli {
@@ -93,6 +99,7 @@ impl ClaudeCli {
             config_dir,
             mcp_config_path,
             last_session_id: Arc::new(Mutex::new(None)),
+            sessions_by_cwd: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -213,13 +220,28 @@ impl LlmBackend for ClaudeCli {
         events: mpsc::Sender<LlmEvent>,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, LlmError> {
-        let resume_id = request
+        let explicit_session = request
             .extra_body
             .get("native_session_id")
-            .or_else(|| request.extra_body.get("session_id"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| self.last_session_id());
+            .or_else(|| request.extra_body.get("session_id"));
+        let resume_id = match explicit_session {
+            // Explicit string resumes that session; explicit null/empty
+            // requests a fresh session without falling back to shared state.
+            Some(val) => val
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            None => match &request.cwd {
+                Some(cwd) => self
+                    .sessions_by_cwd
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(cwd)
+                    .cloned(),
+                None => self.last_session_id(),
+            },
+        };
 
         let mut cmd = tokio::process::Command::new(&self.binary);
         cmd.arg("-p")
@@ -265,7 +287,9 @@ impl LlmBackend for ClaudeCli {
             cmd.arg("--permission-mode").arg(mode);
         }
 
-        if let Some(cwd) = self.spec.option_str("cwd") {
+        if let Some(ref cwd) = request.cwd {
+            cmd.current_dir(cwd);
+        } else if let Some(cwd) = self.spec.option_str("cwd") {
             cmd.current_dir(cwd);
         }
 
@@ -522,7 +546,14 @@ impl LlmBackend for ClaudeCli {
         }
 
         if let Some(ref sid) = current_session_id {
-            self.set_last_session_id(Some(sid.clone()));
+            if let Some(ref cwd) = request.cwd {
+                self.sessions_by_cwd
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cwd.clone(), sid.clone());
+            } else {
+                self.set_last_session_id(Some(sid.clone()));
+            }
         }
 
         let _ = emit(
@@ -958,5 +989,90 @@ sleep 10
         spec.kind = BackendKind::OpenAiCompat;
         let error = ClaudeCli::from_spec(spec).expect_err("wrong kind");
         assert!(matches!(error, LlmError::Unavailable { .. }));
+    }
+
+    #[tokio::test]
+    async fn chat_isolates_sessions_per_request_cwd_and_respects_explicit_null() {
+        let temp = TempDir::new("cwd-iso");
+        let ws_a = temp.path().join("bot-a");
+        let ws_b = temp.path().join("bot-b");
+        fs::create_dir_all(&ws_a).expect("ws_a");
+        fs::create_dir_all(&ws_b).expect("ws_b");
+        let log_file = temp.path().join("invocations.log");
+        let script = temp.path().join("mock_iso.sh");
+        let log_str = log_file.display().to_string();
+
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+echo "CWD=$PWD ARGS=$*" >> "{log_str}"
+SID="sid-$(basename "$PWD")"
+cat << EOF
+{{"type":"system","subtype":"init","session_id":"$SID"}}
+{{"type":"result","result":"ok","session_id":"$SID","usage":{{"input_tokens":1,"output_tokens":1}},"is_error":false}}
+EOF
+"#
+            ),
+        )
+        .expect("write script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let mut options = serde_json::Map::new();
+        options.insert("binary".into(), json!(script.display().to_string()));
+        let harness = ClaudeCli::from_spec(spec_with_options(options)).expect("valid spec");
+        harness.set_last_session_id(Some("global-leak-id".into()));
+
+        // Turn 1 for bot-a: must NOT resume global-leak-id.
+        let mut req_a1 = ChatRequest::new("claude-sonnet", "");
+        req_a1.cwd = Some(ws_a.clone());
+        let (tx, _rx) = mpsc::channel(4);
+        harness
+            .chat(req_a1, tx, CancellationToken::new())
+            .await
+            .expect("a1");
+
+        // Turn 1 for bot-b: must NOT resume bot-a's sid-bot-a or global-leak-id.
+        let mut req_b1 = ChatRequest::new("claude-sonnet", "");
+        req_b1.cwd = Some(ws_b.clone());
+        let (tx, _rx) = mpsc::channel(4);
+        harness
+            .chat(req_b1, tx, CancellationToken::new())
+            .await
+            .expect("b1");
+
+        // Turn 2 for bot-a: resumes bot-a's own sid-bot-a.
+        let mut req_a2 = ChatRequest::new("claude-sonnet", "");
+        req_a2.cwd = Some(ws_a.clone());
+        let (tx, _rx) = mpsc::channel(4);
+        harness
+            .chat(req_a2, tx, CancellationToken::new())
+            .await
+            .expect("a2");
+
+        // Turn 3 for bot-a with explicit native_session_id: null forces fresh session.
+        let mut req_a3 = ChatRequest::new("claude-sonnet", "");
+        req_a3.cwd = Some(ws_a.clone());
+        req_a3
+            .extra_body
+            .insert("native_session_id".into(), Value::Null);
+        let (tx, _rx) = mpsc::channel(4);
+        harness
+            .chat(req_a3, tx, CancellationToken::new())
+            .await
+            .expect("a3");
+
+        let logged = fs::read_to_string(&log_file).expect("read log");
+        let lines: Vec<&str> = logged.lines().collect();
+        assert_eq!(lines.len(), 4, "{logged}");
+        assert!(!lines[0].contains("--resume"), "a1: {}", lines[0]);
+        assert!(!lines[1].contains("--resume"), "b1: {}", lines[1]);
+        assert!(lines[2].contains("--resume sid-bot-a"), "a2: {}", lines[2]);
+        assert!(!lines[3].contains("--resume"), "a3: {}", lines[3]);
     }
 }

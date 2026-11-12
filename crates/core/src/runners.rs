@@ -29,16 +29,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use swarmbot_contracts::bot::{Bot, BotStatus};
-use swarmbot_contracts::config::Settings;
+use swarmbot_contracts::config::{BackendKind, Settings};
 use swarmbot_contracts::conversation::{Conversation, ConversationKind};
 use swarmbot_contracts::delivery::{Delivery, DeliveryKind, Urgency};
 use swarmbot_contracts::entry::{Author, Entry, EntryKind, NoticeLevel, PostState, ToolCallStatus};
 use swarmbot_contracts::error::DomainError;
-use swarmbot_contracts::id::{BotId, ConversationId, TaskId, ToolCallId, TurnId};
+use swarmbot_contracts::id::{BotId, ConversationId, EntryId, TaskId, ToolCallId, TurnId};
 use swarmbot_contracts::node::{NodeInfo, PolicyMap};
 use swarmbot_contracts::repo::{Persistence, ToolCallRecord};
 use swarmbot_contracts::task::Task;
-use swarmbot_contracts::tool::{Invocation, ToolCallRequest, ToolResult};
+use swarmbot_contracts::tool::{Invocation, ToolCallRequest, ToolResult, ToolSpec, Toolset};
 use swarmbot_contracts::turn::{Turn, TurnInitiator, TurnStatus};
 use swarmbot_llm::{
     ChatMessage, ChatRequest, ChatResponse, FinishReason, LlmBackend, LlmEvent, Role,
@@ -48,9 +48,10 @@ use swarmbot_tools::{ApprovalGate, NodeExecutor, ToolContext, ToolRegistry};
 use crate::backends::BackendSet;
 use crate::bus::{Change, LiveHub};
 use crate::instructions::{InstructionRenderer, RenderOptions};
-use crate::router::{GroupRouter, is_no_reply};
+use crate::router::{GroupRouter, RouteReason, is_no_reply};
 use crate::session::{Session, origin_tag};
 use crate::settings::SettingsHandle;
+use crate::swarm::{McpProviderSlot, McpTurnRegistration, McpTurnRequest};
 use crate::transcript::Transcript;
 
 /// How often a streaming reply is written to the transcript. Every delta would
@@ -322,9 +323,11 @@ pub struct RunnerEnv {
     /// Where each bot's files live: `<root>/<bot name>`.
     pub workspaces_root: PathBuf,
     pub hooks: Arc<dyn RunnerHooks>,
+    pub mcp_provider: McpProviderSlot,
 }
 
-/// The two things a runner cannot do alone: wake other bots, and settle tasks.
+/// The things a runner cannot do alone: wake other bots, settle tasks, and
+/// coordinate DM reply forwarding across turns.
 pub trait RunnerHooks: Send + Sync {
     /// A reply mentioned teammates in a group: wake each of them once.
     fn wake_mentioned(
@@ -339,6 +342,23 @@ pub trait RunnerHooks: Send + Sync {
 
     /// A task's turn ended: mark the task and deliver its result.
     fn settle_task(&self, task_id: &TaskId, result: &str, failed: bool);
+
+    /// Take and clear targets explicitly messaged or handed off during `turn_id`.
+    fn take_turn_targets(&self, _turn_id: &TurnId) -> HashSet<BotId> {
+        HashSet::new()
+    }
+
+    /// Forward a DM reply back to the teammate that sent a `BotMessage`.
+    fn forward_dm_reply(
+        &self,
+        _conversation: &Conversation,
+        _from: &Bot,
+        _to: &BotId,
+        _text: &str,
+        _source_entry: Option<EntryId>,
+        _hops: u8,
+    ) {
+    }
 }
 
 /// No hooks, for tests that only care about one bot.
@@ -459,6 +479,13 @@ impl BotRunner {
                 }
             };
 
+            {
+                let mut leftover = steer.lock().unwrap_or_else(|e| e.into_inner());
+                while let Some(delivery) = leftover.pop_front() {
+                    self.queue.push_back(delivery);
+                }
+            }
+            self.publish_queued();
             self.after_turn(outcome);
             if self.cancel.is_cancelled() {
                 break;
@@ -682,6 +709,7 @@ async fn run_turn(
         let _ = store.update_delivery(&record);
     }
 
+    let mut consumed_steers = Vec::new();
     let executed = execute_turn(
         &bot_id,
         &env,
@@ -692,6 +720,7 @@ async fn run_turn(
         &mut turn,
         &turn_cancel,
         &steer,
+        &mut consumed_steers,
         &settings,
     )
     .await;
@@ -743,7 +772,7 @@ async fn run_turn(
     store.update_turn(&finished_turn)?;
     env.hub.publish(Change::Turn(finished_turn));
 
-    for delivery in &deliveries {
+    for delivery in deliveries.iter().chain(consumed_steers.iter()) {
         let mut record = delivery.clone();
         record.mark_done(chrono::Utc::now());
         let _ = store.update_delivery(&record);
@@ -766,6 +795,7 @@ async fn run_turn(
     state.busy.store(false, Ordering::SeqCst);
     *state.conversation.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *state.turn_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let _ = env.hooks.take_turn_targets(&turn.id);
 
     outcome
 }
@@ -781,6 +811,7 @@ async fn execute_turn(
     turn: &mut Turn,
     turn_cancel: &CancellationToken,
     steer: &Arc<Mutex<VecDeque<Delivery>>>,
+    consumed_steers: &mut Vec<Delivery>,
     settings: &Settings,
 ) -> Result<TurnOutcome, DomainError> {
     let store = Arc::clone(&env.store);
@@ -792,10 +823,19 @@ async fn execute_turn(
     let node = store
         .get_node(&bot.host_node())?
         .unwrap_or_else(|| NodeInfo::local("this machine", Vec::new(), PolicyMap::default()));
+    let backend: Arc<dyn LlmBackend> = env.backends.backend(&bot.backend)?;
+    let spec = env.backends.spec(&bot.backend);
     let in_task = task.is_some();
+
+    let mut effective_toolsets = bot.toolsets.clone();
+    if backend.kind() == BackendKind::Acp {
+        // ACP runs fs/shell tools inside its own sandboxed harness per D2.5,
+        // while keeping SwarmBot's Bot/Task toolsets scoped through MCP.
+        effective_toolsets.retain(|toolset| *toolset != Toolset::Node);
+    }
     let visible = env
         .tools
-        .visible_specs(&bot.toolsets, Some(&node.capabilities()), in_task);
+        .visible_specs(&effective_toolsets, Some(&node.capabilities()), in_task);
 
     let previous_elsewhere = session
         .last_conversation()
@@ -814,6 +854,35 @@ async fn execute_turn(
 
     let memory_content = read_bot_memory(&workspace);
     let workspace_abs = std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
+
+    let mcp_registration: Option<McpTurnRegistration> = if backend.kind().owns_tool_loop() {
+        let provider = env
+            .mcp_provider
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match provider {
+            Some(provider) => Some(provider.register_turn(McpTurnRequest {
+                bot_id: bot_id.clone(),
+                conversation_id: conversation.id.clone(),
+                turn_id: turn.id.clone(),
+                task_id: task.map(|t| t.id.clone()),
+                workspace: workspace_abs.clone(),
+                spool_dir: spool_dir.clone(),
+                toolsets: effective_toolsets.clone(),
+                node_caps: Some(node.capabilities()),
+                in_task,
+            })?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let mcp_servers = mcp_registration
+        .as_ref()
+        .map(|reg| reg.servers.clone())
+        .unwrap_or_default();
+
     let placement = if node.id.is_local() {
         format!(
             "node `{}` (local); private workspace: `{}`",
@@ -824,19 +893,22 @@ async fn execute_turn(
         format!("node `{}` (remote)", node.label)
     };
     let chat_cwd = node.id.is_local().then_some(workspace_abs);
+    let prompt_tools: &[ToolSpec] = if !backend.kind().owns_tool_loop() || !mcp_servers.is_empty() {
+        &visible
+    } else {
+        &[]
+    };
     let instructions = env.instructions.render(
         bot,
         RenderOptions {
             task,
-            tools: &visible,
+            tools: prompt_tools,
             memory_index: memory_content.as_deref(),
             placement: Some(&placement),
             messaging_enabled: settings.bot_messaging,
         },
     )?;
 
-    let backend: Arc<dyn LlmBackend> = env.backends.backend(&bot.backend)?;
-    let spec = env.backends.spec(&bot.backend);
     let model = bot
         .model
         .clone()
@@ -846,6 +918,18 @@ async fn execute_turn(
         .and_then(|s| s.options.get("context_window"))
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+
+    let dm_addressed_to = if conversation.is_direct() {
+        deliveries.iter().find_map(|d| {
+            if d.kind == DeliveryKind::BotMessage {
+                d.from_bot.clone()
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
 
     let mut rounds = 0u32;
     let mut outcome = TurnOutcome::default();
@@ -865,16 +949,12 @@ async fn execute_turn(
         }
 
         // Steers join the running turn between model rounds. A task session has
-        // one piece of work and is never steered.
+        // one piece of work and is never steered. Steers targeting other
+        // conversations stay queued.
         if !in_task {
-            let drained: Vec<Delivery> = steer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .drain(..)
-                .filter(|d| d.conversation_id == conversation.id)
-                .collect();
-            for delivery in drained {
+            for delivery in drain_matching_steers(steer, &conversation.id) {
                 session.push_user(format!("[Added while you were working] {}", delivery.text));
+                consumed_steers.push(delivery);
             }
         }
 
@@ -882,7 +962,12 @@ async fn execute_turn(
             model: model.clone(),
             instructions: instructions.clone(),
             messages: session.messages().to_vec(),
-            tools: visible.clone(),
+            tools: if backend.kind().owns_tool_loop() {
+                Vec::new()
+            } else {
+                visible.clone()
+            },
+            mcp_servers: mcp_servers.clone(),
             max_tokens: None,
             temperature: None,
             extra_body: spec.map(|s| s.extra_body.clone()).unwrap_or_default(),
@@ -925,15 +1010,36 @@ async fn execute_turn(
             streamed,
             &response.text,
             turn.id.clone(),
+            dm_addressed_to.clone(),
         )?;
 
         if response.tool_calls.is_empty() {
+            if !response.text.is_empty() && !outcome.silent {
+                session.push(ChatMessage {
+                    role: Role::Assistant,
+                    content: response.text.clone(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
             if matches!(response.finish_reason, FinishReason::Length) {
                 let _ = env.transcript.notice(
                     &conversation.id,
                     "The answer was cut off by the model's output limit.",
                     NoticeLevel::Warning,
                 );
+            }
+            if !in_task && !turn_cancel.is_cancelled() && rounds < settings.max_tool_rounds {
+                let mid_steers = drain_matching_steers(steer, &conversation.id);
+                if !mid_steers.is_empty() {
+                    for delivery in mid_steers {
+                        session
+                            .push_user(format!("[Added while you were working] {}", delivery.text));
+                        consumed_steers.push(delivery);
+                    }
+                    continue;
+                }
             }
             break;
         }
@@ -981,22 +1087,27 @@ async fn execute_turn(
         }
     }
 
-    // Wake the teammates a group reply mentioned, once each.
+    drop(mcp_registration);
+    let messaged_targets = env.hooks.take_turn_targets(&turn.id);
+
+    // Wake the teammates a group reply mentioned, or forward a DM reply back
+    // to a teammate that asked via `message_bot` when the bot only spoke text.
     if !outcome.text.is_empty() && !outcome.silent {
         if let ConversationKind::Group { members, .. } = &conversation.kind {
             let member_bots: Vec<Bot> = members
                 .iter()
                 .filter_map(|id| store.get_bot(id).ok().flatten())
                 .collect();
-            let already: Vec<BotId> = deliveries
-                .iter()
-                .filter_map(|d| d.from_bot.clone())
-                .collect::<HashSet<BotId>>()
-                .into_iter()
-                .collect();
+            let already = already_addressed_in_group(
+                store.as_ref(),
+                bot_id,
+                &member_bots,
+                conversation,
+                deliveries,
+            );
             let woken = GroupRouter::wake_from_reply(&member_bots, &outcome.text, &already);
             if !woken.is_empty() {
-                let hops = deliveries.first().map(|d| d.causal.hops).unwrap_or(0);
+                let hops = deliveries.iter().map(|d| d.causal.hops).max().unwrap_or(0);
                 env.hooks.wake_mentioned(
                     conversation,
                     bot,
@@ -1004,6 +1115,57 @@ async fn execute_turn(
                     outcome.reply.as_ref(),
                     hops,
                     woken,
+                );
+            }
+        } else if matches!(conversation.kind, ConversationKind::Direct { .. })
+            && !in_task
+            && !turn_cancel.is_cancelled()
+        {
+            let mut forwarded_to: HashSet<BotId> = HashSet::new();
+            for delivery in deliveries.iter().chain(consumed_steers.iter()) {
+                if delivery.kind != DeliveryKind::BotMessage {
+                    continue;
+                }
+                let Some(sender_id) = delivery.from_bot.as_ref() else {
+                    continue;
+                };
+                if sender_id == bot_id
+                    || messaged_targets.contains(sender_id)
+                    || !forwarded_to.insert(sender_id.clone())
+                {
+                    continue;
+                }
+                let Some(sender_bot) = store.get_bot(sender_id)? else {
+                    continue;
+                };
+                // Forward back only when the DM reply explicitly addresses the
+                // teammate (e.g. `@name`, `name:`, `name,`, or greeting). Plain
+                // acknowledgements or third-person mentions stay local so turns
+                // do not ping-pong.
+                let addressed = GroupRouter::wake_from_reply(
+                    std::slice::from_ref(&sender_bot),
+                    &outcome.text,
+                    std::slice::from_ref(bot_id),
+                );
+                if addressed.is_empty() {
+                    continue;
+                }
+                let hops = deliveries
+                    .iter()
+                    .chain(consumed_steers.iter())
+                    .filter(|d| {
+                        d.kind == DeliveryKind::BotMessage && d.from_bot.as_ref() == Some(sender_id)
+                    })
+                    .map(|d| d.causal.hops)
+                    .max()
+                    .unwrap_or(delivery.causal.hops);
+                env.hooks.forward_dm_reply(
+                    conversation,
+                    bot,
+                    sender_id,
+                    &outcome.text,
+                    outcome.reply.as_ref().map(|e| e.id.clone()),
+                    hops,
                 );
             }
         }
@@ -1175,13 +1337,25 @@ fn render_turn_text(
         let unseen = env
             .transcript
             .since(&conversation.id, seen, CATCH_UP_LIMIT)?;
+        let delivery_source_ids: HashSet<EntryId> = deliveries
+            .iter()
+            .filter_map(|d| d.source_entry_id.clone())
+            .collect();
         let mut lines = Vec::new();
         let mut bytes = 0usize;
-        for entry in unseen.iter().rev() {
+        let mut last_processed_seq = seen;
+        let mut truncated = false;
+        for entry in &unseen {
+            if delivery_source_ids.contains(&entry.id) {
+                last_processed_seq = last_processed_seq.max(entry.seq);
+                continue;
+            }
             let Some(message) = entry.as_message() else {
+                last_processed_seq = last_processed_seq.max(entry.seq);
                 continue;
             };
             if entry.author.bot_id() == Some(&bot.id) {
+                last_processed_seq = last_processed_seq.max(entry.seq);
                 continue; // never its own words
             }
             let author = match &entry.author {
@@ -1191,49 +1365,65 @@ fn render_turn_text(
                     .get_bot(id)?
                     .map(|b| format!("@{}", b.name))
                     .unwrap_or_else(|| "@unknown".to_string()),
-                Author::System => continue,
+                Author::System => {
+                    last_processed_seq = last_processed_seq.max(entry.seq);
+                    continue;
+                }
             };
             let line = format!("[{author}]: {}", message.text);
-            bytes += line.len();
-            if bytes > CATCH_UP_BYTES {
+            if !lines.is_empty() && bytes + line.len() > CATCH_UP_BYTES {
+                truncated = true;
                 break;
             }
+            bytes += line.len();
+            last_processed_seq = last_processed_seq.max(entry.seq);
             lines.push(line);
         }
-        lines.reverse();
         if !lines.is_empty() {
             parts.push(format!(
                 "[Messages in this group you have not seen]\n{}",
                 lines.join("\n")
             ));
         }
-        if let Some(last) = unseen.last() {
-            session.mark_seen(&conversation.id, last.seq);
+        if last_processed_seq > seen {
+            session.mark_seen(&conversation.id, last_processed_seq);
         }
         // A delivery's own entry is already in the transcript; mark the batch
-        // seen so the next turn does not repeat it.
-        for delivery in deliveries {
-            if let Some(entry_id) = &delivery.source_entry_id
-                && let Ok(Some(entry)) = env.store.get_entry(entry_id)
-            {
-                session.mark_seen(&conversation.id, entry.seq);
+        // seen only when catch-up fit completely so older unseen entries are
+        // never leaped past.
+        if !truncated {
+            for delivery in deliveries {
+                if let Some(entry_id) = &delivery.source_entry_id
+                    && let Ok(Some(entry)) = env.store.get_entry(entry_id)
+                {
+                    session.mark_seen(&conversation.id, entry.seq);
+                }
             }
         }
     }
 
+    let is_group = conversation.kind.is_group();
     for (index, delivery) in deliveries.iter().enumerate() {
-        let prefix = match (&delivery.kind, &delivery.from_bot) {
-            (DeliveryKind::OwnerMessage, _) => String::new(),
-            (DeliveryKind::BotMessage, Some(_)) => match &from_bot_name {
+        let sender_name = match &delivery.from_bot {
+            Some(id) => env.store.get_bot(id)?.map(|b| b.name),
+            None => None,
+        };
+        let prefix = match (&delivery.kind, &delivery.from_bot, is_group) {
+            (DeliveryKind::OwnerMessage, _, _) => String::new(),
+            (DeliveryKind::BotMessage, Some(_), true) => match &sender_name {
+                Some(name) => format!("[Message from @{name}] "),
+                None => "[Message from a teammate] ".to_string(),
+            },
+            (DeliveryKind::BotMessage, Some(_), false) => match &sender_name {
                 Some(name) => format!("[Direct message from @{name}] "),
                 None => "[Direct message from a teammate] ".to_string(),
             },
-            (DeliveryKind::Task, _) => String::new(),
-            (DeliveryKind::TaskResult, _) => String::new(),
-            (DeliveryKind::AsyncAnswer, _) => "[An answer to what you asked] ".to_string(),
-            (DeliveryKind::Routine, _) => "[Routine run] ".to_string(),
-            (DeliveryKind::SystemResume, _) => "[System] ".to_string(),
-            (DeliveryKind::BotMessage, None) => String::new(),
+            (DeliveryKind::Task, _, _) => String::new(),
+            (DeliveryKind::TaskResult, _, _) => String::new(),
+            (DeliveryKind::AsyncAnswer, _, _) => "[An answer to what you asked] ".to_string(),
+            (DeliveryKind::Routine, _, _) => "[Routine run] ".to_string(),
+            (DeliveryKind::SystemResume, _, _) => "[System] ".to_string(),
+            (DeliveryKind::BotMessage, None, _) => String::new(),
         };
         // The first delivery reads as the request itself; anything batched
         // behind it is a list item.
@@ -1247,6 +1437,69 @@ fn render_turn_text(
     Ok(parts.join("\n\n"))
 }
 
+fn drain_matching_steers(
+    steer: &Arc<Mutex<VecDeque<Delivery>>>,
+    conversation_id: &ConversationId,
+) -> Vec<Delivery> {
+    let mut pending = steer.lock().unwrap_or_else(|e| e.into_inner());
+    let mut kept = VecDeque::with_capacity(pending.len());
+    let mut matching = Vec::new();
+    while let Some(delivery) = pending.pop_front() {
+        if &delivery.conversation_id == conversation_id {
+            matching.push(delivery);
+        } else {
+            kept.push_back(delivery);
+        }
+    }
+    *pending = kept;
+    matching
+}
+
+fn already_addressed_in_group(
+    store: &dyn Persistence,
+    self_bot_id: &BotId,
+    member_bots: &[Bot],
+    conversation: &Conversation,
+    deliveries: &[Delivery],
+) -> Vec<BotId> {
+    let mut excluded: HashSet<BotId> = HashSet::new();
+    excluded.insert(self_bot_id.clone());
+    let lead = match &conversation.kind {
+        ConversationKind::Group { lead, .. } => lead,
+        ConversationKind::Direct { .. } => return excluded.into_iter().collect(),
+    };
+    for delivery in deliveries {
+        let Some(entry_id) = &delivery.source_entry_id else {
+            continue;
+        };
+        let Ok(Some(entry)) = store.get_entry(entry_id) else {
+            continue;
+        };
+        let Some(message) = entry.as_message() else {
+            continue;
+        };
+        if let Some(target) = &message.addressed_to
+            && target != self_bot_id
+        {
+            excluded.insert(target.clone());
+        }
+        if entry.author.is_owner() {
+            let decision = GroupRouter::route(member_bots, &message.text, &[], None, lead);
+            if matches!(
+                decision.reason,
+                RouteReason::Mention | RouteReason::Everyone | RouteReason::Addressed
+            ) {
+                for target in decision.targets {
+                    if target != *self_bot_id {
+                        excluded.insert(target);
+                    }
+                }
+            }
+        }
+    }
+    excluded.into_iter().collect()
+}
+
 /// Turn the streamed entry into the final reply, or drop it when the answer was
 /// `NO_REPLY` or empty.
 fn finalize_reply(
@@ -1256,6 +1509,7 @@ fn finalize_reply(
     streamed: StreamedEntries,
     text: &str,
     turn_id: TurnId,
+    addressed_to: Option<BotId>,
 ) -> Result<Option<Entry>, DomainError> {
     if text.trim().is_empty() || is_no_reply(text) {
         return Ok(None);
@@ -1269,6 +1523,9 @@ fn finalize_reply(
     if let EntryKind::Message(message) = &mut entry.kind {
         message.text = text.to_string();
         message.post = PostState::Posted;
+        if message.addressed_to.is_none() {
+            message.addressed_to = addressed_to;
+        }
     }
     entry.revision += 1;
     entry.updated_at = chrono::Utc::now();
@@ -1537,4 +1794,304 @@ fn read_bot_memory(workspace: &Path) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use swarmbot_contracts::config::{BackendSpec, BrainConfig};
+    use swarmbot_contracts::delivery::CausalChain;
+    use swarmbot_contracts::id::DeliveryId;
+
+    fn test_swarm() -> (Arc<crate::swarm::Swarm>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut config = BrainConfig {
+            default_backend: "fake".to_string(),
+            backends: vec![BackendSpec::fake("fake")],
+            ..BrainConfig::default()
+        };
+        config.team = Some(BrainConfig::demo_team("fake"));
+        let swarm =
+            crate::compose::memory(config, dir.path(), vec![], &BTreeMap::new()).expect("swarm");
+        swarm.provision_team().expect("provision");
+        (swarm, dir)
+    }
+
+    #[test]
+    fn drain_matching_steers_preserves_other_conversations() {
+        let conv_a = ConversationId::new();
+        let conv_b = ConversationId::new();
+        let bot = BotId::new();
+        let steer = Arc::new(Mutex::new(VecDeque::from([
+            Delivery::owner_message(conv_a.clone(), bot.clone(), "a1"),
+            Delivery::owner_message(conv_b.clone(), bot.clone(), "b1"),
+            Delivery::owner_message(conv_a.clone(), bot.clone(), "a2"),
+        ])));
+
+        let drained = drain_matching_steers(&steer, &conv_a);
+        let texts: Vec<&str> = drained.iter().map(|d| d.text.as_str()).collect();
+        assert_eq!(texts, vec!["a1", "a2"]);
+
+        let remaining: Vec<String> = steer
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.text.clone())
+            .collect();
+        assert_eq!(remaining, vec!["b1".to_string()]);
+    }
+
+    #[test]
+    fn render_turn_text_respects_catch_up_bytes_without_skipping_unshown_entries() {
+        let (swarm, _dir) = test_swarm();
+        let env = swarm.runner_env();
+        let lead = swarm.bots.by_name("lead").unwrap();
+        let scout = swarm.bots.by_name("scout").unwrap();
+        let group = swarm
+            .conversations
+            .find_by_title("Team")
+            .unwrap()
+            .expect("Team group");
+
+        let chunk_1 = format!("MSG_ONE {}", "a".repeat(3500));
+        let chunk_2 = format!("MSG_TWO {}", "b".repeat(3500));
+        let chunk_3 = format!("MSG_THREE {}", "c".repeat(3500));
+        let e1 = swarm.transcript.owner_message(&group.id, &chunk_1).unwrap();
+        let e2 = swarm.transcript.owner_message(&group.id, &chunk_2).unwrap();
+        let e3 = swarm.transcript.owner_message(&group.id, &chunk_3).unwrap();
+        let trigger = swarm
+            .transcript
+            .bot_message(
+                &group.id,
+                &lead.id,
+                "@scout please check",
+                None,
+                Some(scout.id.clone()),
+            )
+            .unwrap();
+
+        let mut delivery = Delivery::bot_message(
+            group.id.clone(),
+            lead.id.clone(),
+            scout.id.clone(),
+            "please check".to_string(),
+            CausalChain::new(DeliveryId::new()),
+            Urgency::Background,
+        );
+        delivery.source_entry_id = Some(trigger.id.clone());
+
+        let mut session = Session::load(swarm.store.as_ref(), &scout.id).unwrap();
+        let first_prompt = render_turn_text(
+            &env,
+            &scout,
+            &group,
+            std::slice::from_ref(&delivery),
+            None,
+            &mut session,
+            false,
+        )
+        .unwrap();
+
+        assert!(first_prompt.contains("MSG_ONE"));
+        assert!(first_prompt.contains("MSG_TWO"));
+        assert!(!first_prompt.contains("MSG_THREE"));
+        assert!(first_prompt.contains("[Message from @lead] please check"));
+        assert!(!first_prompt.contains("[Direct message from @lead]"));
+        assert_eq!(
+            session.seen(&group.id),
+            e2.seq,
+            "mark_seen must stop at the last message shown ({}) and never jump past e3 ({})",
+            e2.seq,
+            e3.seq
+        );
+        assert!(session.seen(&group.id) > e1.seq);
+
+        // Next turn sees MSG_THREE without anything dropped, and does not
+        // duplicate `trigger` inside catch-up.
+        let second_prompt = render_turn_text(
+            &env,
+            &scout,
+            &group,
+            std::slice::from_ref(&delivery),
+            None,
+            &mut session,
+            false,
+        )
+        .unwrap();
+        assert!(second_prompt.contains("MSG_THREE"));
+        assert_eq!(
+            second_prompt.matches("please check").count(),
+            1,
+            "triggering delivery must appear once, not in catch-up: {second_prompt}"
+        );
+        assert_eq!(session.seen(&group.id), trigger.seq);
+    }
+
+    #[test]
+    fn render_turn_text_resolves_bot_sender_per_delivery_in_batch() {
+        let (swarm, _dir) = test_swarm();
+        let env = swarm.runner_env();
+        let lead = swarm.bots.by_name("lead").unwrap();
+        let dev = swarm.bots.by_name("dev").unwrap();
+        let scout = swarm.bots.by_name("scout").unwrap();
+        let group = swarm
+            .conversations
+            .find_by_title("Team")
+            .unwrap()
+            .expect("Team group");
+
+        let d1 = Delivery::bot_message(
+            group.id.clone(),
+            lead.id.clone(),
+            scout.id.clone(),
+            "first note".to_string(),
+            CausalChain::new(DeliveryId::new()),
+            Urgency::Background,
+        );
+        let d2 = Delivery::bot_message(
+            group.id.clone(),
+            dev.id.clone(),
+            scout.id.clone(),
+            "second note".to_string(),
+            CausalChain::new(DeliveryId::new()),
+            Urgency::Background,
+        );
+
+        let mut session = Session::load(swarm.store.as_ref(), &scout.id).unwrap();
+        let prompt =
+            render_turn_text(&env, &scout, &group, &[d1, d2], None, &mut session, false).unwrap();
+        assert!(prompt.contains("[Message from @lead] first note"));
+        assert!(prompt.contains("[Message from @dev] second note"));
+        assert!(!prompt.contains("[Direct message from"));
+    }
+
+    #[tokio::test]
+    async fn runner_cmd_steer_for_another_conversation_is_not_dropped() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::Notify;
+
+        struct GateBackend {
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+            calls: AtomicUsize,
+            prompts: Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmBackend for GateBackend {
+            fn id(&self) -> &str {
+                "gate"
+            }
+
+            fn kind(&self) -> BackendKind {
+                BackendKind::Fake
+            }
+
+            fn capabilities(&self) -> swarmbot_llm::Capabilities {
+                swarmbot_llm::Capabilities {
+                    streaming: false,
+                    tool_calls: false,
+                    reasoning: false,
+                    steer: true,
+                    survives_restart: false,
+                }
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest,
+                events: mpsc::Sender<LlmEvent>,
+                _cancel: CancellationToken,
+            ) -> Result<ChatResponse, swarmbot_llm::LlmError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let user_text = request
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::User)
+                    .map(|m| m.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.prompts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(user_text);
+                if n == 0 {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                let mut response = ChatResponse::empty();
+                response.text = format!("done-{n}");
+                let _ = events
+                    .send(LlmEvent::Finished {
+                        finish_reason: FinishReason::Stop,
+                        usage: response.usage,
+                        text: response.text.clone(),
+                        reasoning: String::new(),
+                        tool_calls: Vec::new(),
+                    })
+                    .await;
+                Ok(response)
+            }
+
+            async fn probe(&self) -> Result<swarmbot_llm::BackendStatus, swarmbot_llm::LlmError> {
+                Ok(swarmbot_llm::BackendStatus {
+                    backend: "gate".to_string(),
+                    ok: true,
+                    detail: "ok".to_string(),
+                    model: None,
+                    version: None,
+                })
+            }
+        }
+
+        let (swarm, _dir) = test_swarm();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let gate = Arc::new(GateBackend {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            calls: AtomicUsize::new(0),
+            prompts: Mutex::new(Vec::new()),
+        });
+        swarm
+            .backends
+            .register("gate", Arc::clone(&gate) as Arc<dyn LlmBackend>);
+
+        let mut lead = swarm.bots.by_name("lead").unwrap();
+        lead.backend = "gate".to_string();
+        swarm.bots.update(&lead).unwrap();
+        swarm.ensure_runners().unwrap();
+
+        let group = swarm
+            .conversations
+            .find_by_title("Team")
+            .unwrap()
+            .expect("Team group");
+
+        swarm
+            .send(&lead.direct_conversation_id, "first dm")
+            .unwrap();
+        started.notified().await;
+
+        // Simulate a TOCTOU race where `RunnerCmd::Steer` for ANOTHER
+        // conversation lands directly in the running turn's `steer` buffer.
+        let mut other_steer =
+            Delivery::owner_message(group.id.clone(), lead.id.clone(), "steer-other-conv");
+        other_steer.urgency = Urgency::Urgent;
+        swarm.store.insert_delivery(&other_steer).unwrap();
+        let handle = swarm.runners.get(&lead.id).unwrap();
+        handle.cmd.send(RunnerCmd::Steer(other_steer)).unwrap();
+
+        release.notify_one();
+        assert!(swarm.wait_for_idle(Duration::from_secs(5)).await);
+
+        {
+            let prompts = gate.prompts.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(prompts.len(), 2, "second turn must run the preserved steer");
+            assert!(prompts[1].contains("steer-other-conv"), "{prompts:?}");
+        }
+
+        swarm.shutdown().await;
+    }
 }

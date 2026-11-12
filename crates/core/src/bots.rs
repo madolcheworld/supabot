@@ -16,7 +16,6 @@ use swarmbot_contracts::tool::Toolset;
 use crate::bus::{Change, LiveHub};
 use crate::runners::RunnerMap;
 use crate::session::Session;
-use crate::transcript::Transcript;
 
 /// What it takes to make a bot.
 #[derive(Clone, Debug)]
@@ -49,7 +48,6 @@ impl NewBot {
 pub struct BotService {
     store: Arc<dyn Persistence>,
     hub: Arc<LiveHub>,
-    transcript: Arc<Transcript>,
     runners: Arc<RunnerMap>,
 }
 
@@ -57,13 +55,11 @@ impl BotService {
     pub fn new(
         store: Arc<dyn Persistence>,
         hub: Arc<LiveHub>,
-        transcript: Arc<Transcript>,
         runners: Arc<RunnerMap>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
             hub,
-            transcript,
             runners,
         })
     }
@@ -111,11 +107,6 @@ impl BotService {
         self.store.insert_bot(&bot)?;
         self.hub.publish(Change::Conversation(conversation));
         self.hub.publish(Change::Bot(bot.clone()));
-        let _ = self.transcript.event(
-            &bot.direct_conversation_id,
-            "bot-created",
-            format!("@{} joined the team", bot.name),
-        );
         info!(bot = %bot.name, backend = %bot.backend, "bot created");
         Ok(bot)
     }
@@ -187,17 +178,12 @@ impl BotService {
     /// Remove a bot. Its transcript stays: deleting history would be a lie
     /// about what the team did.
     pub fn delete(&self, id: &BotId) -> Result<(), DomainError> {
-        let bot = self.get(id)?;
+        self.get(id)?;
         if let Some(handle) = self.runners.unregister(id) {
             handle.shutdown();
         }
         self.store.delete_session(id)?;
         self.store.delete_bot(id)?;
-        let _ = self.transcript.event(
-            &bot.direct_conversation_id,
-            "bot-deleted",
-            format!("@{} left the team", bot.name),
-        );
         Ok(())
     }
 
@@ -313,6 +299,7 @@ mod tests {
     use crate::conversations::ConversationService;
     use crate::settings::SettingsHandle;
     use crate::testing;
+    use crate::transcript::Transcript;
     use swarmbot_contracts::config::GroupSpec;
 
     struct Rig {
@@ -326,12 +313,7 @@ mod tests {
     fn rig() -> Rig {
         let fixture = testing::Fixture::memory();
         let runners = RunnerMap::new();
-        let service = BotService::new(
-            fixture.store.clone(),
-            fixture.hub.clone(),
-            fixture.transcript.clone(),
-            runners.clone(),
-        );
+        let service = BotService::new(fixture.store.clone(), fixture.hub.clone(), runners.clone());
         let settings = SettingsHandle::new(fixture.store.clone());
         let tasks = crate::tasks::BackgroundTasks::new(
             fixture.store.clone(),
@@ -368,6 +350,13 @@ mod tests {
         assert_eq!(conversation.direct_bot(), Some(&bot.id));
         assert_eq!(bot.direct_conversation_id, conversation.id);
         assert!(bot.toolsets.contains(&Toolset::Bot));
+        assert!(
+            rig.store
+                .entry_tail(&conversation.id, 10)
+                .unwrap()
+                .is_empty(),
+            "a new bot starts with an empty DM transcript"
+        );
     }
 
     #[test]
@@ -442,7 +431,8 @@ mod tests {
             .store
             .entry_tail(&bot.direct_conversation_id, 10)
             .unwrap();
-        assert!(!entries.is_empty(), "what happened is still readable");
+        assert_eq!(entries.len(), 1, "what happened is still readable");
+        assert_eq!(entries[0].kind.text(), Some("before the delete"));
         assert!(rig.runners.get(&bot.id).is_none());
     }
 

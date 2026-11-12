@@ -130,6 +130,86 @@ impl ToolCall {
     }
 }
 
+/// An MCP (Model Context Protocol) server attached to a single model turn.
+///
+/// Consumed by backends that run their own tool loop (such as
+/// [`crate::acp::AcpAgent`]), giving the agent per-turn access to SwarmBot's
+/// tools with the caller's exact bot, conversation, and turn identity.
+///
+/// The `Debug` impl is manual: `Http::headers` and `Stdio::env` mask values of
+/// secret-bearing keys so tokens or credentials never reach logs or transcripts.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpServerSpec {
+    Http {
+        name: String,
+        url: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, String>,
+    },
+    Stdio {
+        name: String,
+        command: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
+    },
+}
+
+impl McpServerSpec {
+    /// Construct an HTTP MCP server spec with no extra headers.
+    pub fn http(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self::Http {
+            name: name.into(),
+            url: url.into(),
+            headers: BTreeMap::new(),
+        }
+    }
+
+    /// Construct a stdio MCP server spec with no args or extra env.
+    pub fn stdio(name: impl Into<String>, command: impl Into<String>) -> Self {
+        Self::Stdio {
+            name: name.into(),
+            command: command.into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+        }
+    }
+
+    /// Human-readable server identifier.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Http { name, .. } | Self::Stdio { name, .. } => name,
+        }
+    }
+}
+
+impl fmt::Debug for McpServerSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Http { name, url, headers } => f
+                .debug_struct("Http")
+                .field("name", name)
+                .field("url", url)
+                .field("headers", &RedactedHeaders(headers))
+                .finish(),
+            Self::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => f
+                .debug_struct("Stdio")
+                .field("name", name)
+                .field("command", command)
+                .field("args", args)
+                .field("env", &RedactedEnv(env))
+                .finish(),
+        }
+    }
+}
+
 /// Everything one model call needs. Assembled by the runner (instructions and
 /// history come from the bot's session), consumed by a backend adapter.
 ///
@@ -156,6 +236,10 @@ pub struct ChatRequest {
     /// each bot's session inside its own workspace).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    /// Optional per-turn MCP servers exposed to backends that run their own
+    /// tool loop (such as ACP agents).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServerSpec>,
 }
 
 impl fmt::Debug for ChatRequest {
@@ -170,6 +254,7 @@ impl fmt::Debug for ChatRequest {
             .field("extra_body", &self.extra_body)
             .field("extra_headers", &RedactedHeaders(&self.extra_headers))
             .field("cwd", &self.cwd)
+            .field("mcp_servers", &self.mcp_servers)
             .finish()
     }
 }
@@ -186,6 +271,7 @@ impl ChatRequest {
             extra_body: Map::new(),
             extra_headers: BTreeMap::new(),
             cwd: None,
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -399,13 +485,39 @@ pub(crate) fn is_secret_header(name: &str) -> bool {
         || n.contains("api-key")
         || n.contains("api_key")
         || n.contains("auth-token")
+        || n.contains("auth_token")
+        || n.contains("token")
         || n.contains("secret")
         || n.contains("password")
+        || n.contains("credential")
+}
+
+/// True for environment variable names whose values may carry credentials and
+/// must be masked in `Debug` output.
+pub(crate) fn is_secret_env(name: &str) -> bool {
+    if is_secret_header(name) {
+        return true;
+    }
+    let n = name.to_ascii_lowercase();
+    n.contains("key")
+        || n.contains("auth")
+        || n.contains("passwd")
+        || n.contains("private")
+        || n.contains("bearer")
 }
 
 /// The header value as it may be rendered: masked when secret-bearing.
 pub(crate) fn redact_header_value<'a>(name: &str, value: &'a str) -> Cow<'a, str> {
     if is_secret_header(name) {
+        Cow::Borrowed("[redacted]")
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
+/// The env value as it may be rendered: masked when secret-bearing.
+pub(crate) fn redact_env_value<'a>(name: &str, value: &'a str) -> Cow<'a, str> {
+    if is_secret_env(name) {
         Cow::Borrowed("[redacted]")
     } else {
         Cow::Borrowed(value)
@@ -431,6 +543,17 @@ impl<'a> fmt::Debug for RedactedHeaders<'a, Vec<(String, String)>> {
                     .iter()
                     .map(|(k, v)| (k.as_str(), redact_header_value(k, v))),
             )
+            .finish()
+    }
+}
+
+/// `Debug` for a process env map that masks secret-bearing values.
+pub(crate) struct RedactedEnv<'a>(pub(crate) &'a BTreeMap<String, String>);
+
+impl<'a> fmt::Debug for RedactedEnv<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(k, v)| (k, redact_env_value(k, v))))
             .finish()
     }
 }
@@ -532,5 +655,107 @@ mod tests {
             .tool_calls
             .push(ToolCall::new("c", "shell", serde_json::json!({})));
         assert!(response.has_tool_calls());
+    }
+
+    #[test]
+    fn chat_request_mcp_servers_serde_is_backward_compatible() {
+        let legacy = serde_json::json!({
+            "model": "m",
+            "instructions": "be helpful",
+            "messages": [],
+            "tools": [],
+            "max_tokens": null,
+            "temperature": null,
+            "extra_body": {},
+            "extra_headers": {}
+        });
+        let parsed: ChatRequest = serde_json::from_value(legacy).expect("legacy ChatRequest loads");
+        assert!(parsed.mcp_servers.is_empty());
+        assert!(parsed.cwd.is_none());
+
+        // Empty mcp_servers is omitted when serializing.
+        let compact = serde_json::to_value(&parsed).expect("serializable");
+        assert!(compact.get("mcp_servers").is_none());
+
+        // Populated Http & Stdio specs round-trip cleanly.
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".into(), "Bearer tok-1".into());
+        let mut env = BTreeMap::new();
+        env.insert("API_KEY".into(), "secret-1".into());
+        let mut req = ChatRequest::new("m", "i");
+        req.mcp_servers = vec![
+            McpServerSpec::Http {
+                name: "swarmbot".into(),
+                url: "http://127.0.0.1:9000/mcp/t/1".into(),
+                headers,
+            },
+            McpServerSpec::Stdio {
+                name: "local".into(),
+                command: "/usr/bin/mcp".into(),
+                args: vec!["--stdio".into()],
+                env,
+            },
+        ];
+        let value = serde_json::to_value(&req).expect("serializable");
+        let back: ChatRequest = serde_json::from_value(value).expect("round trips");
+        assert_eq!(back, req);
+
+        // Minimal Http & Stdio JSON without optional fields deserializes via defaults.
+        let minimal_http: McpServerSpec = serde_json::from_value(serde_json::json!({
+            "kind": "http",
+            "name": "s1",
+            "url": "http://127.0.0.1/mcp"
+        }))
+        .expect("minimal http");
+        assert_eq!(
+            minimal_http,
+            McpServerSpec::http("s1", "http://127.0.0.1/mcp")
+        );
+
+        let minimal_stdio: McpServerSpec = serde_json::from_value(serde_json::json!({
+            "kind": "stdio",
+            "name": "s2",
+            "command": "node"
+        }))
+        .expect("minimal stdio");
+        assert_eq!(minimal_stdio, McpServerSpec::stdio("s2", "node"));
+    }
+
+    #[test]
+    fn mcp_server_spec_debug_masks_secret_headers_and_env() {
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".into(), "Bearer sk-mcp-secret".into());
+        headers.insert("X-Turn-Token".into(), "turn-secret-99".into());
+        headers.insert("X-Client".into(), "swarmbot".into());
+        let http = McpServerSpec::Http {
+            name: "swarmbot".into(),
+            url: "http://127.0.0.1:8788/mcp".into(),
+            headers,
+        };
+
+        let mut env = BTreeMap::new();
+        env.insert("OPENAI_API_KEY".into(), "sk-env-secret".into());
+        env.insert("AUTH_TOKEN".into(), "tok-env-secret".into());
+        env.insert("RUST_LOG".into(), "info".into());
+        let stdio = McpServerSpec::Stdio {
+            name: "helper".into(),
+            command: "helper-mcp".into(),
+            args: vec!["--flag".into()],
+            env,
+        };
+
+        let mut req = ChatRequest::new("m", "i");
+        req.mcp_servers = vec![http, stdio];
+        let debug = format!("{req:?}");
+
+        assert!(!debug.contains("sk-mcp-secret"), "{debug}");
+        assert!(!debug.contains("turn-secret-99"), "{debug}");
+        assert!(!debug.contains("sk-env-secret"), "{debug}");
+        assert!(!debug.contains("tok-env-secret"), "{debug}");
+        assert!(debug.contains("[redacted]"), "{debug}");
+        assert!(debug.contains("swarmbot"), "{debug}");
+        assert!(debug.contains("info"), "{debug}");
+        assert!(debug.contains("http://127.0.0.1:8788/mcp"), "{debug}");
+        assert!(debug.contains("helper-mcp"), "{debug}");
     }
 }

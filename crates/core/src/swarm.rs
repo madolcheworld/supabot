@@ -11,7 +11,7 @@
 //! testable without a socket.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -19,9 +19,10 @@ use tracing::{info, warn};
 use swarmbot_contracts::bot::Bot;
 use swarmbot_contracts::config::BrainConfig;
 use swarmbot_contracts::error::DomainError;
-use swarmbot_contracts::id::NodeId;
-use swarmbot_contracts::node::{NodeInfo, PolicyMap};
+use swarmbot_contracts::id::{BotId, ConversationId, NodeId, TaskId, TurnId};
+use swarmbot_contracts::node::{Capabilities, NodeInfo, PolicyMap};
 use swarmbot_contracts::repo::{Persistence, RecoveryReport};
+use swarmbot_contracts::tool::Toolset;
 use swarmbot_store::JsonlMirror;
 use swarmbot_tools::{AuditLog, NodeExecutor, PathPolicy, PolicyEngine, ToolRegistry};
 
@@ -40,6 +41,78 @@ use crate::runners::{BotRunner, RunnerEnv, RunnerMap};
 use crate::settings::SettingsHandle;
 use crate::tasks::BackgroundTasks;
 use crate::transcript::Transcript;
+
+/// Inputs describing a running turn so an external MCP server layer can
+/// expose turn-scoped tools to `owns_tool_loop()` backends.
+#[derive(Clone, Debug)]
+pub struct McpTurnRequest {
+    pub bot_id: BotId,
+    pub conversation_id: ConversationId,
+    pub turn_id: TurnId,
+    pub task_id: Option<TaskId>,
+    pub workspace: PathBuf,
+    pub spool_dir: PathBuf,
+    pub toolsets: Vec<Toolset>,
+    pub node_caps: Option<Capabilities>,
+    pub in_task: bool,
+}
+
+/// Per-turn MCP server specs and RAII cleanup guard.
+///
+/// Dropping this handle unregisters any turn-scoped MCP credentials/endpoints.
+pub struct McpTurnRegistration {
+    pub servers: Vec<swarmbot_llm::McpServerSpec>,
+    cleanup: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl std::fmt::Debug for McpTurnRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpTurnRegistration")
+            .field("servers", &self.servers)
+            .field("has_cleanup", &self.cleanup.is_some())
+            .finish()
+    }
+}
+
+impl Default for McpTurnRegistration {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl McpTurnRegistration {
+    pub fn empty() -> Self {
+        Self {
+            servers: Vec::new(),
+            cleanup: None,
+        }
+    }
+
+    pub fn new(
+        servers: Vec<swarmbot_llm::McpServerSpec>,
+        cleanup: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            servers,
+            cleanup: Some(Box::new(cleanup)),
+        }
+    }
+}
+
+impl Drop for McpTurnRegistration {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+/// Port implemented by `brain` (or tests) to expose scoped MCP servers per turn.
+pub trait McpTurnProvider: Send + Sync {
+    fn register_turn(&self, request: McpTurnRequest) -> Result<McpTurnRegistration, DomainError>;
+}
+
+pub type McpProviderSlot = Arc<RwLock<Option<Arc<dyn McpTurnProvider>>>>;
 
 /// A wired brain, without listeners.
 pub struct Swarm {
@@ -65,6 +138,7 @@ pub struct Swarm {
     pub nodes: Arc<dyn NodeExecutor>,
     pub roots: Vec<swarmbot_contracts::node::NodeRoot>,
     pub data_dir: PathBuf,
+    mcp_provider: McpProviderSlot,
     expiry: ExpirySlot,
     routine_ticker: ExpirySlot,
 }
@@ -134,12 +208,7 @@ impl Swarm {
             Arc::clone(&tasks),
             Arc::clone(&approval),
         );
-        let bots = BotService::new(
-            Arc::clone(&store),
-            Arc::clone(&hub),
-            Arc::clone(&transcript),
-            Arc::clone(&runners),
-        );
+        let bots = BotService::new(Arc::clone(&store), Arc::clone(&hub), Arc::clone(&runners));
         let conversations = ConversationService::new(
             Arc::clone(&store),
             Arc::clone(&hub),
@@ -192,9 +261,16 @@ impl Swarm {
             nodes: parts.nodes,
             roots: parts.roots,
             data_dir,
+            mcp_provider: Arc::new(RwLock::new(None)),
             expiry: ExpirySlot(std::sync::Mutex::new(None)),
             routine_ticker: ExpirySlot(std::sync::Mutex::new(None)),
         }))
+    }
+
+    /// Attach the per-turn MCP server provider used for `owns_tool_loop()`
+    /// backends. Runners share the slot, so runners started beforehand see it.
+    pub fn set_mcp_provider(&self, provider: Arc<dyn McpTurnProvider>) {
+        *self.mcp_provider.write().unwrap_or_else(|e| e.into_inner()) = Some(provider);
     }
 
     /// A swarm on a fresh in-memory store: tests, and `--offline` demos.
@@ -311,6 +387,7 @@ impl Swarm {
             runners: Arc::clone(&self.runners),
             workspaces_root: self.workspaces_root(),
             hooks: Arc::clone(&self.orchestrator) as Arc<dyn crate::runners::RunnerHooks>,
+            mcp_provider: Arc::clone(&self.mcp_provider),
         }
     }
 

@@ -16,9 +16,10 @@
 //! * a backend that advertises **no** model list (opencode's ACP server, the
 //!   `claude -p` skeleton) gets an empty right column that says so, plus the
 //!   search box as a free-text escape hatch — never a fabricated menu;
-//! * only a **direct** conversation gets the menu: it configures exactly one
-//!   bot. A group's members can sit on different providers, and one dropdown
-//!   cannot honestly speak for all of them.
+//! * both **direct** and **group** conversations can open the menu: a direct
+//!   conversation targets its single bot, while a group opens the menu for a
+//!   selected member bot (since group members may run on different providers
+//!   and models).
 
 use std::sync::mpsc::Sender;
 

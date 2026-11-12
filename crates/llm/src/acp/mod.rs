@@ -101,11 +101,11 @@ use crate::backend::{LlmBackend, LlmError, emit};
 use crate::openai::truncate_utf8;
 use crate::types::{
     BackendStatus, Capabilities, ChatMessage, ChatRequest, ChatResponse, FinishReason, LlmEvent,
-    ModelList, ModelOption, Role,
+    McpServerSpec, ModelList, ModelOption, Role,
 };
 
 use self::client::{AcpRequestError, Connection, SCRUBBED_ENV};
-use self::proto::{NewSessionResult, PermissionRequest, PromptResult, StopReason};
+use self::proto::{McpCapabilities, NewSessionResult, PermissionRequest, PromptResult, StopReason};
 
 /// How long the agent gets to answer a *setup* call (`initialize`,
 /// `session/new`, `session/set_model`). Derived from `timeout_secs`, with a
@@ -806,9 +806,11 @@ impl LlmBackend for AcpAgent {
 
         // 1. A fresh session per turn (module docs: the rendered history *is*
         //    the context; a reused session would double it).
+        let mcp_servers =
+            acp_mcp_servers(&self.spec.id, &request.mcp_servers, conn.mcp_capabilities());
         let new_params = json!({
             "cwd": cwd.to_string_lossy(),
-            "mcpServers": [],
+            "mcpServers": mcp_servers,
         });
         let session_value = self
             .setup_rpc(&conn, "session/new", new_params, setup, &cancel)
@@ -1401,6 +1403,63 @@ pub(crate) fn parse_model_list(stdout: &str) -> Vec<ModelOption> {
         .take(MAX_LISTED_MODELS)
         .map(ModelOption::new)
         .collect()
+}
+
+/// Convert per-turn [`McpServerSpec`] values into ACP `session/new`
+/// `mcpServers` entries.
+///
+/// Stdio servers are supported by all ACP agents. HTTP servers are included
+/// unless the agent explicitly advertised `mcpCapabilities.http = false`, in
+/// which case they are skipped with a warning log.
+pub(crate) fn acp_mcp_servers(
+    backend_id: &str,
+    specs: &[McpServerSpec],
+    caps: Option<McpCapabilities>,
+) -> Vec<Value> {
+    let http_explicitly_unsupported = caps.is_some_and(|c| c.http == Some(false));
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match spec {
+            McpServerSpec::Http { name, url, headers } => {
+                if http_explicitly_unsupported {
+                    tracing::warn!(
+                        backend = %backend_id,
+                        server = %name,
+                        "ACP agent advertised mcpCapabilities.http = false; skipping HTTP MCP server"
+                    );
+                    continue;
+                }
+                let header_list: Vec<Value> = headers
+                    .iter()
+                    .map(|(k, v)| json!({"name": k, "value": v}))
+                    .collect();
+                out.push(json!({
+                    "type": "http",
+                    "name": name,
+                    "url": url,
+                    "headers": header_list,
+                }));
+            }
+            McpServerSpec::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => {
+                let env_list: Vec<Value> = env
+                    .iter()
+                    .map(|(k, v)| json!({"name": k, "value": v}))
+                    .collect();
+                out.push(json!({
+                    "name": name,
+                    "command": command,
+                    "args": args,
+                    "env": env_list,
+                }));
+            }
+        }
+    }
+    out
 }
 
 /// The model this turn wants: the runner resolves bot → spec already, and

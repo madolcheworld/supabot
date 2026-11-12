@@ -25,7 +25,7 @@ use swarmbot_contracts::config::BrainConfig;
 use swarmbot_contracts::conversation::Conversation;
 use swarmbot_contracts::entry::Entry;
 use swarmbot_contracts::error::DomainError;
-use swarmbot_contracts::id::{ConversationId, RequestId};
+use swarmbot_contracts::id::{BotId, ConversationId, EntryId, RequestId};
 use swarmbot_contracts::live::LiveEvent;
 use swarmbot_contracts::node::{NodeInfo, NodeRoot};
 use swarmbot_contracts::request::{Decision, RuntimeRequest};
@@ -36,7 +36,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::remote::Backend;
 use crate::render::{Printer, Roster, print_event};
-use crate::session::{SendReport, Session};
+use crate::session::{SendReport, Session, request_relevant_to};
 
 /// Everything [`Embedded::build`] needs: a resolved config and where to run.
 pub struct BrainParams {
@@ -100,9 +100,20 @@ impl Embedded {
     }
 
     pub fn send(&self, conversation: &ConversationId, text: &str) -> Result<SendReport> {
+        self.send_with(conversation, text, &[], None)
+    }
+
+    pub fn send_with(
+        &self,
+        conversation: &ConversationId,
+        text: &str,
+        addressed: &[BotId],
+        reply_to: Option<&EntryId>,
+    ) -> Result<SendReport> {
         let sent = self
             .swarm
-            .send(conversation, text)
+            .orchestrator
+            .send_owner_message(conversation, text, addressed, reply_to)
             .map_err(|err| anyhow!("{err}"))?;
         let queued = sent
             .queued
@@ -211,6 +222,16 @@ impl Session for Embedded {
         Embedded::send(self, conversation, text)
     }
 
+    fn send_with(
+        &self,
+        conversation: &ConversationId,
+        text: &str,
+        addressed: &[BotId],
+        reply_to: Option<&EntryId>,
+    ) -> Result<SendReport> {
+        Embedded::send_with(self, conversation, text, addressed, reply_to)
+    }
+
     fn subscribe(
         &self,
         conversation: Option<ConversationId>,
@@ -232,13 +253,39 @@ impl Session for Embedded {
     }
 
     fn pending_in(&self, conversation: &ConversationId) -> Result<Vec<RuntimeRequest>> {
-        Ok(self
+        let pending: Vec<RuntimeRequest> = self
             .swarm
             .store
-            .requests_in(conversation)
+            .pending_requests()
             .map_err(|err| anyhow!("{err}"))?
             .into_iter()
             .filter(|request| request.is_pending())
+            .collect();
+        if pending.is_empty()
+            || pending
+                .iter()
+                .all(|request| request.conversation_id == *conversation)
+        {
+            return Ok(pending);
+        }
+        let conversations = self.conversations()?;
+        let bots = self.bots()?;
+        let tasks = self.tasks()?;
+        let mut turns = Vec::new();
+        for request in &pending {
+            if request.conversation_id != *conversation
+                && request.task_id.is_none()
+                && let Some(turn_id) = &request.turn_id
+                && let Ok(Some(turn)) = self.swarm.store.get_turn(turn_id)
+            {
+                turns.push(turn);
+            }
+        }
+        Ok(pending
+            .into_iter()
+            .filter(|request| {
+                request_relevant_to(request, conversation, &conversations, &bots, &tasks, &turns)
+            })
             .collect())
     }
 
@@ -348,6 +395,12 @@ pub fn emit_event<W: Write>(
     with_snapshot: bool,
 ) -> Result<()> {
     if json {
+        roster.observe_event(event);
+        if let LiveEvent::EntryUpsert { entry, .. } = event
+            && !roster.should_show(entry)
+        {
+            return Ok(());
+        }
         printer.json_event(event)
     } else {
         print_event(printer, roster, event, with_snapshot)

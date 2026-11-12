@@ -10,7 +10,8 @@
 //! * **a bot never interrupts a bot** — deliveries queue; only the owner can
 //!   stop a turn.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use tracing::{debug, warn};
@@ -20,7 +21,7 @@ use swarmbot_contracts::conversation::{Conversation, ConversationKind};
 use swarmbot_contracts::delivery::{Delivery, Urgency};
 use swarmbot_contracts::entry::Entry;
 use swarmbot_contracts::error::DomainError;
-use swarmbot_contracts::id::{BotId, ConversationId, EntryId};
+use swarmbot_contracts::id::{BotId, ConversationId, EntryId, TurnId};
 use swarmbot_contracts::repo::Persistence;
 use swarmbot_contracts::task::{Task, TaskStatus};
 use swarmbot_contracts::tool::ToolResult;
@@ -48,6 +49,7 @@ pub struct Messaging {
     settings: Arc<SettingsHandle>,
     runners: Arc<RunnerMap>,
     tasks: Arc<BackgroundTasks>,
+    turn_targets: Mutex<HashMap<TurnId, HashSet<BotId>>>,
 }
 
 /// What a send produced, for the tool result and for tests.
@@ -77,7 +79,27 @@ impl Messaging {
             settings,
             runners,
             tasks,
+            turn_targets: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Record that `turn_id` explicitly messaged or handed work off to `recipient`.
+    pub fn record_turn_target(&self, turn_id: &TurnId, recipient: &BotId) {
+        self.turn_targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(turn_id.clone())
+            .or_default()
+            .insert(recipient.clone());
+    }
+
+    /// Take and clear all recipient bot IDs recorded during `turn_id`.
+    pub fn take_turn_targets(&self, turn_id: &TurnId) -> HashSet<BotId> {
+        self.turn_targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(turn_id)
+            .unwrap_or_default()
     }
 
     /// `message_bot {to, text, urgency}`.
@@ -102,7 +124,7 @@ impl Messaging {
         if let ConversationKind::Group { members, .. } = &ctx.conversation.kind
             && members.contains(&recipient.id)
         {
-            let posted = self.post_in_group(ctx, &recipient, text)?;
+            let posted = self.post_in_group(ctx, &recipient, text, urgency)?;
             return Ok(posted);
         }
 
@@ -126,7 +148,7 @@ impl Messaging {
             format!("Messaged @{}", recipient.name),
         );
 
-        let delivery = Delivery::bot_message(
+        let mut delivery = Delivery::bot_message(
             recipient.direct_conversation_id.clone(),
             ctx.from.id.clone(),
             recipient.id.clone(),
@@ -134,6 +156,7 @@ impl Messaging {
             chain,
             urgency,
         );
+        delivery.source_entry_id = Some(entry.id.clone());
         let woke = self.deliver(delivery, &recipient)?;
         Ok(Sent {
             conversation: recipient.direct_conversation_id,
@@ -151,6 +174,16 @@ impl Messaging {
         group: &str,
         text: &str,
     ) -> Result<Sent, DomainError> {
+        self.post_to_group_recorded(ctx, group, text, None)
+    }
+
+    pub(crate) fn post_to_group_recorded(
+        &self,
+        ctx: &SendContext,
+        group: &str,
+        text: &str,
+        turn_id: Option<&TurnId>,
+    ) -> Result<Sent, DomainError> {
         if let Some(blocked) = self.blocked(ctx)? {
             return Ok(blocked);
         }
@@ -167,15 +200,18 @@ impl Messaging {
             std::slice::from_ref(&ctx.from.id),
         );
         let hops = ctx.hops;
+        let mut woke_any = false;
+        let mut stopped = false;
         for bot in woken
             .iter()
             .filter_map(|id| members.iter().find(|m| &m.id == id))
         {
             let Some(chain) = self.chain_at(hops) else {
                 let _ = self.hop_limit_event(&ctx.conversation.id, &ctx.from);
+                stopped = true;
                 break;
             };
-            let delivery = Delivery::bot_message(
+            let mut delivery = Delivery::bot_message(
                 conversation.id.clone(),
                 ctx.from.id.clone(),
                 bot.id.clone(),
@@ -183,13 +219,24 @@ impl Messaging {
                 chain,
                 Urgency::Background,
             );
-            let _ = self.deliver(delivery, bot);
+            delivery.source_entry_id = Some(entry.id.clone());
+            match self.deliver(delivery, bot) {
+                Ok(did_wake) => {
+                    woke_any |= did_wake;
+                    if did_wake && let Some(turn_id) = turn_id {
+                        self.record_turn_target(turn_id, &bot.id);
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, bot = %bot.name, "cannot wake group member after post_to_group");
+                }
+            }
         }
         Ok(Sent {
             conversation: conversation.id,
             entry: Some(entry.id),
-            woke: true,
-            stopped: false,
+            woke: woke_any,
+            stopped,
             task: None,
         })
     }
@@ -353,11 +400,23 @@ impl Messaging {
         ctx: &SendContext,
         recipient: &Bot,
         text: &str,
+        urgency: Urgency,
     ) -> Result<Sent, DomainError> {
-        let posted = format!("@{} {}", recipient.name, text);
-        let entry =
-            self.transcript
-                .bot_message(&ctx.conversation.id, &ctx.from.id, &posted, None, None)?;
+        let already_mentions = crate::router::mentioned_handles(text)
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&recipient.name));
+        let posted = if already_mentions {
+            text.to_string()
+        } else {
+            format!("@{} {}", recipient.name, text)
+        };
+        let entry = self.transcript.bot_message(
+            &ctx.conversation.id,
+            &ctx.from.id,
+            &posted,
+            None,
+            Some(recipient.id.clone()),
+        )?;
         let Some(chain) = self.chain_at(ctx.hops) else {
             self.hop_limit_event(&ctx.conversation.id, &ctx.from)?;
             return Ok(Sent {
@@ -374,7 +433,7 @@ impl Messaging {
             recipient.id.clone(),
             text.to_string(),
             chain,
-            Urgency::Background,
+            urgency,
         );
         delivery.source_entry_id = Some(entry.id.clone());
         let woke = self.deliver(delivery, recipient)?;
@@ -969,5 +1028,61 @@ mod tests {
             rig.messaging.resolve_bot(rig.scout.id.as_ref()).unwrap().id,
             rig.scout.id
         );
+    }
+
+    #[test]
+    fn post_in_group_honors_urgency_sets_addressed_to_and_avoids_duplicate_mention() {
+        let rig = rig();
+        let sent = rig
+            .messaging
+            .message_bot(
+                &rig.ctx_in_group(),
+                "scout",
+                "@scout please verify this",
+                Urgency::Urgent,
+            )
+            .unwrap();
+        assert_eq!(sent.conversation, rig.group.id);
+
+        let entries = rig.store.entry_tail(&rig.group.id, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].kind.text(),
+            Some("@scout please verify this"),
+            "must not double-prefix @scout when already mentioned"
+        );
+        assert_eq!(
+            entries[0]
+                .as_message()
+                .and_then(|m| m.addressed_to.as_ref()),
+            Some(&rig.scout.id)
+        );
+
+        let deliveries = rig.store.queued_deliveries(&rig.scout.id).unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].urgency, Urgency::Urgent);
+        assert_eq!(deliveries[0].source_entry_id, Some(entries[0].id.clone()));
+    }
+
+    #[test]
+    fn post_to_group_reports_accurate_woke_and_sets_source_entry_id() {
+        let rig = rig();
+        // No mentions -> nobody woken -> woke == false.
+        let unmentioned = rig
+            .messaging
+            .post_to_group(&rig.ctx_in_dm(), "Team", "just sharing status")
+            .unwrap();
+        assert!(!unmentioned.woke);
+        assert!(unmentioned.entry.is_some());
+
+        // Explicit mention -> teammate woken and delivery carries source_entry_id.
+        let mentioned = rig
+            .messaging
+            .post_to_group(&rig.ctx_in_dm(), "Team", "@scout take a look")
+            .unwrap();
+        assert!(mentioned.woke);
+        let deliveries = rig.store.queued_deliveries(&rig.scout.id).unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].source_entry_id, mentioned.entry);
     }
 }

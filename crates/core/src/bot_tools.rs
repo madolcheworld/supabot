@@ -455,6 +455,12 @@ impl BotToolEnv {
             .message_bot(&send, &args.to, &args.text, args.urgency)
             .map_err(tool_error)?;
         if sent.stopped {
+            if let (Some(turn_id), Ok(recipient)) = (
+                &ctx.invocation.turn_id,
+                self.messaging.resolve_bot(&args.to),
+            ) {
+                self.messaging.record_turn_target(turn_id, &recipient.id);
+            }
             // Report, don't fail: the chain ending is a fact the model has to
             // act on (answer here instead), not a broken call.
             return Ok(ToolResult::text(format!(
@@ -466,6 +472,9 @@ impl BotToolEnv {
         }
         // Safe to resolve now: the send already resolved the same name.
         let recipient = self.messaging.resolve_bot(&args.to).map_err(tool_error)?;
+        if let Some(turn_id) = &ctx.invocation.turn_id {
+            self.messaging.record_turn_target(turn_id, &recipient.id);
+        }
         let place = if sent.conversation == send.conversation.id {
             "in this group — a message to a fellow member stays where the owner can see it"
         } else {
@@ -494,7 +503,12 @@ impl BotToolEnv {
         let send = self.send_context(ctx)?;
         let sent = self
             .messaging
-            .post_to_group(&send, &args.group, &args.text)
+            .post_to_group_recorded(
+                &send,
+                &args.group,
+                &args.text,
+                ctx.invocation.turn_id.as_ref(),
+            )
             .map_err(tool_error)?;
         if sent.stopped {
             return Ok(ToolResult::text(
@@ -508,9 +522,13 @@ impl BotToolEnv {
             .map_err(tool_error)?
             .and_then(|conversation| conversation.title)
             .unwrap_or_else(|| sent.conversation.to_string());
+        let wake_note = if sent.woke {
+            "Teammates you @mentioned were woken and will read it on their next turn."
+        } else {
+            "No teammates were woken (none @mentioned or active)."
+        };
         Ok(ToolResult::text(format!(
-            "Posted in \"{title}\". Teammates you @mentioned were woken and will read it on \
-             their next turn."
+            "Posted in \"{title}\". {wake_note}"
         )))
     }
 
@@ -542,6 +560,9 @@ impl BotToolEnv {
             ));
         };
         let recipient = self.messaging.resolve_bot(&args.to).map_err(tool_error)?;
+        if let Some(turn_id) = &ctx.invocation.turn_id {
+            self.messaging.record_turn_target(turn_id, &recipient.id);
+        }
         Ok(ToolResult::text(format!(
             "Handed \"{}\" to @{} as task {}. It is theirs to run; when they finish, their \
              result comes back to this conversation. Follow progress with check_task.",
