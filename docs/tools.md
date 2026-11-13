@@ -91,6 +91,29 @@ outside the deny list, and (for writes) inside a read-write root. Failures are
 `ToolError::PathDenied { path, reason }` with reasons `outside roots`,
 `deny-list`, `read-only root`.
 
+### The one exception: `shell`
+
+Every handler but `shell` resolves the paths it touches through that boundary.
+`shell` cannot: it hands a **string** to a shell, and the shell decides what the
+words mean. Its `cwd` is resolved, and its command line is scanned for a
+deny-listed path (`PathPolicy::denied_reference`), which turns the direct
+spelling — `cat ~/.ssh/id_rsa`, `tar -xf <denied>`, `echo x > <denied>`, through
+`~`, `$HOME` and quotes — into a refusal.
+
+That scan is a **word heuristic, not a sandbox**. It does not cover:
+
+* a path the command builds at run time (`cat $(echo ~/.ssh)/id_rsa`);
+* a path reached after a `cd` (`cd ~/.ssh && cat id_rsa`);
+* **root containment at all** — a shell command legitimately names `/bin/sh`,
+  `/usr/bin/git` and `$HOME/.cache`, so requiring containment would refuse
+  nearly every real command. Roots bound the tools that open files; they do not
+  bound a shell.
+
+A real boundary for `shell` is a sandbox (mount namespace, seccomp) or a
+container, not a string scan. Until then the ceiling, the destructive-command
+floor and the deny-list scan are what stand between a bot and the machine, and
+this section is the honest statement of where that stops.
+
 ## 4. Tool reference
 
 ### 4.1 Node tools (toolset `Node`, all accept an optional `node`)

@@ -94,9 +94,33 @@ Status: accepted for the M0–M6 prototype.
   **fresh ACP session** with the bot's whole history rendered into the prompt —
   the history we send *is* the context, exactly like the stateless HTTP
   backend, and a native session on top of it would double the context.
-  `timeout_secs` is reinterpreted as an **idle** timeout: updates reset it,
-  because an agent that streams tool activity for ten minutes is working, not
-  hung. Two rules keep it honest: the client declares **no** fs/terminal
+  **The connection is not a per-turn resource.** Because every bot naming the
+  backend shares one process, a per-request timeout must fail the turn that
+  asked and never the shared process: a setup call (`session/new`,
+  `session/set_model`, `session/set_config_option`) that runs out its budget is
+  *abandoned*, not answered by a shutdown. That is safe by protocol rather than
+  by hope — JSON-RPC correlates responses by id and never by order, so an
+  unanswered request desyncs nothing, the client removes the pending slot with
+  the dropped future, and a late answer for an id nobody waits for is logged.
+  Shutdown therefore belongs to the *connection's* life (a failed handshake no
+  other turn can see, `probe`'s throwaway connection, the `Drop` backstop), not
+  to a turn's timeout. A **run** of unanswered setup calls is a different fact —
+  the process is wedged, not the turn — so after three consecutive setup
+  timeouts the next turn replaces the connection lazily, once; the old process
+  is shut down only when the turns still holding it finish, so a replacement
+  never kills somebody else's turn. Establishment is serialised **per
+  connection key** and is cancel-aware, so one bot's cold `npx` boot cannot make
+  another bot's stopped turn wait out a `setup_timeout × (max_retries + 1)`
+  queue. Two limits are stated rather than hidden: there is **no idle reaper**
+  — a connection lives until the backend is dropped, the agent dies, or a run of
+  setup timeouts replaces it — and a finished turn releases its session with
+  `session/close` only when the agent advertises
+  `agentCapabilities.sessionCapabilities.close` (the method is optional in ACP
+  v1, and an unadvertised optional method is not ours to call); for an agent
+  that does not advertise it, its per-turn sessions live until the process
+  exits. `timeout_secs` is reinterpreted as an **idle** timeout: updates reset
+  it, because an agent that streams tool activity for ten minutes is working,
+  not hung. Two rules keep it honest: the client declares **no** fs/terminal
   capabilities, so the agent acts through its own sandboxed tools rather than
   through hands we would not policy-check; and every
   `session/request_permission` is answered by the configured policy — default
@@ -316,12 +340,14 @@ what it is holding back.
   tools executed on the brain's machine, inside the brain's roots and under the
   brain's ceilings — invisible in the transcript, because the tool-call entry
   still named the node the model asked for. A node daemon passes its own paired
-  id, so calls addressed to itself are its own to run. Known consequence: the
-  embedded CLI (`swarmbot run`, which composes through `core::compose`) has no
-  remote dispatcher in front of the executor, so a remote-bound bot there now
-  gets a clear typed refusal rather than remote execution. Safe, not complete —
-  the fix is for `core::compose` to accept an executor, the way
-  `swarmbot-brain/src/compose.rs` puts its `NodeDispatcher` in front.
+  id, so calls addressed to itself are its own to run. Consequence, and it is a
+  property of the mode rather than a missing wire: the embedded CLI (`swarmbot
+  run`, which composes through `core::compose`) has no remote dispatcher, so a
+  remote-bound bot there gets a clear typed refusal. Putting a dispatcher in
+  `core::compose` would not help — a node dials the brain's gateway, and the
+  embedded CLI has no listener, so nothing could pair with it and the dispatcher
+  could only ever answer "not connected". Remote nodes are the daemon's feature;
+  use `--brain` when they matter.
 - **D9.12 `NodeExecutor::exec` should carry the invocation.** Every `fs.*` and
   `shell.exec` payload needs `inv: Invocation`, and a node echoes `inv.bot_id`
   back in `node.requestApproval` — but the port is `exec(&self, node, call)`, so
@@ -331,9 +357,14 @@ what it is holding back.
   happens inside a turn, and a bot runs one turn at a time), but it is inference
   where the data was available at the call site. Widening the port to
   `exec(&self, node, inv, call)` — or putting the invocation inside `NodeCall` —
-  deletes the sentinel and the dedup window. Not done yet: it touches `tools`,
-  `core`, `node` and `brain` at once, which is a change to make deliberately
-  rather than at the end of a milestone.
+  deletes the sentinel and the dedup window. **Done**: the port is
+  `exec(&self, node, &Invocation, call)`, `NodeDispatcher::attribute()` and its
+  `running_turns()` scan are gone, and the dispatch path has no fallback that
+  invents attribution. `unattributed()` survives only for the
+  `node.requestApproval` path, where a node names a bot this brain cannot place.
+  The change touched `tools`, `core`, `node` and `brain` at once, as predicted;
+  `two_turns_on_one_node_each_carry_their_own_invocation_to_the_node` pins it and
+  was mutation-checked against the old give-up path.
 - **D9.13 An empty test is a lie, so there are none.** A test whose body is
   empty passes trivially and reads as coverage. The `#[ignore]`d
   `pair_and_serve_against_a_real_brain` recipe in `crates/node` was deleted and
@@ -362,3 +393,30 @@ what it is holding back.
   to a current-thread runtime, which is the wrong half of the problem — a test
   that cannot fail is not evidence. Hence the rule: when a test hides a race, fix
   the product and put the test back on the multi-threaded runtime.
+- **D9.16 The usage window rule lives in `contracts`, not in the route.** Two
+  front ends answer "what did this team spend": the brain at `GET /api/usage` and
+  the CLI's embedded mode reading its own store. Written twice, the rules that are
+  easy to get subtly wrong — `since` **inclusive**, `until` enforced as a real
+  upper bound *after* the read, a deleted bot keeping an unnamed row, a store
+  error reading a bot never failing the report — would drift, and the one that
+  drifted would be wrong in a way nobody notices, because a report is only ever
+  compared against a number somebody remembers. `UsageReport::window` is that one
+  function; both callers go through it. Two things the report deliberately does
+  **not** do: estimate (a backend that reports nothing leaves zeros, and `turns`
+  is carried so "nothing ran" is distinguishable from "turns ran, nothing
+  reported"), and price (converting tokens to money needs the owner's per-model
+  rates; a built-in table would be a guess with a decimal point).
+- **D9.17 A backup is `VACUUM INTO`, and its manifest is verified against the
+  snapshot.** Copying `<data>/swarmbot.sqlite` while the brain runs is not a
+  backup: committed transactions may still be in the `-wal`, so the copy is stale,
+  and a torn SQLite file still opens and reports plausible data — the failure is
+  silent, which is the worst kind for the one file holding everything. The
+  snapshot therefore goes through SQLite's own locking, and `MANIFEST.json` is
+  written **last** (via temp + rename) so a half-finished backup leaves a
+  directory that `verify` refuses rather than one that merely looks complete.
+  `verify` re-derives every number from the snapshot and the transcript tree
+  instead of believing the manifest: a manifest that lies is a detected failure.
+  Restoring is deliberately not a code path — it is "open the snapshot as a
+  store", which `SqliteStore::open` already does, and the test suite proves that
+  rather than trusting the bytes. A non-empty target is a typed refusal, never a
+  silent overwrite.

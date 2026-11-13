@@ -6,19 +6,21 @@ document describes the shape those decisions produced. Tool-level detail is in
 [`tools.md`](tools.md), the node wire in [`node-protocol.md`](node-protocol.md),
 the desktop app in [`ui.md`](ui.md).
 
-State of the tree when this was written: **eleven of the twelve crates are built
-and tested** — `contracts`, `store`, `llm`, `tools`, `core` (including the thirteen
+State of the tree when this was written: **all twelve crates are built and
+tested** — `contracts`, `store`, `llm`, `tools`, `core` (including the fourteen
 bot-facing tools), `client`, `node-protocol`, `brain` (REST + `/ws/live` + owner
-auth), `cli` (embedded *and* remote), `node` (the daemon) and `ui` (the GPUI app).
-`mcp` is the only scaffold. The brain's **node gateway is real**
+auth), `cli` (embedded *and* remote), `node` (the daemon), `ui` (the GPUI app) and
+`mcp` (stdio + streamable HTTP, mounted at `/mcp` and `/mcp/t/{token}`). The
+brain's **node gateway is real**
 (`brain/src/gateway/`): pairing, the signed upgrade, the roster and a dispatcher
 that routes a bot's tool call to the right machine — and
 `crates/node/tests/real_brain.rs` pins an in-process brain against the **real
 `swarmbot-node` binary**, including a remote tool call proven by a marker file on
 the node and a decoy on the brain ([`node-protocol.md`](node-protocol.md) §11.1).
-The last full `scripts/check.sh` was **965 passed, 0 failed, 1 ignored** (fmt 1 s,
-clippy 16 s, tests 89 s); the ignored one is the live-gateway LLM test behind
-`PROTO_LIVE_LLM`.
+The last full `scripts/check.sh` was **1.283 passed, 0 failed, 4 ignored** (tests
+289 s, 336 s total); the ignored ones are the live-gateway LLM test behind
+`PROTO_LIVE_LLM`, the live ACP-agent test behind `PROTO_LIVE_ACP`, and two
+doctests in `store/src/threaded.rs` that need a runtime a doctest does not have.
 
 ---
 
@@ -91,7 +93,7 @@ and a stale write is a `Conflict`, never a silent overwrite.
 | Live change | `live::LiveEvent` | — | `events_log`, `meta` (`live_epoch`) | `core::LiveHub` |
 | Settings | `config::Settings` | — | `settings` (one row) | `core::SettingsHandle` |
 | Invocation | `tool::Invocation` | `inv_` | *not stored* — audit JSONL on the node | `tools::AuditLog` |
-| Routine / run | `RoutineId`, `RunId` exist | `rtn_`, `run_` | **no table yet** | M7 |
+| Routine / run | `routine::Routine`, `RoutineRun` | `rtn_`, `run_` | `routines`, `routine_runs` | `core::RoutineScheduler` (MIGRATION_0002) |
 
 The port these tables sit behind is `contracts::repo::Persistence` — a bundle of
 13 traits (`BotRepo`, `ConversationRepo`, `EntryRepo`, `TurnRepo`,
@@ -296,6 +298,7 @@ is silently lost.
 | Secrets | `{"ENV_NAME": "key"}`, 0600 — `brain::config` reads it and warns when the file is readable by more than its owner; the map is handed to `BackendRegistry::new`. Never in SQLite, never in argv, redacted from `Debug`, and registered with `brain::telemetry` so a stray log line is scrubbed | `<data>/secrets.json` |
 | Owner auth | the one-time login token, 0600, printed once when created; `POST /api/session` exchanges it for a session cookie (a browser cannot send `Authorization` on a WebSocket upgrade). Compared in constant time | `<data>/owner-token` |
 | Workspaces | one directory per bot, plus `.spool/` for spilled tool output | `<data>/workspaces/<bot name>/` |
+| Backup | `store::backup` — `VACUUM INTO` (not `cp`: committed-but-uncheckpointed WAL pages are invisible to a file copy, and a torn SQLite file still opens), the transcript tree, and a `MANIFEST.json` written **last** so a half-finished backup is never mistaken for a whole one. `verify` re-derives every number from the snapshot instead of trusting the manifest | `<out>/swarmbot.sqlite`, `<out>/transcripts/`, `<out>/MANIFEST.json` |
 
 Timestamps are stored as fixed-width RFC 3339 UTC with microsecond precision
 (`store::ts`), so lexicographic order equals chronological order in SQLite and the
@@ -356,12 +359,11 @@ Each of these is a hole with a shape, not a hole in the dark:
 
 | Missing | The seam that is already there | Milestone |
 | --- | --- | --- |
-| `NodeExecutor::exec` carrying the `Invocation` | Every `fs.*`/`shell.exec` payload needs `inv`, so the brain's dispatcher currently *derives* attribution (one running turn on a bot hosted on that node ⇒ that turn, else a `bot_unknown`/`cnv_unknown` sentinel with a distinct invocation id). Sound today, inference nonetheless; widening the port touches `tools`, `core`, `node` and `brain` at once (D9.12) | — |
-| A remote dispatcher in the embedded CLI | `LocalExecutor` now knows its own `node_id` and **refuses** a call addressed to another node instead of absorbing it (D9.11 — absorbing ran a remote bot's tools on the brain's machine, invisibly). `swarmbot-brain` puts `NodeDispatcher` in front; `core::compose` does not, so a remote-bound bot in `swarmbot run` gets a typed refusal. The fix is for `core::compose` to accept an executor | — |
-| MCP gateway | `ToolRegistry` is transport-neutral: `specs()`/`dispatch()` are all an MCP server needs, and `BackendKind::owns_tool_loop()` already tells the runner not to drive tool rounds for a harness. `brain` already depends on `swarmbot-mcp`, which is a one-line scaffold | M3 |
-| Claude CLI backend | `llm::ClaudeCli` implements `LlmBackend` with an honest `probe()` (binary + `--version`) and `chat()` returning `Unavailable{…not implemented in this milestone}`; capabilities declare `tool_calls: false`, `steer: true`. It needs the MCP gateway above to be useful | M3 |
+| ~~`NodeExecutor::exec` carrying the `Invocation`~~ | **Built (D9.12).** The port takes `&Invocation`, the dispatcher forwards it verbatim, and `attribute()` is gone. `unattributed()` survives only for `node.requestApproval` when a node names a bot this brain cannot place | — |
+| A remote dispatcher in the embedded CLI | Not a missing wire but a property of the mode: a node dials the brain's gateway, and the embedded CLI has no listener, so nothing can pair with it. `LocalExecutor` knows its own `node_id` and **refuses** a call addressed elsewhere instead of absorbing it (D9.11 — absorbing ran a remote bot's tools on the brain's machine, invisibly). Use `--brain` when remote nodes matter; see [`node-protocol.md`](node-protocol.md) §13 item 6 | — |
 | Data streams (pty, file transfer) | `streams.rs` mints and brokers the one-time tokens; the framing, the stream kinds and `/node/stream/:id` are absent, and `NodeCall` has no stream-bearing variant, so nothing pretends to support one | M7 |
-| Routines, memory, skills | ids exist (`RoutineId`, `RunId`), `RenderOptions.memory_index` is a parameter the renderer already caps at 4 KiB, and `Bot.skills` is a stored field nothing reads yet | M7 |
+| `codex app-server` backend | `BackendKind::CodexAppServer` is a typed `Unavailable` with an honest probe row; the seam is `LlmBackend` plus `owns_tool_loop()`, which is already true for it | M7 |
+| A skill *library* UI, and per-skill enable/disable | `Bot.skills` is rendered from `<data>/skills/<name>/SKILL.md` (or `<name>.md`), capped per skill and per turn; there is no editor and no discovery, so the owner writes the files | M7 |
 | TLS, and any non-unix host | `wss://`/`https://` origins are rewritten correctly and rustls is linked, but no TLS-terminating brain has been dialed; `crates/node` calls `libc::gethostname` and `killpg` unconditionally, so the daemon is unix-only in practice | — |
 
 ## 10. Public API
@@ -389,6 +391,7 @@ is the protocol's own order — a single-use ten-minute code for `/node/pair`, a
 | `GET`/`POST /api/rules`, `DELETE /api/rules/{id}` | approval rules |
 | `GET`/`PATCH /api/settings` | the kill switch, hop limit, ceilings |
 | `GET /api/backends`, `GET /api/backends/probe` | the backend list (redacted) and `probe()` results |
+| `GET /api/usage?since=…` | a `UsageReport`: what the window's turns spent, per bot and in total, **as the backends reported it**. Default window 24 h, `since` inclusive and RFC 3339; a malformed or future `since` is a 400, not zeros |
 | `POST /api/shutdown` | ask the daemon to stop; the CLI's `shutdown` then polls `/api/health` for up to 10 s and says whether it actually went down |
 | `GET /ws/live` | the live event socket (§6), cookie or bearer, `Origin` allow-listed |
 | `POST /node/pair`, `GET /node` | the node gateway: redeem a pairing code; serve the signed control socket (§8 of this doc's sibling, [`node-protocol.md`](node-protocol.md)) |

@@ -175,10 +175,44 @@ salah ketik hostname bisa mencoba lagi dengan kode yang sama.
 
 Semua milik node hidup di satu data dir: `identity.json` (kunci privat Ed25519,
 0600, tidak pernah keluar dari node), `node.toml` (tanpa rahasia), `workspace/`
-(satu-satunya root default), `audit/`, `spill/`, `node-state.json`. Ceiling node
+(root default pertama, read-write), `spill/` (root default kedua, **read-only** —
+jadi keluaran yang di-spill bisa dibaca balik dengan `fs.read` tetapi direktori itu
+tidak bisa dipakai menulis), `audit/`, `node-state.json`. Ceiling node
 selalu menang atas ceiling brain (`min(brain, node)` per permukaan), dan pencabutan
 (`DELETE /api/nodes/{id}`) menutup socket dengan 4401 — node berhenti mendial dan
 operator disuruh pair ulang.
+
+**6. Pemakaian token dan backup** — dua hal yang dulu tidak punya permukaan sama
+sekali:
+
+```bash
+cargo run -p swarmbot-cli -- --data-dir ./data usage                    # 24 jam terakhir
+cargo run -p swarmbot-cli -- --data-dir ./data usage --since 2026-11-01T00:00:00Z
+cargo run -p swarmbot-cli -- --brain http://127.0.0.1:8787 --data-dir ./data usage --json
+
+cargo run -p swarmbot-cli -- --data-dir ./data backup create --out ./backup-2026-11-13
+cargo run -p swarmbot-cli -- backup verify ./backup-2026-11-13
+```
+
+`usage` melaporkan **apa yang dilaporkan backend**, bukan estimasi: `turns` ikut
+ditampilkan supaya "0 token karena tidak ada turn" bisa dibedakan dari "0 token
+karena backend-nya diam". Tidak ada tabel harga per token di mana pun — mengubah
+token menjadi uang butuh tarif pemilik, dan menebaknya adalah kebohongan dengan
+titik desimal. `--brain` memakai route yang sama (`GET /api/usage`), dan keduanya
+melipat lewat fungsi yang sama (`UsageReport::window`), jadi mode embedded dan
+daemon tidak bisa berbeda angka untuk turn yang sama.
+
+`backup create` menyalin `<data>/swarmbot.sqlite` lewat `VACUUM INTO` — **bukan
+`cp`**: transaksi yang sudah commit tapi masih di `-wal` tidak ikut kalau file-nya
+hanya disalin, dan SQLite yang robek tetap terbuka serta menampilkan data yang
+masuk akal. Transkrip JSONL ikut, lalu `MANIFEST.json` ditulis **paling akhir**,
+jadi backup yang gagal di tengah tidak pernah terlihat sah. Perintahnya lalu
+memverifikasi hasilnya sendiri sebelum melaporkan sukses, dan `backup verify`
+membaca ulang snapshot: `PRAGMA integrity_check`, jumlah baris per tabel dihitung
+dari snapshot (bukan dari manifest), dan manifest yang berbohong adalah kegagalan
+bertipe. Target yang tidak kosong ditolak, bukan ditimpa. `backup` adalah kerja
+filesystem lokal: dengan `--brain` ia menolak, karena database-nya ada di mesin
+daemon itu.
 
 **Konfigurasi**:
 
@@ -239,10 +273,10 @@ model = "sonnet"
 binary = "claude"
 ```
 
-Hari ini adapter ini hanya `probe()` yang sungguh bekerja (mencari binary dan
-menjalankan `--version`); `chat()` menjawab `Unavailable` dengan alasan yang
-jujur. Loop tool milik harness sendiri (`owns_tool_loop() == true`) baru tersambung
-lewat MCP gateway di M3.
+`chat()` berjalan: ia men-spawn `claude -p` dengan protokol stream-json, dan tool
+milik SwarmBot sampai ke harness lewat MCP (`--mcp-config` menunjuk server MCP
+kita). Loop tool milik harness sendiri (`owns_tool_loop() == true`) berarti runner
+tidak menggerbangi tool round; `capabilities()` menyatakan itu apa adanya.
 
 **3. Agen ACP** (`kind = "acp"`) — satu adapter untuk setiap agen yang berbicara
 [Agent Client Protocol](https://agentclientprotocol.com) (JSON-RPC 2.0 di atas
@@ -321,9 +355,9 @@ Cara kerjanya dan batasnya, stated plainly:
   layar Settings bisa bilang "agen siap / tidak ada / belum login" beserta
   metode auth yang agen iklankan.
 - **Aktivitas tool agen belum ditranskrip** — satu baris log per aksi; transcript
-  menampilkan teks dan reasoning. Tool delegasi kita (`message_bot`, dst.) juga
-  belum menjangkau agen ACP; itu pekerjaan MCP gateway (M3), sama seperti untuk
-  harness `claude_cli`. Shutdown koneksi menutup stdin agen lebih dulu (EOF —
+  menampilkan teks dan reasoning. Tool delegasi kita (`message_bot`, dst.)
+  menjangkau agen lewat MCP per-turn (`/mcp/t/{token}`, disaring sesuai toolset
+  bot itu). Shutdown koneksi menutup stdin agen lebih dulu (EOF —
   agen stdio yang baik keluar dan mengurus anaknya sendiri) lalu, setelah 2
   detik, membunuh seluruh grup prosesnya: wrapper `npx` tidak bisa
   melewatinya, dan `opencode acp` yang melepas child `serve`-nya ke grup
@@ -347,18 +381,18 @@ Login `claude.ai`/ChatGPT milik bot tidak pernah dibaca atau diteruskan.
 
 | Crate | Isi | Status (tes dari run terakhir) |
 | --- | --- | --- |
-| `swarmbot-contracts` | Domain types shared by every SwarmBot crate: ids, transcript entries, deliveries, turns, tasks, requests, nodes, tools, errors and live events. | selesai — 69 |
-| `swarmbot-llm` | LLM backend port and adapters: OpenAI-compatible HTTP (SSE + tool calls), ACP agent harnesses (opencode / Claude Code / Codex), CLI harnesses, and a deterministic Fake for tests. | selesai — 96 (+2 `#[ignore]`: gateway live `PROTO_LIVE_LLM`, agen ACP live `PROTO_LIVE_ACP`). `AcpAgent`: nyata end-to-end — 15 tes unit + 15 tes integrasi offline (agen terskrip in-memory + `/bin/sh` lewat stdio nyata) dan satu turn live terverifikasi lewat `codex-acp`. `ClaudeCli`: `probe()` nyata, `chat()` menjawab `Unavailable` dengan alasan jujur |
-| `swarmbot-tools` | Tool registry and local handlers (shell, fs, glob, grep) with the path policy, safety ceilings, output spilling and audit log. | selesai — 95 |
-| `swarmbot-store` | SQLite projections (WAL, migrations), the append-only JSONL transcript mirror and boot recovery. | selesai — 11 (5 lib + 2 memory + 4 sqlite; satu contract suite dijalankan ke dua store) |
-| `swarmbot-core` | Orchestration: one runner per bot, deliveries, group routing, bot-to-bot messaging, handoffs, background tasks, approvals, instructions and the live hub. | selesai — 168 (159 lib + 9 integrasi delegasi), termasuk `bot_tools.rs`: 13 tool delegasi |
-| `swarmbot-client` | Blocking brain API client (REST + live WebSocket) shared by the CLI and the GPUI desktop app. | selesai — 38 (37 + 1 doctest): `BrainClient`, `LiveSubscription`, `ClientError`, `StubBrain` di balik `features = ["test-support"]` |
-| `swarmbot-node-protocol` | Node wire protocol: bidirectional JSON-RPC mux, Ed25519 pairing and signed upgrades, one-time stream tokens, typed errors. | selesai — 70 (67 lib + 2 WebSocket + 1 doctest): `wire`, `mux`, `auth`, `pairing`, `identity`, `streams`, `rpc`, `testing` |
-| `swarmbot-brain` | Composition root: the brain daemon with the public API, the live WebSocket, the node gateway and the in-process local node. | selesai — 169 (121 lib + 14 api + 10 live + 8 node-gateway + 8 operations + 6 cli + 2 client-contract) |
-| `swarmbot-cli` (bin `swarmbot`) | Terminal client: chat with bots, run one-shot tasks, watch delegation, answer approvals, pair nodes. | selesai — 106. Dua mode lewat satu port `Session`: `Embedded` (in-process) dan `Remote` (`--brain`) |
-| `swarmbot-node` (bin `swarmbot-node`) | The hands: a node daemon that pairs with a brain and executes fs/shell RPCs under its own policy. | selesai — 135 (71 lib + 64 integrasi, 0 diabaikan), termasuk `tests/real_brain.rs` (3) yang menjalankan binary node sungguhan melawan brain nyata |
-| `swarmbot-ui` (bin `swarmbot-ui`) | GPUI desktop app: sidebar, conversations, live streaming transcript, delegation graph, approval cards, nodes and settings. | selesai — 39. 8.797 baris: `view/{sidebar,conversation,composer,graph,cards,nodes,settings,palette}`, `widgets/{text_input,markdown,bits}`, `reducer`, `worker`, `spawn` |
-| `swarmbot-mcp` | Exposes the SwarmBot tool registry as an MCP server (stdio for CLI harnesses, streamable HTTP for the internal listener). | **scaffold** (M3) — satu-satunya crate yang belum ditulis |
+| `swarmbot-contracts` | Domain types shared by every SwarmBot crate: ids, transcript entries, deliveries, turns, tasks, requests, nodes, tools, errors and live events. | selesai — 81 |
+| `swarmbot-llm` | LLM backend port and adapters: OpenAI-compatible HTTP (SSE + tool calls), ACP agent harnesses (opencode / Claude Code / Codex), CLI harnesses, and a deterministic Fake for tests. | selesai — 138 (+2 `#[ignore]`: gateway live `PROTO_LIVE_LLM`, agen ACP live `PROTO_LIVE_ACP`). `AcpAgent`: nyata end-to-end — 15 tes unit + 15 tes integrasi offline (agen terskrip in-memory + `/bin/sh` lewat stdio nyata) dan satu turn live terverifikasi lewat `codex-acp`. `ClaudeCli`: `probe()` nyata dan `chat()` yang berjalan lewat `claude -p` + MCP |
+| `swarmbot-tools` | Tool registry and local handlers (shell, fs, glob, grep) with the path policy, safety ceilings, output spilling and audit log. | selesai — 115 |
+| `swarmbot-store` | SQLite projections (WAL, migrations), the append-only JSONL transcript mirror and boot recovery. | selesai — 39 (11 lib + 12 backup + 2 memory + 4 sqlite + 10 threaded; satu contract suite dijalankan ke dua store) |
+| `swarmbot-core` | Orchestration: one runner per bot, deliveries, group routing, bot-to-bot messaging, handoffs, background tasks, approvals, instructions and the live hub. | selesai — 218 (209 lib + 9 integrasi delegasi), termasuk `bot_tools.rs`: 13 tool delegasi |
+| `swarmbot-client` | Blocking brain API client (REST + live WebSocket) shared by the CLI and the GPUI desktop app. | selesai — 43 (42 + 1 doctest): `BrainClient`, `LiveSubscription`, `ClientError`, `StubBrain` di balik `features = ["test-support"]` |
+| `swarmbot-node-protocol` | Node wire protocol: bidirectional JSON-RPC mux, Ed25519 pairing and signed upgrades, one-time stream tokens, typed errors. | selesai — 74 (71 lib + 2 WebSocket + 1 doctest): `wire`, `mux`, `auth`, `pairing`, `identity`, `streams`, `rpc`, `testing` |
+| `swarmbot-brain` | Composition root: the brain daemon with the public API, the live WebSocket, the node gateway and the in-process local node. | selesai — 197 (136 lib + 19 api + 10 live + 8 node-gateway + 9 operations + 7 mcp-gateway + 6 cli + 2 client-contract) |
+| `swarmbot-cli` (bin `swarmbot`) | Terminal client: chat with bots, run one-shot tasks, watch delegation, answer approvals, pair nodes. | selesai — 153. Dua mode lewat satu port `Session`: `Embedded` (in-process) dan `Remote` (`--brain`); `usage` dan `backup` termasuk |
+| `swarmbot-node` (bin `swarmbot-node`) | The hands: a node daemon that pairs with a brain and executes fs/shell RPCs under its own policy. | selesai — 138 (73 lib + 65 integrasi, 0 diabaikan), termasuk `tests/real_brain.rs` (4) yang menjalankan binary node sungguhan melawan brain nyata |
+| `swarmbot-ui` (bin `swarmbot-ui`) | GPUI desktop app: sidebar, conversations, live streaming transcript, delegation graph, approval cards, nodes and settings. | selesai — 77. 15.463 baris: `view/{sidebar,conversation,composer,graph,cards,nodes,settings,palette,routines,provider_menu,side_panel}`, `widgets/{text_input,markdown,bits}`, `reducer`, `worker`, `spawn`, `selftest` |
+| `swarmbot-mcp` | Exposes the SwarmBot tool registry as an MCP server (stdio for CLI harnesses, streamable HTTP for the internal listener). | selesai — 10 tes integrasi. `/mcp` dan `/mcp/t/{token}` ter-mount di brain; `/mcp` memakai gerbang owner token yang sama dengan API publik |
 
 Keterangan crate adalah string `description` dari `Cargo.toml` masing-masing; angka
 tes dari `cargo test --workspace` (bukan hasil grep).
@@ -370,20 +404,22 @@ tes dari `cargo test --workspace` (bukan hasil grep).
 | **M0** Fondasi | `contracts` (14 modul + `lib.rs`), `store` (`SqliteStore` + `MemoryStore` + `JsonlMirror` + satu contract suite untuk keduanya) | **selesai** |
 | **M1** Agent loop + tool lokal | `llm` (`OpenAiCompat` SSE + tool call + retry + hint 402, `FakeBackend`, `BackendRegistry`, `ClaudeCli` probe), `tools` (registry, `PathPolicy`, `PolicyEngine`, `AuditLog`, `LocalExecutor`, 7 handler), `core/runners` (loop turn, streaming ke transcript, tool rounds, kompaksi) | **selesai** |
 | **M2** Delegasi multi-agen | `core`: `router`, `messaging`, `tasks` (`submit` satu pintu untuk `start_task` dan `handoff_task`), `approval`, `instructions`, `bus`, `transcript`, `session`, `swarm`, `compose`, `bot_tools` (13 tool) | **selesai** |
-| **M3** MCP gateway + backend Claude | `crates/mcp`, adapter stream-json `claude -p` | **belum** — satu-satunya milestone yang belum dimulai |
+| **M3** MCP gateway + backend Claude | `crates/mcp`, adapter stream-json `claude -p` | **selesai**: `crates/mcp` (stdio + streamable HTTP), `/mcp` di listener internal dengan autentikasi owner, `/mcp/t/{token}` per-turn untuk harness yang punya tool loop sendiri, dan `llm::ClaudeCli::chat` yang benar-benar berjalan lewat `--mcp-config` |
 | **M4** Brain API + CLI | `crates/brain` (axum REST + `/ws/live` + auth owner), `crates/client`, `crates/cli` (embedded + remote) | **selesai** |
 | **M5** UI desktop GPUI | jendela nyata, sidebar, transcript streaming, composer, delegation graph, kartu approval, nodes, settings, palet | **selesai** (render lewat llvmpipe di mesin ini — lihat [`docs/ui.md`](docs/ui.md) §2) |
-| **M6** Node daemon | `crates/node-protocol` (mux, pairing, upgrade bertanda tangan), `crates/node` (daemon: pair/run/status, policy sendiri, audit, redial), `brain/src/gateway/` (roster, dispatcher, socket axum) | **selesai**: pairing → hello → `fs.*` → `shell.exec` streaming → revoke 4401 teruji tiga lapis (wire 70 tes, daemon 135, gateway 8 di `brain/tests/node_gateway.rs`), dan `crates/node/tests/real_brain.rs` (3 tes, ~0,4 s, selalu jalan) menjalankan **dua sisi nyata sekaligus**: brain in-process + binary `swarmbot-node` sebagai child, termasuk tool call jarak jauh yang dibuktikan lewat berkas penanda |
-| **M7** Penguatan | routines, memory, skills, data stream `/node/stream/:id`, backend `codex app-server`, backup | **belum** |
+| **M6** Node daemon | `crates/node-protocol` (mux, pairing, upgrade bertanda tangan), `crates/node` (daemon: pair/run/status, policy sendiri, audit, redial), `brain/src/gateway/` (roster, dispatcher, socket axum) | **selesai**: pairing → hello → `fs.*` → `shell.exec` streaming → revoke 4401 teruji tiga lapis (wire 70 tes, daemon 135, gateway 8 di `brain/tests/node_gateway.rs`), dan `crates/node/tests/real_brain.rs` (4 tes, ~0,5 s, selalu jalan) menjalankan **dua sisi nyata sekaligus**: brain in-process + binary `swarmbot-node` sebagai child, termasuk tool call jarak jauh yang dibuktikan lewat berkas penanda |
+| **M7** Penguatan | routines, memory, skills, data stream `/node/stream/:id`, backend `codex app-server`, backup | **sebagian**: routines berjalan (ticker dipanggil di brain dan CLI embedded, `RoutineRun` ditutup saat turn selesai), memory punya jalur tulis (`remember` → `MEMORY.md`), skills dibaca dari pustaka `<data>/skills/<nama>/SKILL.md`, **backup selesai** (`swarmbot backup create/verify`, `VACUUM INTO` + manifest yang diverifikasi ulang dari snapshot), dan **usage token punya permukaan** (`GET /api/usage`, `swarmbot usage`, `UsageReport`). **Belum**: data stream `/node/stream/:id` (token ada, framing belum), backend `codex app-server` (masih refusal bertipe) |
 
 Run terakhir yang tercatat: `scripts/check.sh` exit 0 — fmt + clippy + tes,
-**1021 lulus, 0 gagal, 2 di-`#[ignore]`**. Yang diabaikan memang butuh sesuatu
-yang tidak ada di gate: tes gateway live llm (`PROTO_LIVE_LLM=1`) dan tes agen
-ACP live (`PROTO_LIVE_ACP=1`, plus `PROTO_LIVE_ACP_CMD`; tanpa
-`PROTO_LIVE_ACP_PROMPT=1` ia berhenti di handshake yang gratis).
+**1.283 lulus, 0 gagal, 4 di-`#[ignore]`** (289 s tes; 336 s total). Yang
+diabaikan memang butuh sesuatu yang tidak ada di gate: dua tes live — gateway llm
+(`PROTO_LIVE_LLM=1`) dan agen ACP (`PROTO_LIVE_ACP=1`, plus `PROTO_LIVE_ACP_CMD`;
+tanpa `PROTO_LIVE_ACP_PROMPT=1` ia berhenti di handshake yang gratis) — plus dua
+doctest di `store/src/threaded.rs` yang ditandai `ignore` karena memerlukan
+runtime yang tidak dimiliki doctest.
 Perincian per crate ada di tabel di atas; `scripts/check.sh` adalah yang menentukan.
 
-Catatan yang belum ada di kode mana pun: repository ini **belum** `git init`.
+Repository ini adalah repo git; riwayatnya ada di `git log`.
 
 ### Yang belum diverifikasi
 
@@ -399,6 +435,10 @@ Ditulis di sini supaya tidak ada yang mengira ini sudah terbukti:
 | `LiveEvent::Resync` karena broadcast yang **lagged** | resync akibat cursor basi/epoch lain teruji (`brain/tests/live.rs`, `client_contract.rs`); cabang `Lagged` di `LiveHub::subscribe` tidak punya pemicu deterministik |
 | Frame rate GPUI di GPU nyata | sesi ini tidak punya `/dev/dri`; semua render lewat llvmpipe |
 | Windows | `crates/node` memanggil `libc::gethostname` dan `killpg` tanpa syarat, jadi daemon-nya unix-only dalam praktik |
+| Roster node di bawah konkurensi | `node.hello` dan `node.heartbeat` sama-sama read–modify–write pada baris roster yang sama, dan `update_node` menulis seluruh baris tanpa CAS. Heartbeat yang membaca sebelum hello menulis akan menimpa policy dengan nilai lama — di UI artinya ceiling yang ditampilkan bisa bukan ceiling node itu. Teridentifikasi dan tercatat di [`review.md`](docs/review.md) §9; **belum diperbaiki** |
+| Apakah adapter sungguhan mengisi `Usage` | semua angka yang pernah dilihat gate berasal dari `FakeBackend::with_usage`; `UsageReport` menampilkan apa yang ada di `Turn.usage`, dan untuk backend yang tidak melaporkan apa pun hasilnya nol dengan `turns` bukan nol. `openai`/`acp`/`claude-cli` terhadap model nyata belum diuji untuk ini |
+| Panel usage di UI desktop | route `GET /api/usage` dan `swarmbot usage` ada; GPUI belum menampilkannya |
+| Restore backup ke brain yang **sedang berjalan** | yang terbukti: snapshot dibuka sebagai store yang berfungsi dan berisi data pemilik (tes `the_snapshot_opens_as_a_store_and_serves_the_owners_data`), dan backup dari store hidup dengan WAL belum di-checkpoint konsisten. Prosedur "taruh kembali sebagai `<data>/swarmbot.sqlite` sambil brain hidup" tidak diuji |
 | Agen ACP **nyata** di dalam test suite | suite memakai agen terskrip in-memory (seluruh protokol: streaming, permission, cancel, timeout, respawn) plus `/bin/sh` lewat stdio nyata (framing + kill grup proses). Agen sungguhan diverifikasi manual di mesin ini: handshake + `session/new` untuk **opencode**, **claude-code-acp** dan **codex-acp**, dan **satu turn penuh lewat codex-acp** (balasan `PONG`, 5,4 s — satu panggilan model kecil). Turn penuh opencode/Claude Code belum: opencode konfigurasi global pemilik menggantung di `session/new` (sisi opencode, bukan adapter — timeout setup kita menangkapnya dengan jujur), dan Claude Agent SDK tidak menemukan kredensial di mesin ini. Tes live satu-turn ada di gate env: `PROTO_LIVE_ACP=1` |
 
 ## Keamanan
@@ -449,11 +489,10 @@ D5.1–D5.7. Ringkasnya:
   tidak pernah menggagalkan tool call.
 - **Node menyimpan semuanya di satu data dir**: `identity.json` (kunci privat
   Ed25519, 0600, tidak pernah keluar dari node), `node.toml` (tanpa rahasia),
-  `workspace/` (satu-satunya root default), `audit/`, `spill/`, `node-state.json`.
-  Catatan jujur: **`spill/` tidak berada di dalam root secara default**, jadi
-  keluaran yang di-spill tidak bisa dibaca balik lewat `fs.read` kecuali pemilik
-  menambah root yang meliputinya (`--root <data>/spill`). Tanpa itu, teks spill yang
-  diterima model menunjuk berkas yang tidak bisa ia buka.
+  `workspace/` (root default pertama, read-write), `spill/` (root default kedua,
+  **read-only**), `audit/`, `node-state.json`. `spill/` sengaja read-only: teks
+  spill yang diterima model menunjuk berkas yang benar-benar bisa ia buka, dan
+  direktori itu tidak bisa dipakai sebagai ruang tulis bebas.
 - **Tidak ada endpoint tanpa auth.** Termasuk `/api/health`: UI yang men-spawn
   brain membaca `owner-token` yang brain itu baru minting (D9.10) alih-alih meminta
   pengecualian. Upgrade WebSocket juga wajib lolos allow-list `Origin`, karena

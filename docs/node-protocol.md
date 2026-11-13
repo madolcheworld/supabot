@@ -12,11 +12,11 @@ D1.1–D1.5. This is a deliberate subset of OpenBot's node protocol v1
 but with SwarmBot's own string prefixes, so a code or signature from another
 product never validates here.
 
-**What exists.** `crates/node-protocol` is implemented (5,904 lines; 67 lib tests
-+ 2 WebSocket integration tests + 1 doctest = **70**), and so is the daemon that
-uses it: `crates/node` (6,186 lines of source; **135 tests, none ignored**), which
-dials out, pins the brain key, serves `fs.*` and streaming `shell.exec` under its
-own policy, and refuses what it cannot do.
+**What exists.** `crates/node-protocol` is implemented (6,339 lines of source;
+71 lib tests + 2 WebSocket integration tests + 1 doctest = **74**), and so is the
+daemon that uses it: `crates/node` (6,186 lines of source; **135 tests, none
+ignored**), which dials out, pins the brain key, serves `fs.*` and streaming
+`shell.exec` under its own policy, and refuses what it cannot do.
 
 | Module | Owns | Doc section |
 | --- | --- | --- |
@@ -24,7 +24,7 @@ own policy, and refuses what it cannot do.
 | `pairing.rs` | Crockford-base32 codes, normalization, hashing, constant-time compare | §2.1 |
 | `auth.rs` | the signed upgrade header, ordered verification, bounded replay cache, `node.hello` signatures, brain-origin derivation, close codes | §3 |
 | `wire.rs` | the JSON-RPC 2.0 envelope: frames, type-preserving ids, tagged error causes, direction routing | §4, §7 |
-| `mux.rs` | `Peer` over any `Socket`: streaming + Acks, interruption, ping/liveness, the `NotAuthenticated` gate; `WsSocket`, `connect_ws*`, `accept_ws*` | §3.3, §4 |
+| `mux.rs` | `Peer` over any `Socket`: streaming + Acks, interruption, ping/liveness, **call deadlines and withdrawal**, the `NotAuthenticated` gate; `WsSocket`, `connect_ws*`, `accept_ws*` | §3.4, §3.5, §4 |
 | `streams.rs` | one-time data-stream tokens and `StreamBroker` bookkeeping | §8 |
 | `rpc.rs` | method names, payload structs, the unimplemented-method refusal table | §5, §6, §9 |
 | `testing.rs` | in-memory sockets for tests, public | §10 |
@@ -278,6 +278,16 @@ The success value is `rpc::NodeHello`:
   surface.
 * `tunnels` is optional and empty here (no tunnelling in this build).
 
+**The brain's hello has a deadline: `HELLO_DEADLINE = 10 s`**
+(`brain/src/gateway/session.rs`). A node that dials, upgrades and keeps its socket
+alive with pings while never answering `node.hello` would otherwise hold its
+registry slot — and the brain's session task — forever, because the liveness
+timeout below only notices a *silent* socket. On expiry the brain withdraws the
+call (it is sent `@effect/rpc/Interrupt`, and a late answer is ignored), logs the
+timeout and closes with `CLOSE_HELLO_FAILED` (4403), so the slot is released and a
+node that redials gets a fresh handshake. Ten seconds is far more than a hello
+needs — one signature check and one frame on the node's side.
+
 ### 3.3 Close codes
 
 `auth.rs` constants, used by `Socket::close(code, reason)`:
@@ -299,6 +309,11 @@ The success value is `rpc::NodeHello`:
   that long without **any** inbound frame. Any decoded frame counts as liveness, so
   a busy connection never pings itself to death. This is half-open detection: the
   brain marks the node offline, the node redials.
+* **Liveness is not a call deadline.** It bounds a *silent socket*, and nothing
+  else. A node that keeps pinging while a handler hangs — `fs.read` on a dead
+  network mount is the canonical case — is perfectly "live" and would hold the
+  caller forever. The bound on the *work* is separate and belongs to the caller;
+  see §3.5.
 * Application-level pings only: WebSocket-level ping/pong is left to tungstenite.
 * The node redials with exponential backoff from 250 ms to 30 s, ±50 % jitter,
   resetting only after a connection stayed up 10 s (`crates/node/src/dial.rs`;
@@ -312,6 +327,51 @@ The success value is `rpc::NodeHello`:
   strong clone, which made that branch dead code and leaked one task and one socket
   per disconnected node. `close(code, reason)` is still how you send a *close code*
   — drop is the leak-proof fallback, not the polite goodbye.
+
+### 3.5 Call deadlines and withdrawal
+
+A call's caller sets its own bound; the protocol does not. `mux::Peer` offers
+`call_with_id_deadline` and `call_stream_with_id_deadline` next to the unbounded
+`call_with_id` / `call_stream_with_id`, because the mux cannot know what a caller
+is willing to wait for and must not guess.
+
+**What the brain uses** (`brain/src/gateway/executor.rs`, `deadline_for`):
+
+| Call | Deadline | Why |
+| --- | --- | --- |
+| `fs.*` | `FS_CALL_DEADLINE = 60 s` | A hung filesystem call is a dead mount or a stalled server: it never answers. Long enough for a `fs.grep` over a large tree on a slow disk, short enough that a bot's single turn survives one stuck call. |
+| `shell.exec` | the caller's own `timeoutMs` + `SHELL_DEADLINE_GRACE = 30 s` | A command may legitimately run minutes, so the budget on the wire is the caller's, not a brain constant. The grace covers what the node still does after that timeout fires: kill the process group, drain the pipes, send the `Exit` chunk. Without it every timed-out command would be reported as a node failure instead of as the timed-out run it was. |
+| `node.hello` | `HELLO_DEADLINE = 10 s` | §3.2. |
+
+The deadline covers the **whole stream** for a streaming call, not the gap between
+chunks: a stream that dribbles chunks forever is exactly the shape a deadline
+exists to stop.
+
+**On expiry the call is withdrawn**, not merely abandoned. One driver command does
+both, in this order:
+
+1. the pending entry for that id is removed — so a reply that arrives afterwards
+   finds nothing, is logged and ignored, and cannot resurrect a call whose caller
+   has gone (and the dropped waiter cannot panic the driver);
+2. `@effect/rpc/Interrupt` is queued for that id (§4.7), which is the peer's cue to
+   stop the work;
+3. the caller gets `ProtocolError::CallTimedOut { method, after }` — deliberately
+   **not** `LivenessTimeout` (the socket was alive) and **not** a `Remote` error
+   (the peer said nothing). The brain turns that into a `ToolError::Failed` naming
+   the node and the kind of call. A timeout is a failure, never a denial: nothing
+   was refused, so `PolicyRefused` would be a lie about what happened.
+
+Withdrawing also drops the stream's chunk sink, which is what lets a collector
+finish instead of waiting for a stream that will never end.
+
+**A deadline is not a cancellation guarantee.** It bounds how long *this side
+waits*, and it *asks* the peer to stop. This build's node answers an interrupt by
+dropping the handler future, which runs its `Drop` guards and kills the process
+group (§4.7, §5.1) — but the brain cannot kill a process on another machine, and a
+peer that ignores the frame may still be running the command when the brain has
+given up. Its answer, if it ever comes, is discarded. Every error message and doc
+comment says so rather than implying the work was stopped, and nothing reports a
+success, an empty result or a finished job the brain cannot vouch for.
 
 ## 4. Wire format (JSON-RPC 2.0, Effect-RPC dialect)
 
@@ -374,6 +434,13 @@ Implemented in `wire.rs` (`Frame`, `Id`, `parse`, `render`, `direction`,
    `Interrupt` reason, which surfaces from the original `call`/`call_stream` as
    `ProtocolError::Remote`; the node kills the work's process group before
    answering.
+
+   The brain also sends an `Interrupt` **without waiting for that answer** when one
+   of its own call deadlines expires: it withdraws the call (pending entry removed,
+   so the late answer is ignored) and then asks the peer to stop (§3.5). That is
+   the one interrupt whose answer nobody reads, and it is honest about it — the
+   interrupt *asks*; the brain cannot kill a process on another machine, so the
+   work may outlive the call.
 9. **Payload-less RPCs** omit `params` or send `null`. `{}` is refused with the
    typed `ProtocolError::ExpectedNullParams` — the reference implementation fails
    these with "Expected null", and matching that keeps a foreign peer's error
@@ -621,7 +688,10 @@ direction.
 5. Implement the RPCs for the capabilities you declare. Enforce your own roots,
    deny list and ceilings; call `node.requestApproval` for `ask`; audit every
    invocation.
-6. On `@effect/rpc/Interrupt` or a socket drop, kill the work's process group.
+6. On `@effect/rpc/Interrupt` or a socket drop, kill the work's process group. A
+   brain call deadline arrives this way (§3.5): the brain has already stopped
+   waiting and will not read your answer, so an interrupt is the *only* chance to
+   stop the work — treat it as urgent, not as advisory.
 7. Redial with backoff; stop on close code `4401`.
 
 **Testing without sockets.** `node_protocol::testing` is public test support, not
@@ -642,16 +712,20 @@ direction.
 Three layers, and the point of the third is that the first two cannot fake each
 other.
 
-**The wire crate** — `node-protocol`, 67 lib tests + 2 in `tests/ws.rs` + 1 doctest
-= **70**: the header round trip and every verification failure mode (bad shape,
+**The wire crate** — `node-protocol`, 71 lib tests + 2 in `tests/ws.rs` + 1 doctest
+= **74**: the header round trip and every verification failure mode (bad shape,
 unknown node, revoked node, skew, replayed nonce, bad signature, and that a failed
 signature does *not* burn the nonce), hello sign/verify, pairing codes
 (normalization, hashing, constant-time compare, display vs raw), identity
 save/load/0600 and key-encoding errors, frame parse/render including ids that keep
 their JSON type, batches, `{}` params, trace fields, unknown cause `_tag`s, the mux
 (chunk/Ack strict alternation, interrupt, ping/liveness, the `require_hello` gate,
-and that dropping every handle closes the connection), stream-token
-single-use/expiry/wrong-token behaviour, and the method-table XOR coverage.
+and that dropping every handle closes the connection), **call deadlines and
+withdrawal** (§3.5: a call that is never answered fails at its deadline and is
+interrupted, a call answered in time still succeeds, a late answer neither panics
+nor breaks the connection, and a withdrawn stream's late chunk never reaches its
+collector), stream-token single-use/expiry/wrong-token behaviour, and the
+method-table XOR coverage.
 
 **The daemon** — `crates/node`, 71 lib + 64 integration = **135, none ignored**:
 
@@ -669,10 +743,14 @@ single-use/expiry/wrong-token behaviour, and the method-table XOR coverage.
 | `brain_end_to_end.rs` | 1 | a pairing **refusal** — any non-2xx, from any brain — is reported verbatim and nothing is written to disk; the expected envelope is built by the brain's own `error_body`, so neither half can drift |
 | `real_brain.rs` | 3 | **the two real halves together** — see below |
 
-**The gateway** — `crates/brain`, 121 lib + 48 integration = **169**, of which
+**The gateway** — `crates/brain`, 134 lib + 57 integration = **191**, of which
 `tests/node_gateway.rs` (**8**) drives the whole remote path — pairing, signed
 upgrade, `node.hello`, `fs.*`, streamed `shell.exec`, revoke → `4401` — against the
-real protocol library on a real loopback socket, with a *fake* node.
+real protocol library on a real loopback socket, with a *fake* node. Its lib tests
+pin the two brain-side deadlines over an in-memory pair (§3.5, §3.2): a hanging node
+fails a tool call with a `ToolError::Failed` naming the node and the method — never
+a `PolicyRefused`, because nothing was refused — while the turn's `exec` returns;
+and a node that never answers `node.hello` releases its slot instead of holding it.
 
 ### 11.1 What `real_brain.rs` adds
 
@@ -758,25 +836,29 @@ they are acceptable forever.
 
 **Debt.**
 
-1. `crates/node/src/shell.rs` **mirrors** `tools::handlers::shell::exec_shell`
-   instead of calling it. Every `fs.*` call goes through `tools::LocalExecutor` so
-   the local and remote paths cannot drift; `shell.exec` cannot, because the
-   executor answers with one *buffered* `ToolResult` while a socket needs
-   incremental chunks, a real pid and pgid in `Started`, and an `Exit` that says how
-   the run ended — and the implementation function that does the work is
-   `pub(crate)`. Its module header lists the **six things that must stay in sync**
-   (`sh -c` with null stdin and both pipes; `process_group(0)` + `kill_on_drop`;
-   the cleared-then-allowlisted environment; the clamped timeout that kills the
-   *group*; the post-exit grace period for background children holding the pipes;
-   the per-stream output cap and spill). The way out is to make `exec_shell` public
-   — or add a streaming variant in `tools` — and delete the copy. Until then, a
-   change to either side is a change to both.
-2. The node's spill directory `<data>/spill` is **not inside a root by default**:
-   the only default root is `<data>/workspace`. Output spilled there is therefore
-   not readable back through `fs.read` unless the owner adds a root covering it
-   (`--root <data>/spill`, or a `[[roots]]` entry in `node.toml`). The spill text
-   the model receives names a path it cannot open, which reads as a broken promise
-   rather than a policy.
+1. ~~`crates/node/src/shell.rs` mirrors `exec_shell`.~~ **Closed.** The streaming
+   implementation is now `tools::handlers::shell::exec_shell_streaming`, public,
+   with `ShellEvent`/`ShellEventSink`/`ShellOptions`/`ShellRun` re-exported from
+   `swarmbot_tools`. `crates/node/src/shell.rs` is a thin adapter: it contributes
+   the node's own policy, spill dir and audit line, and maps `ShellEvent` onto the
+   wire's `ShellChunk` — the spawn/pump/`killpg`/spill half is one body of code
+   again. One deliberate difference remains, and it is stated rather than hidden:
+   `exec_shell` (buffered, one exit → `ToolResult`) and `exec_shell_streaming`
+   (feeds an emitter, can be cut short by its transport) keep separate run loops,
+   side by side in that one file, both spawning through `build_shell_command` —
+   so process group, scrubbed environment and the clamped group timeout cannot
+   drift across the crate boundary. Tests: `the_streaming_run_sends_started_before_any_output`,
+   `a_cancelled_streaming_run_kills_the_process_group`,
+   `output_beyond_the_cap_is_spilled_to_a_file_the_result_names` (tools) and the
+   pre-existing `crates/node/src/shell.rs` suite.
+2. ~~The node's spill dir is not inside a root.~~ **Closed.** `NodeConfig::default()`
+   and `NodeConfig::new_in()` now have **two** roots: `<data>/workspace` (read-write,
+   still first) and `<data>/spill` (**read-only**). Output the model is told about
+   can be read back with `fs.read`; the spill directory is not writable, so it
+   cannot be used as free storage. An operator who passes `--root` still gets those
+   roots appended, and an explicit `[[roots]]` in `node.toml` replaces the defaults
+   as before. Tests: `the_default_roots_are_the_workspace_then_a_read_only_spill_directory`,
+   `a_spilled_file_can_be_read_back_but_the_spill_directory_is_not_writable`.
 3. **A refused *redial* loses the brain's reason.** When a revoked node dials again,
    the brain answers `401` before upgrading, and tungstenite surfaces that as
    `HTTP error: 401 Unauthorized` — the JSON body ("node … is revoked") is never
@@ -787,25 +869,43 @@ they are acceptable forever.
    it means reading the response body out of tungstenite's `Error::Http` in
    `dial::connect` — and updating the assertion in `real_brain.rs` that currently
    pins the blunt wording (`line.contains("cannot reach the brain")`).
-4. **`NodeExecutor::exec` does not carry the `Invocation`** (D9.12). Every `fs.*`
-   and `shell.exec` payload needs `inv`, and a node echoes `inv.bot_id` back in
-   `node.requestApproval`, so the brain's dispatcher has to *derive* attribution:
-   exactly one running turn belonging to a bot hosted on that node ⇒ that turn,
-   otherwise the `bot_unknown` / `cnv_unknown` sentinel (distinct invocation ids, so
-   a node's audit log can still tell two unattributed calls apart). The derivation
-   is sound today — a tool call only happens inside a turn and a bot runs one turn
-   at a time — but it is inference where the data existed at the call site. Widening
-   the port deletes the sentinel and the dedup window; it touches `tools`, `core`,
-   `node` and `brain` at once, so it is a change to make deliberately.
-5. **The embedded CLI has no remote dispatcher** (D9.11's known consequence).
-   `LocalExecutor` now knows which node it is and **refuses** a call addressed to
-   any other one, instead of absorbing it — absorbing meant a bot bound to a remote
-   node had its tools run on the brain's machine, inside the brain's roots and under
-   the brain's ceilings, invisibly (the tool-call entry still named the remote
-   node). `swarmbot-brain` puts its `NodeDispatcher` in front, so remote calls
-   really travel; `core::compose` (the CLI's embedded mode) does not, so a
-   remote-bound bot there gets a clear typed refusal rather than remote execution.
-   Safe, not complete: the fix is for `core::compose` to accept an executor.
+4. ~~`NodeExecutor::exec` does not carry the `Invocation`.~~ **Closed (D9.12).**
+   The port is `exec(&self, node: &NodeId, invocation: &Invocation, call: NodeCall)`,
+   so attribution is a fact from the caller rather than a guess: `ToolContext`
+   already held the invocation, and it is what a node audits against and echoes in
+   `node.requestApproval`. `NodeDispatcher::attribute()` — the `running_turns()`
+   scan that fell back to the `bot_unknown`/`cnv_unknown` sentinel whenever two
+   turns ran on one node — is deleted. `unattributed()` survives only for the
+   `node.requestApproval` path in `gateway/session.rs`, where a node names a bot
+   this brain cannot place; the dispatch path cannot reach it.
+   Test: `two_turns_on_one_node_each_carry_their_own_invocation_to_the_node`
+   (mutation-checked against the old give-up path) and
+   `forward_remote_hands_the_callers_invocation_to_the_executor`.
+5. **A call deadline stops the wait, not the work** (§3.5). On expiry the brain
+   withdraws the call and sends `@effect/rpc/Interrupt`, and that is the end of
+   what it can guarantee: it cannot kill a process on another machine, so a node
+   that ignores the frame (or is wedged below its event loop) may still be running
+   the command. Two deliberate consequences: the socket is **not** closed on a
+   per-call timeout — one hung call must not fail the other calls in flight on the
+   same connection — and a late answer is discarded rather than reported. Closing
+   the socket would be a bigger hammer that turns one stuck call into an outage;
+   the interrupt is the honest middle. The limit is stated in the tool error the
+   model sees, not only here, because that is where somebody will read it first.
+6. **The embedded CLI cannot reach a remote node, and that is a property of the
+   mode, not a missing wire.** `LocalExecutor` knows which node it is and
+   **refuses** a call addressed to any other one instead of absorbing it —
+   absorbing meant a bot bound to a remote node had its tools run on the brain's
+   machine, inside the brain's roots and under the brain's ceilings, invisibly (the
+   tool-call entry still named the remote node). `swarmbot-brain` puts its
+   `NodeDispatcher` in front, so remote calls really travel. `core::compose` does
+   not, and a dispatcher there would have nothing to dispatch *to*: a node dials
+   the brain's gateway (`GET /node`), and the embedded CLI has no listener and no
+   gateway — no node can pair with it, so none can be connected. A bot whose config
+   names a foreign node therefore gets a clear typed refusal. Wiring an executor
+   into `core::compose` without also giving the CLI a gateway would produce a
+   dispatcher that can only ever answer "not connected"; the honest fix, if remote
+   nodes from the terminal are wanted, is to run the brain (`--brain`) — which is
+   the documented way.
 
 **Unverified — no test, and no local way to run one.**
 
@@ -817,3 +917,4 @@ they are acceptable forever.
 | SIGINT, and the second-signal force exit (`registry.kill_all()` then `std::process::exit(0)`) | signal delivery to a supervised child is not something a unit test can fake honestly |
 | `LiveEvent::Resync` caused by a **lagged** broadcast | the stale-cursor and wrong-epoch resyncs are tested (`brain/tests/live.rs`, `brain/tests/client_contract.rs`); the mid-stream `Lagged` branch of `LiveHub::subscribe` has no deterministic trigger |
 | Windows | `crates/node` calls `libc::gethostname` and `killpg` unconditionally, so the daemon is unix-only in practice whatever `Cargo.toml` says |
+| the per-call deadline against a **real hung handler on the real daemon** | the brain-side tests drive an in-memory peer whose far end deliberately never answers, and `crates/node`'s own tests prove an interrupt kills a process group — but nothing joins the two, because hanging a real handler deterministically (a `fs.read` on a dead mount) needs a mount the test cannot create. What *is* proven end to end: `real_brain.rs` runs a real daemon through `node.hello` and real calls, so the deadline path is not exercised there only because nothing hangs |

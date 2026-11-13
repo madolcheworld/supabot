@@ -38,8 +38,8 @@ Cargo builds share `./target`. `Blocking waiting for file lock on build director
 is other people working, not a hang: wait it out. Do not invent a second target
 directory — it recompiles every shared dependency.
 
-This checkout is **not a git repository yet**. Do not `git init`, do not commit,
-do not tag, unless the owner asks.
+This checkout **is** a git repository. Do not commit, do not tag, and do not
+rewrite history unless the owner asks.
 
 ## Crate ownership during parallel work
 
@@ -149,20 +149,16 @@ do not tag, unless the owner asks.
 | `ui` | `swarmbot-ui`: the GPUI desktop app | `src/lib.rs` (module map), `src/reducer.rs` (where the correctness lives), [`docs/ui.md`](docs/ui.md) |
 | `node-protocol` | the wire: mux, pairing, signed upgrade, typed errors, stream tokens | `src/lib.rs` (module map), [`docs/node-protocol.md`](docs/node-protocol.md) |
 | `node` | `swarmbot-node`: the daemon that executes under its own policy | `src/lib.rs`, `src/handlers.rs` (the `rpc` ↔ `NodeCall` bridge), `src/shell.rs`, `tests/real_brain.rs` (the end-to-end proof) |
-| `mcp` | the tool registry as an MCP server (stdio + streamable HTTP) | *(M3)* |
+| `mcp` | the tool registry as an MCP server (stdio + streamable HTTP) | `src/lib.rs`, `src/transport.rs` |
 
 ## Known debt
 
-Two things recorded on purpose, so nobody "fixes" them by accident or trusts them
-further than they go:
+Recorded on purpose, so nobody "fixes" them by accident or trusts them further
+than they go. Two entries that used to live here — the `exec_shell` mirror and the
+node's out-of-root spill dir — are **closed**; they are described in
+[`node-protocol.md`](docs/node-protocol.md) §13 items 1–2 with the tests that pin
+them, so this list only carries what is still open.
 
-* **`crates/node/src/shell.rs` mirrors `tools::handlers::shell::exec_shell`**
-  instead of calling it, because that function is `pub(crate)` and `LocalExecutor`'s
-  *buffered* result cannot produce `Started{pid,pgid}`, Ack-paced chunks and a
-  verifiable `killpg`. Its module header lists the **six things that must stay in
-  sync**. The way out is to make `exec_shell` public — or add a streaming variant in
-  `tools` — and delete the copy; until then, a change to either side is a change to
-  both.
 * **One CLI test is suspected flaky under port reuse.** A single gate run showed
   `105 passed; 1 failed`; the failing name was not captured and it never
   reproduced in 30 subsequent runs (8 of them under simulated 4-core load). The
@@ -173,33 +169,52 @@ further than they go:
   this machine and `./target`. If you see a one-off CLI failure, re-run before
   you debug; if it reproduces, fix it by holding the listener for the duration of
   the assertion rather than by adding a sleep.
-* **One `crates/node/tests/real_brain.rs` test is suspected flaky under
-  machine load.** `the_nodes_own_never_ceiling_refuses_what_the_brain_allowed`
-  failed once in four full `check.sh` runs (the transcript had no `read_file`
-  call) and passed 3/3 in isolation. It spawns a real `swarmbot-node` child and a
-  real brain, so it is the most load-sensitive test in the tree; on a 4-core box
-  shared with other builds a bounded wait can be starved. Same rule as the CLI
-  flake above: re-run before you debug, and if it reproduces, widen the specific
-  wait and name what it waits for — do not add a blanket sleep and do not
-  `#[ignore]` it.
-* **The node's spill dir `<data>/spill` is not inside a root by default** (the only
-  default root is `<data>/workspace`), so a bot cannot `fs.read` a spilled file back
-  unless the owner adds a root covering it. See
-  [`node-protocol.md`](docs/node-protocol.md) §13.
+* **A `real_brain` failure was diagnosed, and it was not a load problem.**
+  `revoking_closes_the_real_child_with_4401_and_a_redial_is_refused` used to fail
+  with "the refusal is a dial failure the node reports honestly:
+  `2026-11-13T01:33:44.929401Z  INFO swarmbot-node starting …`". The needle was
+  `401` and the **tracing timestamp** contains `401` (`.929401`), so the helper
+  answered with the daemon's startup line before the refusal ever appeared. More
+  log lines — a busier machine — meant more chances for the clock to answer the
+  question, which is why it looked like load sensitivity. `wait_for_line` now
+  matches `message_of(line)` (the line with its tracing prefix stripped) and
+  `a_timestamp_is_never_mistaken_for_the_message` pins it. The lesson generalises:
+  **when a helper matches a short token against a log line, strip the prefix
+  first.** A remaining `real_brain` failure is a real failure; do not call it a
+  flake without the log line in hand.
+* **The node roster can lose an update, and that is a product bug, not a flake.**
+  `node.hello` and `node.heartbeat` both do read–modify–write on the same row
+  (`session.rs`: `get_node` → mutate one field → `update_node`), and
+  `update_node` is a whole-row upsert with no CAS. The brain side runs with
+  `require_hello: false`, so a heartbeat can arrive *while* the hello handler is
+  mid-flight: the heartbeat reads the old row, hello writes the real policy, the
+  heartbeat then writes its stale copy back and the policy silently reverts.
+  Under 6× parallel load this fails a `real_brain` roster wait with
+  `online: true` and the wrong `policy.default`. Until it is fixed (revision-CAS
+  in the port, per-field SQL, or a single actor owning the row — a change to
+  `contracts` + `store` + `brain`), **do not trust a node's roster row under
+  concurrency**, and do not "fix" the test by widening its wait: the wait is not
+  what is wrong. See [`review.md`](docs/review.md) §9.
+* **The embedded CLI cannot reach a remote node** — not a missing wire but a
+  property of the mode: a node dials the brain's gateway, and `swarmbot` in-process
+  has no listener, so nothing can pair with it. A bot configured against a foreign
+  node gets a typed refusal. Use `--brain` when remote nodes matter. See
+  [`node-protocol.md`](docs/node-protocol.md) §13 item 6.
 
 ## State of the tree
 
-Check before you assume — it moves while people work. As of this writing **eleven
-of the twelve crates are built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1021
-passed, 0 failed, 2 ignored** — the ignored ones are the live-gateway LLM test behind
-`PROTO_LIVE_LLM` and the live ACP-agent test behind `PROTO_LIVE_ACP`): `contracts`, `store`, `llm`, `tools`, `core`, `client`,
-`node-protocol`, `brain`, `cli`, `node` and `ui`. `crates/mcp` is the only
-one-line scaffold (milestone M3).
+Check before you assume — it moves while people work. **All twelve crates are
+built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.283
+passed, 0 failed, 4 ignored** — two live tests, behind `PROTO_LIVE_LLM` and
+`PROTO_LIVE_ACP`, and two doctests in `store/src/threaded.rs` marked `ignore`
+because a doctest has no runtime to await on): `contracts`,
+`store`, `llm`, `tools`, `core`, `client`, `node-protocol`, `brain`, `cli`, `node`,
+`ui` and `mcp`.
 
 The brain's **node gateway is real**: `POST /node/pair` redeems a code and
 `GET /node` serves the signed control socket (`src/gateway/`).
 **`crates/node/tests/real_brain.rs` pins the whole of M6 against the real
-binaries** (3 tests, ~0.4 s, always run): an in-process brain + a spawned
+binaries** (4 tests, ~0.5 s, always run): an in-process brain + a spawned
 `swarmbot-node` child pair with a minted code, a bot bound to that node reads
 `marker.txt` and runs `cat marker.txt` through it — asserted by planting
 "from the node" in the node's root and a "from the brain" decoy in the brain's
@@ -211,8 +226,10 @@ Still genuinely unverified: `wss://`/TLS, and a remote tool call from a *bot tur
 in two separate OS processes driven by a real model* (the fake backend's script
 lives in-process, so the test drives the brain in-process).
 
-`llm::ClaudeCli::chat` still returns `Unavailable` until the MCP gateway exists —
-deliberately, so a bot on that backend fails with a reason instead of pretending.
+`llm::ClaudeCli::chat` is implemented: it spawns `claude -p` with a stream-json
+protocol and reaches our tools through `--mcp-config`. The MCP gateway exists
+(`crates/mcp`), and `/mcp` on the internal listener is authenticated with the
+owner token like every other execution surface.
 The honest test of "is this module wired?" is still `crates/<name>/src/lib.rs`.
 [`README.md`](README.md#status-milestone) carries the milestone table and the list
 of paths nobody has verified yet.
