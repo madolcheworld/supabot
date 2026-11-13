@@ -81,7 +81,7 @@ pub use tool::{
     Content, Invocation, SHELL_OUTPUT_LIMIT_BYTES, TOOL_RESULT_LIMIT_BYTES, ToolCallRequest,
     ToolError, ToolResult, ToolSpec, Toolset,
 };
-pub use turn::{Turn, TurnInitiator, TurnStatus, Usage};
+pub use turn::{Turn, TurnInitiator, TurnStatus, Usage, UsageReport};
 
 #[cfg(test)]
 mod tests {

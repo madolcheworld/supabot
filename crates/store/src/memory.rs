@@ -350,6 +350,24 @@ impl TurnRepo for MemoryStore {
         });
         Ok(turns)
     }
+
+    fn turns_since(&self, since: DateTime<Utc>) -> Result<Vec<Turn>, DomainError> {
+        // Compared as the canonical stored string, not as a `DateTime`: SQLite
+        // compares the TEXT column, so this is how sub-microsecond differences
+        // collapse the *same way* in both stores at the window boundary.
+        let since = ts(&since);
+        let mut turns: Vec<Turn> = guard(&self.turns)?
+            .values()
+            .filter(|turn| ts(&turn.started_at).as_str() >= since.as_str())
+            .cloned()
+            .collect();
+        turns.sort_by(|a, b| {
+            ts(&a.started_at)
+                .cmp(&ts(&b.started_at))
+                .then_with(|| a.id.as_str().cmp(b.id.as_str()))
+        });
+        Ok(turns)
+    }
 }
 
 impl DeliveryRepo for MemoryStore {

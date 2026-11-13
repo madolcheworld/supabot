@@ -542,6 +542,68 @@ pub fn contract_turns<S: Persistence>(store: &S) -> anyhow::Result<()> {
         store.turns_in(&window_conversation, 0)?.is_empty(),
         "a zero limit reads nothing"
     );
+
+    // `turns_since` is the read behind the usage report: every turn that
+    // *started* in the window, oldest first. The boundary is inclusive — a
+    // window that says "since midnight" contains the turn that started at
+    // midnight — and a turn that started a microsecond earlier is out.
+    let since = base + Duration::seconds(2);
+    ensure_eq!(
+        store
+            .turns_since(since)?
+            .iter()
+            .map(|turn| turn.started_at)
+            .collect::<Vec<_>>(),
+        vec![started[2], started[3], started[4]],
+        "turns_since includes the boundary turn and everything after it, ascending"
+    );
+    ensure_that!(
+        !store
+            .turns_since(since)?
+            .iter()
+            .any(|turn| turn.id == done.id || turn.id == running.id),
+        "a turn that started before `since` is never in the window"
+    );
+    ensure_that!(
+        store.turns_since(base + Duration::seconds(600))?.is_empty(),
+        "a window that starts after every turn is empty, never an error"
+    );
+
+    // Two turns started in the same microsecond fall to the id tie-break. Both
+    // stores must agree on that order — a report built from this list must not
+    // depend on which double answered.
+    let instant = base + Duration::seconds(30);
+    let mut first = Turn::start(
+        bot.clone(),
+        window_conversation.clone(),
+        TurnInitiator::Owner,
+        None,
+        None,
+    );
+    first.started_at = instant;
+    let mut second = Turn::start(
+        bot.clone(),
+        window_conversation.clone(),
+        TurnInitiator::Owner,
+        None,
+        None,
+    );
+    second.started_at = instant;
+    // Inserted newest-id-first on purpose: the order of the *insert* must not
+    // leak into the order of the read.
+    store.insert_turn(&second)?;
+    store.insert_turn(&first)?;
+    let mut expected = vec![first.id.clone(), second.id.clone()];
+    expected.sort();
+    ensure_eq!(
+        store
+            .turns_since(instant)?
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect::<Vec<_>>(),
+        expected,
+        "turns at the same instant are ordered by id in both stores"
+    );
     Ok(())
 }
 

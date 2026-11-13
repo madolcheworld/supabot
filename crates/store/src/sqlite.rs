@@ -861,6 +861,18 @@ impl TurnRepo for SqliteStore {
             [],
         )
     }
+
+    fn turns_since(&self, since: DateTime<Utc>) -> Result<Vec<Turn>, DomainError> {
+        let conn = self.conn()?;
+        // `>=` because the window is inclusive, and the same `(started_at, id)`
+        // order the memory store sorts by — `ts` is fixed-width UTC, so SQLite's
+        // text comparison is the chronological one.
+        entities(
+            &conn,
+            "SELECT payload FROM turns WHERE started_at >= ?1 ORDER BY started_at, id",
+            params![ts(&since)],
+        )
+    }
 }
 
 impl DeliveryRepo for SqliteStore {

@@ -43,6 +43,7 @@ pub mod rules;
 pub mod session;
 pub mod settings;
 pub mod tasks;
+pub mod usage;
 
 /// How many entries one history page carries at most.
 ///
@@ -102,6 +103,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/rules", get(rules::list).post(rules::create))
         .route("/api/rules/{id}", delete(rules::delete))
         .route("/api/settings", get(settings::get).patch(settings::patch))
+        .route("/api/usage", get(usage::get))
         .route("/api/backends", get(backends::list))
         .route("/api/backends/probe", get(backends::probe))
         .route("/api/backends/{id}/models", get(backends::models))

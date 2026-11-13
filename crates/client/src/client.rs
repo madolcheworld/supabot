@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
+use swarmbot_contracts::turn::UsageReport;
 use swarmbot_contracts::{
     ApprovalRule, BackendKind, Bot, BotId, Conversation, ConversationId, Decision, Entry, EntryId,
     NodeId, NodeInfo, RequestId, Routine, RoutineId, RoutineRun, RoutineSchedule, RuleId,
@@ -724,6 +725,29 @@ impl BrainClient {
         self.http.get_with_timeout(&url, timeout)
     }
 
+    // --- usage ------------------------------------------------------------------
+
+    /// `GET /api/usage` — what the backends reported the team spent in a window.
+    ///
+    /// `since` is an **RFC 3339 timestamp** (`"2026-01-31T00:00:00Z"`), the same
+    /// text [`UsageReport::since`] carries; `None` asks the brain for its
+    /// default window (the last 24 hours). It is text and not a `DateTime` for
+    /// the same reason [`PairingCode::expires_at`] is: this crate has no
+    /// `chrono` dependency, on purpose, and the caller (CLI, GPUI) already has
+    /// the clock it wants to ask about.
+    ///
+    /// The numbers are what the backends reported, not an estimate — see
+    /// [`UsageReport`]. A zero here means "nothing was reported", so a caller
+    /// showing it should also show `report.turns`.
+    pub fn usage(&self, since: Option<&str>) -> Result<UsageReport, ClientError> {
+        let query: Vec<(&str, String)> = match since {
+            Some(since) => vec![("since", since.to_string())],
+            None => Vec::new(),
+        };
+        let url = self.endpoint(&["api", "usage"], &query)?;
+        self.http.get(&url)
+    }
+
     /// Build one endpoint URL: `segments` are appended as percent-encoded
     /// path segments (so an id or handle can never break the path), and
     /// `query` values are form-percent-encoded (`3:42` survives as `3%3A42`).
@@ -1344,5 +1368,85 @@ mod tests {
             recorded.cookie.as_deref(),
             Some("swarmbot_session=stub-session")
         );
+    }
+
+    // --- usage --------------------------------------------------------------
+
+    #[test]
+    fn the_usage_window_is_sent_as_a_percent_encoded_rfc3339_value() {
+        let client = BrainClient::new("http://127.0.0.1:9").expect("valid");
+        let url = client
+            .endpoint(
+                &["api", "usage"],
+                &[("since", "2026-01-31T00:00:00+00:00".to_string())],
+            )
+            .expect("endpoint");
+        // The `:` and `+` of an RFC 3339 timestamp must survive the query
+        // string; an unencoded `+` would arrive at the brain as a space.
+        assert_eq!(
+            url, "http://127.0.0.1:9/api/usage?since=2026-01-31T00%3A00%3A00%2B00%3A00",
+            "{url}"
+        );
+        // No `since` means no query at all: the brain applies its own default.
+        let url = client.endpoint(&["api", "usage"], &[]).expect("endpoint");
+        assert_eq!(url, "http://127.0.0.1:9/api/usage", "{url}");
+    }
+
+    #[test]
+    fn usage_asks_the_documented_path_and_keeps_a_404_typed() {
+        // The stub serves no usage route on purpose: what this pins is the
+        // request the client *sent*, and that a missing route is still a typed
+        // `not_found` rather than a panic or a silent default.
+        let stub = StubBrain::start();
+        let client = stub_client(&stub);
+        let err = client
+            .usage(Some("2026-01-31T00:00:00Z"))
+            .expect_err("the stub has no /api/usage");
+        assert!(err.is_not_found(), "{err:?}");
+        let request = stub
+            .last_request("GET", "/api/usage")
+            .expect("the client asked the documented path");
+        assert_eq!(request.query, "since=2026-01-31T00%3A00%3A00Z");
+    }
+
+    #[test]
+    fn a_usage_report_decodes_from_the_documented_body() {
+        // The body the brain sends, byte for byte in shape: this is the test
+        // that fails if the route's JSON and this client ever drift.
+        let bot = BotId::new();
+        let body = json!({
+            "since": "2026-01-31T00:00:00Z",
+            "until": "2026-02-01T00:00:00Z",
+            "turns": 2,
+            "totals": {"input_tokens": 120, "output_tokens": 30, "llm_calls": 2, "tool_calls": 1},
+            "by_bot": [
+                {
+                    "bot_id": bot.as_str(),
+                    "bot_name": "lead",
+                    "usage": {"input_tokens": 120, "output_tokens": 30, "llm_calls": 2, "tool_calls": 1}
+                }
+            ]
+        });
+        let report: UsageReport =
+            serde_json::from_value(body).expect("the documented body decodes");
+        assert_eq!(report.totals.total_tokens(), 150);
+        assert_eq!(report.turns, 2);
+        assert_eq!(report.by_bot.len(), 1);
+        assert_eq!(report.by_bot[0].bot_id, bot);
+        assert_eq!(report.by_bot[0].bot_name.as_deref(), Some("lead"));
+        assert_eq!(report.by_bot[0].usage.input_tokens, 120);
+        // A deleted bot arrives without a name; the row (and its spend) stays.
+        let nameless = json!({
+            "since": "2026-01-31T00:00:00Z",
+            "until": "2026-02-01T00:00:00Z",
+            "turns": 1,
+            "totals": {"input_tokens": 0, "output_tokens": 0, "llm_calls": 1, "tool_calls": 0},
+            "by_bot": [{"bot_id": BotId::new().as_str(), "bot_name": null,
+                        "usage": {"input_tokens": 0, "output_tokens": 0, "llm_calls": 1, "tool_calls": 0}}]
+        });
+        let report: UsageReport = serde_json::from_value(nameless).expect("a nameless bot decodes");
+        assert_eq!(report.by_bot[0].bot_name, None);
+        assert_eq!(report.totals.total_tokens(), 0);
+        assert_eq!(report.turns, 1, "zeros with a turn count is not 'no work'");
     }
 }

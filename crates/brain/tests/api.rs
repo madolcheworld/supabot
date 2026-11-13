@@ -11,6 +11,7 @@ use common::*;
 use serde_json::{Value, json};
 
 use swarmbot_contracts::id::{BotId, ConversationId, EntryId};
+use swarmbot_contracts::turn::Usage;
 use swarmbot_llm::ScriptedTurn;
 
 // --- health and auth ---------------------------------------------------------
@@ -58,6 +59,7 @@ async fn every_route_refuses_an_anonymous_request_with_the_envelope() {
         "/api/nodes",
         "/api/rules",
         "/api/settings",
+        "/api/usage",
         "/api/backends",
         "/api/backends/probe",
     ] {
@@ -1260,6 +1262,192 @@ async fn one_full_turn_with_a_scripted_backend() {
             .any(|message| message.content.contains("what is in the workspace?"))),
         "the turn carried the owner's message"
     );
+
+    brain.stop().await;
+}
+
+// --- usage ------------------------------------------------------------------
+
+/// Post one owner message and wait for the turn to finish.
+async fn run_one_turn(brain: &TestBrain, conversation: &ConversationId, usage: Usage) {
+    brain.script(ScriptedTurn::text("done").with_usage(usage));
+    let response = post(
+        &brain.client(),
+        &brain.url(&format!("/api/conversations/{conversation}/messages")),
+        &json!({"text": "hello", "addressed": []}),
+    )
+    .await;
+    assert!(
+        response.status().is_success(),
+        "the message was accepted: {}",
+        response.status()
+    );
+    brain.settle().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_reports_what_the_backends_reported_per_bot() {
+    let brain = TestBrain::start().await;
+    let client = brain.client();
+    let lead = brain.bot("lead");
+    let dm = lead.direct_conversation_id.clone();
+
+    // A turn whose backend reported a known usage. The report must carry exactly
+    // these numbers: they are the backend's report, not an estimate of ours.
+    run_one_turn(
+        &brain,
+        &dm,
+        Usage {
+            input_tokens: 120,
+            output_tokens: 30,
+            llm_calls: 1,
+            tool_calls: 0,
+        },
+    )
+    .await;
+
+    let report = body(get(&client, &brain.url("/api/usage")).await).await;
+
+    // The exact shape a client decodes: five keys, no more.
+    let keys: Vec<&str> = report
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys.len(), 5, "{report}");
+    for key in ["since", "until", "turns", "totals", "by_bot"] {
+        assert!(keys.contains(&key), "missing {key} in {report}");
+    }
+
+    assert_eq!(report["totals"]["input_tokens"], json!(120));
+    assert_eq!(report["totals"]["output_tokens"], json!(30));
+    assert_eq!(report["totals"]["llm_calls"], json!(1));
+    assert_eq!(report["totals"]["tool_calls"], json!(0));
+    assert_eq!(report["turns"], json!(1), "one turn ran in the window");
+
+    let rows = report["by_bot"].as_array().expect("an array");
+    assert_eq!(rows.len(), 1, "only @lead was woken: {rows:?}");
+    assert_eq!(rows[0]["bot_id"], json!(lead.id.to_string()));
+    assert_eq!(rows[0]["bot_name"], json!(lead.name));
+    assert_eq!(rows[0]["usage"]["input_tokens"], json!(120));
+
+    // The default window is the last 24 hours, resolved when the request
+    // arrived — `since` and `until` are RFC 3339, as the client decodes them.
+    let since = chrono::DateTime::parse_from_rfc3339(report["since"].as_str().expect("since"))
+        .expect("since is RFC 3339");
+    let until = chrono::DateTime::parse_from_rfc3339(report["until"].as_str().expect("until"))
+        .expect("until is RFC 3339");
+    assert!(since < until, "{since} should be before {until}");
+    let window = until - since;
+    assert!(
+        window.num_seconds() >= 24 * 3600 - 60 && window.num_seconds() <= 24 * 3600,
+        "the default window is the last 24 hours, got {window}"
+    );
+
+    brain.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_explicit_since_window_excludes_turns_that_started_before_it() {
+    let brain = TestBrain::start().await;
+    let client = brain.client();
+    let dm = brain.bot("lead").direct_conversation_id.clone();
+
+    run_one_turn(
+        &brain,
+        &dm,
+        Usage {
+            input_tokens: 50,
+            output_tokens: 5,
+            llm_calls: 1,
+            tool_calls: 0,
+        },
+    )
+    .await;
+
+    // The turn above started before this instant, so a window that begins here
+    // is empty — and says so with zeros *and* `turns: 0`, which is the honest
+    // "nothing ran", not an error. `Z`, not `+00:00`: a `+` in a query string
+    // decodes as a space.
+    let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let report = body(get(&client, &brain.url(&format!("/api/usage?since={since}"))).await).await;
+    assert_eq!(report["turns"], json!(0), "{report}");
+    assert_eq!(report["totals"]["input_tokens"], json!(0));
+    assert_eq!(report["by_bot"], json!([]));
+    assert_eq!(report["since"], json!(since));
+
+    // A window that starts before everything sees the turn again — the same
+    // route, the other side of the boundary.
+    let early = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let report = body(get(&client, &brain.url(&format!("/api/usage?since={early}"))).await).await;
+    assert_eq!(report["turns"], json!(1), "{report}");
+    assert_eq!(report["totals"]["input_tokens"], json!(50));
+
+    brain.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bad_or_future_since_is_invalid_input_with_the_envelope() {
+    let brain = TestBrain::start().await;
+    let client = brain.client();
+
+    let message = expect_error(
+        get(&client, &brain.url("/api/usage?since=yesterday")).await,
+        400,
+        "invalid_input",
+    )
+    .await;
+    assert!(message.contains("RFC 3339"), "{message}");
+    assert!(message.contains("yesterday"), "{message}");
+
+    // A window that ends before it starts is a client bug, not an empty report.
+    let future = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let message = expect_error(
+        get(&client, &brain.url(&format!("/api/usage?since={future}"))).await,
+        400,
+        "invalid_input",
+    )
+    .await;
+    assert!(message.contains("future"), "{message}");
+
+    brain.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_blocking_client_reads_the_usage_report() {
+    let brain = TestBrain::start().await;
+    let dm = brain.bot("lead").direct_conversation_id.clone();
+
+    run_one_turn(
+        &brain,
+        &dm,
+        Usage {
+            input_tokens: 9,
+            output_tokens: 1,
+            llm_calls: 1,
+            tool_calls: 0,
+        },
+    )
+    .await;
+
+    let url = brain.base_url.clone();
+    let token = brain.token().to_string();
+    let report = blocking(move || {
+        swarmbot_client::BrainClient::new(&url)
+            .expect("the base URL is valid")
+            .with_token(&token)
+            .usage(None)
+    })
+    .await
+    .expect("the client reads the report");
+    assert_eq!(report.totals.input_tokens, 9);
+    assert_eq!(report.totals.output_tokens, 1);
+    assert_eq!(report.turns, 1);
+    assert_eq!(report.by_bot.len(), 1);
+    assert_eq!(report.by_bot[0].bot_name.as_deref(), Some("lead"));
 
     brain.stop().await;
 }

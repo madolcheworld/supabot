@@ -92,6 +92,20 @@ pub trait TurnRepo: Send + Sync {
     -> Result<Vec<Turn>, DomainError>;
     /// Turns still marked running — what boot recovery has to settle.
     fn running_turns(&self) -> Result<Vec<Turn>, DomainError>;
+    /// Every turn that **started at or after `since`**, oldest first.
+    ///
+    /// This is the read behind the usage report, so its invariants are pinned
+    /// by the shared contract suite rather than by either implementation:
+    ///
+    /// * the boundary is **inclusive** (`started_at >= since`) — a window that
+    ///   asks for "since midnight" includes the turn that started at midnight;
+    /// * the order is `started_at`, then `id`, so a report is deterministic and
+    ///   two turns started in the same microsecond fall to the time-sortable id
+    ///   instead of to a hash map's iteration order;
+    /// * a turn that started before `since` is never in the result, and there is
+    ///   no limit: the caller chose the window, and a silently truncated window
+    ///   would under-report the spend.
+    fn turns_since(&self, since: DateTime<Utc>) -> Result<Vec<Turn>, DomainError>;
 }
 
 pub trait DeliveryRepo: Send + Sync {
@@ -501,6 +515,16 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|t| t.is_running())
+                .cloned()
+                .collect())
+        }
+        fn turns_since(&self, since: DateTime<Utc>) -> Result<Vec<Turn>, DomainError> {
+            Ok(self
+                .turns
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|t| t.started_at >= since)
                 .cloned()
                 .collect())
         }
