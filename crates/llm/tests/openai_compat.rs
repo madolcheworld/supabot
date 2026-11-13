@@ -1195,7 +1195,7 @@ async fn live_gateway_round_trip() {
     }
     let base_url = std::env::var("PROTO_LIVE_BASE_URL").expect("set PROTO_LIVE_BASE_URL");
     let model = std::env::var("PROTO_LIVE_MODEL").expect("set PROTO_LIVE_MODEL");
-    let spec = BackendSpec::openai_compat("live", base_url, "PROTO_LIVE_API_KEY", model);
+    let spec = BackendSpec::openai_compat("live", base_url, "PROTO_LIVE_API_KEY", model.clone());
     let backend =
         OpenAiCompat::from_spec(spec, &|name| std::env::var(name).ok()).expect("valid spec");
 
@@ -1221,6 +1221,39 @@ async fn live_gateway_round_trip() {
         "{response:?}"
     );
     assert!(saw_delta, "the live gateway must stream deltas");
+
+    // What this turn cost, printed rather than only asserted: the gate rule for a
+    // live test is that it stays trivially cheap *and* says what it spent.
+    eprintln!(
+        "live_gateway_round_trip spent: input={} output={} llm_calls={} tool_calls={} model={model}",
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+        response.usage.llm_calls,
+        response.usage.tool_calls
+    );
+
+    // **A real adapter fills `Usage`.** This was on the README's unverified list
+    // for several rounds — every number the gate had ever seen came from
+    // `FakeBackend::with_usage` — so the assertion is the point of keeping this
+    // test live: a `Usage` of zeros here would mean the gateway's `usage` object
+    // is not being read, and every report the owner sees would understate the
+    // spend while looking authoritative.
+    assert!(
+        response.usage.llm_calls >= 1,
+        "one backend call must be counted: {:?}",
+        response.usage
+    );
+    assert!(
+        response.usage.input_tokens > 0,
+        "the gateway reported no input tokens: {:?}. Either it sent no `usage` object \
+         (then `UsageReport` understates every turn) or the adapter drops it",
+        response.usage
+    );
+    assert!(
+        response.usage.output_tokens > 0,
+        "the gateway reported no output tokens: {:?}",
+        response.usage
+    );
 }
 
 /// `available_models` reads the gateway's own `/models`: de-duplicated, in the

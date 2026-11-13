@@ -697,3 +697,37 @@ what it is holding back.
   once at boot; rotating it means restarting the brain), and `wss://` against a
   real public CA chain — the test uses a private CA it builds, which is the same
   verification path but not the same bundle as a production one.
+- **D9.26 The last unverified path is run, and it needed a live model to be
+  meaningful.** `crates/node/tests/real_brain.rs` proves the whole remote-call
+  path against the real node binary, but it composes the brain *in process* —
+  which is what makes a scripted `FakeBackend` reachable. A real brain **process**
+  cannot be handed a script, so "a remote tool call from a bot turn in two separate
+  OS processes driven by a real model" was each-half-proven and never
+  combination-proven. It now exists as `crates/node/tests/live_two_process.rs`,
+  gated on `PROTO_LIVE_LLM=1` plus the gateway env.
+  Three things make it evidence rather than a demo:
+  * **the marker exists only in the node's root**, with a decoy of the same name
+    and different content in the brain's workspace and in the bot's own workspace.
+    A call that silently ran on the brain returns the decoy — and the failure
+    message says so by name, because "the reply did not match" would send the next
+    reader looking in the wrong place;
+  * **the node's own audit log** must carry the `read_file` line attributed to the
+    bot that asked, with `outcome: ok`;
+  * **`usage.input_tokens > 0`** — a `FakeBackend` cannot produce that, so it is
+    the proof a real model drove the turn rather than a script.
+  Mutation-checked the way that matters: binding the bot to the **local** node
+  instead of the remote one makes the model answer "from the brain" and the test
+  fails — which is exactly the D9.11 bug (a remote bot's tools executed on the
+  brain's machine, invisibly) that this test now cannot be fooled by. Verified
+  green three runs in a row at `input≈10.7k output≈74–178 llm_calls=2`.
+  The same live run closed a second open item: **a real adapter fills `Usage`.**
+  Every number the gate had ever seen came from `FakeBackend::with_usage`, so
+  `live_gateway_round_trip` now *asserts* non-zero input and output tokens instead
+  of only printing them (one run: `input=66 output=31 llm_calls=1`). Still
+  unverified for this: the `acp` and `claude-cli` adapters against a real model.
+  Two testing lessons from writing it, because both cost a run each: a streamed
+  reply **upserts one entry at a rising revision**, so waiting for the first
+  non-empty bot text catches a partial word (`"The"`, `"I"`) and — worse — the
+  first bot-authored text was the *reasoning* entry, not the message. The test now
+  waits for a `kind: "message"` entry with `post: "posted"` **and** the bot's own
+  status back at `idle`, which is what the product means by "the turn ended".

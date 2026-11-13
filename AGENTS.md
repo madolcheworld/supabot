@@ -96,6 +96,12 @@ rewrite history unless the owner asks.
   `PROTO_LIVE_MODEL`), `PROTO_LIVE_CLAUDE=1` and `PROTO_LIVE_ACP=1` (plus
   `PROTO_LIVE_ACP_CMD`/`_ARGS`; free handshake unless `PROTO_LIVE_ACP_PROMPT=1`).
   They stay trivially cheap — one turn — and they print what they spent.
+  Three exist: `llm`'s `live_gateway_round_trip` (one turn, also asserts the
+  adapter filled `Usage`), and `node`'s `live_two_process` — two real processes
+  and a real model, which is the only proof of a remote tool call in that shape
+  (D9.26). The last one needs **both** binaries built first
+  (`cargo build -p swarmbot-brain -p swarmbot-node`), because
+  `CARGO_BIN_EXE_<name>` only exists for a package's own bins.
 * **No test writes outside a `TempDir`**, and no test runs a destructive command
   (`rm -rf`, `sudo`, `mkfs`, `dd`, `git reset --hard`, …). A `shell` test must kill
   its own process group and assert that it is gone.
@@ -268,10 +274,10 @@ them.
 ## State of the tree
 
 Check before you assume — it moves while people work. **All twelve crates are
-built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.353
-passed, 0 failed, 4 ignored** — two live tests, behind `PROTO_LIVE_LLM` and
-`PROTO_LIVE_ACP`, and two doctests in `store/src/threaded.rs` marked `ignore`
-because a doctest has no runtime to await on): `contracts`,
+built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.354
+passed, 0 failed, 5 ignored** — three live tests (two behind `PROTO_LIVE_LLM`, one
+behind `PROTO_LIVE_ACP`) and two doctests in `store/src/threaded.rs` marked
+`ignore` because a doctest has no runtime to await on): `contracts`,
 `store`, `llm`, `tools`, `core`, `client`, `node-protocol`, `brain`, `cli`, `node`,
 `ui` and `mcp`.
 
@@ -289,10 +295,11 @@ workspace, so a silent local fallback cannot pass; the node's own
 **4401**, the child exits by itself, and a redial is refused before any upgrade.
 `crates/node/tests/tls_brain.rs` adds 2 more: the real node pairs over `https://`,
 completes the signed upgrade and `node.hello` over `wss://` (D9.25), and a node
-without `--brain-ca` is refused at the handshake. Still genuinely unverified: a
-remote tool call from a *bot turn in two separate OS processes driven by a real
-model* (the fake backend's script
-lives in-process, so the test drives the brain in-process).
+without `--brain-ca` is refused at the handshake.
+**`crates/node/tests/live_two_process.rs` closes the last one** (D9.26): a real
+brain **process**, a real node **process**, and a real model (`PROTO_LIVE_LLM`),
+with a decoy marker on the brain side so a silent local fallback fails. It is
+`#[ignore]`d because it needs a gateway credential.
 
 `llm::ClaudeCli::chat` is implemented: it spawns `claude -p` with a stream-json
 protocol and reaches our tools through `--mcp-config`. The MCP gateway exists

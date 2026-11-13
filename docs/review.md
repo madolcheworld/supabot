@@ -689,3 +689,28 @@ sebagai potret keadaan saat itu, bukan sebagai daftar hidup:
   pernah online, dan melewati `TlsListener` membuat handshake klien gagal.
 * **Yang tetap tidak diklaim:** renewal/hot reload sertifikat (dibaca sekali saat
   boot), dan `wss://` terhadap rantai CA publik.
+
+---
+
+## 16. Tindak lanjut — putaran kesembilan (2026-11-13)
+
+* **Langkah terakhir roadmap tertutup (D9.26).** "Tool call jarak jauh dari turn
+  bot di dua proses OS dengan model sungguhan" sudah terbuka sejak M6: separuh
+  brain dan separuh node masing-masing terbukti, tapi gabungannya tidak, karena
+  brain in-process dipakai justru supaya backend terskrip bisa disodorkan. Dengan
+  kredensial gateway yang tersedia, `crates/node/tests/live_two_process.rs`
+  menjalankan **brain sebagai proses sendiri** + **node sebagai proses sendiri** +
+  model nyata. Hijau 3/3 (`input≈10.7k output≈74–178 llm_calls=2`), dan mutation
+  checkintinya: memindahkan bot ke node lokal membuat model menjawab
+  `from the brain` dan tes gagal — persis bug D9.11 yang kini tidak bisa lolos.
+* **"Apakah adapter sungguhan mengisi `Usage`" juga tertutup**, untuk
+  `openai_compat`. Tes live-nya sekarang **meng-assert** token non-nol, bukan hanya
+  mencetaknya; satu run nyata melaporkan `input=66 output=31 llm_calls=1`. Yang
+  masih belum: `acp` dan `claude-cli` terhadap model nyata.
+* **Dua kesalahan tes yang saya buat dan catat** (masing-masing memakan satu run
+  model): menunggu "teks bot pertama yang tidak kosong" menangkap potongan
+  streaming (`"The"`, `"I"`) — dan yang pertama kali tertangkap justru entri
+  **reasoning**, bukan pesan. Yang benar: entri `kind: "message"` dengan
+  `post: "posted"` **dan** status bot kembali `idle`. Pelajarannya umum: "turn
+  selesai" adalah status bot, bukan sesuatu yang bisa disimpulkan dari isi
+  transkrip.
