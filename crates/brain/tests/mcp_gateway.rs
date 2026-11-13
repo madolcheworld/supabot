@@ -879,3 +879,154 @@ async fn unbound_internal_listener_returns_empty_mcp_turn_registration() {
 
     brain.stop().await;
 }
+
+/// A tool call an ACP agent makes *through* the per-turn MCP endpoint must be
+/// visible to the brain twice: as a transcript card the owner can see, and as
+/// one entry in the turn's tool-call count.
+///
+/// Why this test exists: a backend that owns its tool loop never fills
+/// `ChatResponse::tool_calls`, so the runner cannot count these calls from the
+/// response. Before this was wired, a bot that had messaged four teammates was
+/// stored as a turn with `usage.tool_calls == 0` and no card at all — the UI
+/// showed a bot that said something with nothing behind it.
+#[tokio::test]
+async fn an_mcp_tool_call_lands_a_transcript_card_and_counts_for_the_turn() {
+    use swarmbot_contracts::{EntryKind, Toolset, TurnId};
+    use swarmbot_core::McpTurnRequest;
+    use swarmbot_llm::McpServerSpec;
+
+    let running = RunningInternalBrain::start().await;
+    let client = Client::builder().timeout(TIMEOUT).build().expect("client");
+
+    let lead = running.brain.swarm.bots.by_name("lead").expect("lead bot");
+    let scout = running
+        .brain
+        .swarm
+        .bots
+        .by_name("scout")
+        .expect("scout bot");
+    let conversation = lead.direct_conversation_id.clone();
+
+    let provider = running
+        .brain
+        .swarm
+        .runner_env()
+        .mcp_provider
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .expect("Brain wires McpTurnProvider onto Swarm");
+
+    let workspace = running
+        .brain
+        .swarm
+        .ensure_bot_workspace(&lead.name)
+        .expect("lead workspace");
+    let turn_id = TurnId::new();
+    let reg = provider
+        .register_turn(McpTurnRequest {
+            bot_id: lead.id.clone(),
+            conversation_id: conversation.clone(),
+            turn_id: turn_id.clone(),
+            task_id: None,
+            workspace: workspace.clone(),
+            spool_dir: workspace.join(".spool"),
+            toolsets: vec![Toolset::Bot],
+            node_caps: None,
+            in_task: false,
+        })
+        .expect("register turn");
+    let url = match &reg.servers[0] {
+        McpServerSpec::Http { url, .. } => url.clone(),
+        other => panic!("expected http spec, got {other:?}"),
+    };
+
+    // Nothing has run yet: the turn's count is zero and no card exists.
+    let before = running
+        .brain
+        .swarm
+        .conversations
+        .history(&conversation, 0, 200)
+        .expect("history");
+    assert!(
+        !before.iter().any(|entry| matches!(
+            &entry.kind,
+            EntryKind::ToolCall(call) if call.tool == "message_bot"
+        )),
+        "no message_bot card before the call"
+    );
+
+    let sid = mcp_initialize(&client, &url).await;
+    let (status, _, value) = mcp_post(
+        &client,
+        &url,
+        sid.as_deref(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "message_bot",
+                "arguments": { "to": "scout", "text": "counted call" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let value = value.expect("tool response");
+    assert_ne!(
+        value["result"]["isError"],
+        json!(true),
+        "message_bot failed: {value}"
+    );
+    assert!(
+        running.brain.swarm.wait_for_idle(common::IDLE_BUDGET).await,
+        "swarm should settle after the tool woke scout"
+    );
+
+    // 1. The card: a finished tool-call entry for this turn, naming the tool and
+    //    carrying the result text the model actually read.
+    let after = running
+        .brain
+        .swarm
+        .conversations
+        .history(&conversation, 0, 200)
+        .expect("history");
+    let card = after
+        .iter()
+        .filter_map(|entry| entry.as_tool_call())
+        .find(|call| call.tool == "message_bot" && call.turn_id.as_ref() == Some(&turn_id))
+        .expect("a message_bot tool-call card for this turn");
+    assert_eq!(
+        card.status,
+        swarmbot_contracts::entry::ToolCallStatus::Completed,
+        "the card must be finished, not left Running: {card:?}"
+    );
+    assert!(
+        card.result_text
+            .as_deref()
+            .is_some_and(|text| !text.is_empty()),
+        "the card carries the result the model read: {card:?}"
+    );
+    assert!(
+        card.duration_ms.is_some(),
+        "the card carries how long the call took"
+    );
+
+    // 2. The count the runner folds into `usage.tool_calls`. Drained once, and
+    //    the second read is zero — a count, not a running total.
+    assert_eq!(
+        provider.take_tool_calls(&turn_id),
+        1,
+        "one MCP call must count as one tool call for the turn"
+    );
+    assert_eq!(
+        provider.take_tool_calls(&turn_id),
+        0,
+        "the counter is drained, so a turn cannot be counted twice"
+    );
+
+    drop(reg);
+    let _ = scout;
+    running.stop().await;
+}

@@ -8,6 +8,7 @@ pub mod transport;
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -42,12 +43,41 @@ pub struct ToolFilter {
 /// A factory producing a [`ToolContext`] for each tool invocation.
 pub type ContextFactory = Arc<dyn Fn() -> ToolContext + Send + Sync>;
 
+/// One `tools/call` this server answered, reported after the fact.
+///
+/// It exists because a backend that owns its tool loop (every ACP agent,
+/// `kind = "acp"`) never hands its tool calls back to the runner: the call
+/// happens here, inside the MCP server, so the runner sees a turn with
+/// `response.tool_calls` empty and would otherwise record a turn that used
+/// `message_bot` as a turn that used nothing. The recorder is the seam that
+/// lets the brain write the same transcript entry and count the same tool call
+/// it would have written for an HTTP backend — without `mcp` knowing what a
+/// transcript is (the dependency rules put `core` above this crate).
+#[derive(Clone, Debug)]
+pub struct McpCallRecord {
+    /// Whose turn this was: the template context's invocation, so the recorder
+    /// can name the bot, conversation, turn and task without guessing.
+    pub invocation: swarmbot_contracts::Invocation,
+    pub tool: String,
+    pub args: Value,
+    /// The text the model will actually read, exactly as it was returned.
+    pub result_text: String,
+    pub is_error: bool,
+    pub duration_ms: u64,
+}
+
+/// Called once per answered `tools/call`, including a call the filter refused:
+/// the model asked for it, so a turn that asked for a hidden tool did make a
+/// tool call, and the audit/usage trail should say so.
+pub type CallRecorder = Arc<dyn Fn(McpCallRecord) + Send + Sync>;
+
 /// MCP server handler exposing SwarmBot's [`ToolRegistry`].
 #[derive(Clone)]
 pub struct SwarmMcpServer {
     registry: Arc<ToolRegistry>,
     context_factory: ContextFactory,
     filter: Option<ToolFilter>,
+    recorder: Option<CallRecorder>,
 }
 
 impl SwarmMcpServer {
@@ -62,6 +92,7 @@ impl SwarmMcpServer {
             registry,
             context_factory: factory,
             filter: None,
+            recorder: None,
         }
     }
 
@@ -71,6 +102,7 @@ impl SwarmMcpServer {
             registry,
             context_factory: factory,
             filter: None,
+            recorder: None,
         }
     }
 
@@ -78,6 +110,28 @@ impl SwarmMcpServer {
     pub fn with_filter(mut self, filter: ToolFilter) -> Self {
         self.filter = Some(filter);
         self
+    }
+
+    /// Report every answered `tools/call` to `recorder`.
+    ///
+    /// Without this, a backend that owns its own tool loop leaves no trace of
+    /// its tool calls in the brain: the runner sees `response.tool_calls` empty
+    /// (the agent used the tool, not asked us to), so the turn is stored with
+    /// `usage.tool_calls == 0` and no transcript card — a bot that messaged
+    /// three teammates reads as a bot that did nothing. The recorder is where
+    /// that fact is handed back, because this crate cannot write a transcript
+    /// itself (the dependency rules put `core` above `mcp`).
+    pub fn with_recorder(mut self, recorder: CallRecorder) -> Self {
+        self.recorder = Some(recorder);
+        self
+    }
+
+    /// Tell the recorder about one answered call. Never panics out of this
+    /// crate: a recorder that fails is the recorder's own `tracing::error!`.
+    fn record(&self, call: McpCallRecord) {
+        if let Some(recorder) = &self.recorder {
+            recorder(call);
+        }
     }
 
     /// Returns the active tool filter, if any.
@@ -120,6 +174,19 @@ impl SwarmMcpServer {
                 }
                 .to_result()
             };
+            // A refused call is still a call the model made: reported, so the
+            // turn does not look tool-free and an audit reader can see what was
+            // asked for. The invocation comes from a fresh context because no
+            // call ran — that still names the bot, conversation and turn.
+            let ctx = (self.context_factory)();
+            self.record(McpCallRecord {
+                invocation: ctx.invocation,
+                tool: name.to_string(),
+                args: args.clone(),
+                result_text: result.text_only(),
+                is_error: result.is_error,
+                duration_ms: 0,
+            });
             return Ok(tool_result_to_response(result));
         }
 
@@ -128,15 +195,26 @@ impl SwarmMcpServer {
 
         let call_req = ToolCallRequest {
             id: tool_call_id.clone(),
-            name: tool_name,
-            args,
+            name: tool_name.clone(),
+            args: args.clone(),
         };
 
         let mut ctx = (self.context_factory)();
         ctx.invocation.id = InvocationId::new();
         ctx.invocation.tool_call_id = Some(tool_call_id);
 
+        let invocation = ctx.invocation.clone();
+        let started = Instant::now();
         let tool_result = self.registry.dispatch(&ctx, call_req).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        self.record(McpCallRecord {
+            invocation,
+            tool: tool_name,
+            args,
+            result_text: tool_result.text_only(),
+            is_error: tool_result.is_error,
+            duration_ms,
+        });
         Ok(tool_result_to_response(tool_result))
     }
 }

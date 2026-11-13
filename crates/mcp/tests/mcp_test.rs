@@ -200,6 +200,116 @@ async fn dispatch_call_returns_error_on_invalid_args() {
     }
 }
 
+/// A recorder sees every answered call — including one the filter refused,
+/// because the model asked for it and a turn that asked for a hidden tool did
+/// make a tool call.
+///
+/// This is what a backend that owns its tool loop (every ACP agent) has to rely
+/// on: the agent runs the tool through this server, so the runner's
+/// `ChatResponse::tool_calls` is empty and this recorder is the only place the
+/// call can be counted and turned into a transcript card.
+#[tokio::test]
+async fn recorder_reports_every_call_including_a_filtered_refusal() {
+    use std::sync::Mutex;
+
+    use swarmbot_mcp::McpCallRecord;
+
+    let registry = build_test_registry();
+    let seen: Arc<Mutex<Vec<McpCallRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let server = SwarmMcpServer::new(registry, test_context())
+        .with_filter(ToolFilter {
+            toolsets: Some(vec![Toolset::Bot]),
+            node_caps: None,
+            in_task: false,
+        })
+        .with_recorder(Arc::new(move |record: McpCallRecord| {
+            sink.lock().expect("recorder lock").push(record);
+        }));
+
+    // 1. An allowed call: recorded with its real result text and a turn id.
+    let _ = server
+        .dispatch_call("bot_greet", json!({ "name": "ada" }))
+        .await
+        .expect("allowed call");
+
+    // 2. A filtered-out call: still recorded, flagged as an error.
+    let _ = server
+        .dispatch_call("echo_tool", json!({ "msg": "nope" }))
+        .await
+        .expect("filtered call");
+
+    let records = seen.lock().expect("records");
+    assert_eq!(
+        records.len(),
+        2,
+        "both calls must be reported, got {:?}",
+        records.iter().map(|r| &r.tool).collect::<Vec<_>>()
+    );
+
+    let allowed = &records[0];
+    assert_eq!(allowed.tool, "bot_greet");
+    assert_eq!(allowed.args, json!({ "name": "ada" }));
+    assert_eq!(allowed.result_text, "hello ada");
+    assert!(!allowed.is_error);
+    assert!(
+        allowed.invocation.tool_call_id.is_some(),
+        "the record carries the id of the call it describes"
+    );
+
+    let refused = &records[1];
+    assert_eq!(refused.tool, "echo_tool");
+    assert!(
+        refused.is_error,
+        "a filtered call is reported as a failed call: {}",
+        refused.result_text
+    );
+    assert!(
+        refused.result_text.contains("not available"),
+        "unexpected refusal text: {}",
+        refused.result_text
+    );
+}
+
+/// Attaching a recorder must not change what the model sees: the seam observes
+/// a call, it does not route it.
+#[tokio::test]
+async fn recording_a_call_does_not_change_its_answer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let registry = build_test_registry();
+    let bare = SwarmMcpServer::new(Arc::clone(&registry), test_context());
+    let counted = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::clone(&counted);
+    let recorded =
+        SwarmMcpServer::new(registry, test_context()).with_recorder(Arc::new(move |_record| {
+            sink.fetch_add(1, Ordering::SeqCst);
+        }));
+
+    let first = bare
+        .dispatch_call("echo_tool", json!({ "msg": "same" }))
+        .await
+        .expect("bare");
+    let second = recorded
+        .dispatch_call("echo_tool", json!({ "msg": "same" }))
+        .await
+        .expect("recorded");
+    assert_eq!(
+        counted.load(Ordering::SeqCst),
+        1,
+        "the recorder must see the call exactly once"
+    );
+
+    let text = |resp: &rmcp::model::CallToolResponse| match resp {
+        rmcp::model::CallToolResponse::Complete(res) => match &res.content[0] {
+            rmcp::model::ContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        },
+        _ => panic!("expected complete response"),
+    };
+    assert_eq!(text(&first), text(&second));
+}
+
 #[tokio::test]
 async fn duplex_transport_stdio_protocol_handshake_and_dispatch() {
     let registry = build_test_registry();

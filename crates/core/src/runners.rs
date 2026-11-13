@@ -1360,6 +1360,21 @@ async fn execute_turn(
         }
     }
 
+    // A harness-driven backend (ACP, Claude CLI) never hands its tool calls back
+    // in `ChatResponse`: the agent calls them through the MCP registration this
+    // turn opened. Count those before the registration drops (its cleanup is
+    // what releases the per-turn token), so the stored turn and `/api/usage`
+    // say "four tool calls" rather than "none" about a bot that messaged four
+    // teammates. Read before `drop`: the cleanup may clear the counter.
+    if mcp_registration.is_some()
+        && let Some(provider) = env
+            .mcp_provider
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    {
+        turn.usage.tool_calls += provider.take_tool_calls(&turn.id);
+    }
     drop(mcp_registration);
     let messaged_targets = env.hooks.take_turn_targets(&turn.id);
 

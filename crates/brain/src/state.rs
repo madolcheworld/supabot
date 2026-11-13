@@ -6,17 +6,19 @@
 //! credentials, the resolved configuration, the moment the process started, and
 //! the one signal `POST /api/shutdown` and SIGINT share.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::watch;
 
+use swarmbot_contracts::entry::ToolCallStatus;
 use swarmbot_contracts::{DomainError, Invocation, NodeId};
 use swarmbot_core::{McpTurnProvider, McpTurnRegistration, McpTurnRequest, Swarm};
 use swarmbot_llm::McpServerSpec;
-use swarmbot_mcp::{SwarmMcpServer, ToolFilter, TurnMcpRegistry};
+use swarmbot_mcp::{CallRecorder, McpCallRecord, SwarmMcpServer, ToolFilter, TurnMcpRegistry};
 use swarmbot_tools::{ApprovalGate, ToolContext};
 
 use crate::auth::{Identity as BrainIdentity, OwnerAuth};
@@ -85,6 +87,7 @@ impl AppState {
             turns: Arc::clone(&turn_mcp),
             internal_addr: Arc::clone(&internal_addr),
             secrets: Arc::clone(&secrets),
+            tool_calls: Arc::new(Mutex::new(HashMap::new())),
         }));
         Self {
             swarm,
@@ -199,6 +202,14 @@ struct BrainMcpProvider {
     turns: Arc<TurnMcpRegistry>,
     internal_addr: Arc<RwLock<Option<SocketAddr>>>,
     secrets: Arc<SecretRegistry>,
+    /// How many `tools/call` requests each turn made through its MCP endpoint,
+    /// counted as they happen.
+    ///
+    /// A harness-driven backend (ACP, Claude CLI) runs the tools itself, so the
+    /// runner's `ChatResponse::tool_calls` stays empty for those turns and the
+    /// count would otherwise be lost. The runner drains this via
+    /// [`McpTurnProvider::take_tool_calls`] before the turn is stored.
+    tool_calls: Arc<Mutex<HashMap<swarmbot_contracts::id::TurnId, u32>>>,
 }
 
 impl McpTurnProvider for BrainMcpProvider {
@@ -216,7 +227,7 @@ impl McpTurnProvider for BrainMcpProvider {
             .map(|bot| bot.host_node())
             .unwrap_or_else(NodeId::local);
         let mut invocation = Invocation::new(req.bot_id, req.conversation_id);
-        invocation.turn_id = Some(req.turn_id);
+        invocation.turn_id = Some(req.turn_id.clone());
         invocation.task_id = req.task_id;
         invocation.node_id = Some(host_node.clone());
 
@@ -231,11 +242,14 @@ impl McpTurnProvider for BrainMcpProvider {
             ctx = ctx.with_node_id(host_node);
         }
 
-        let server = SwarmMcpServer::new(Arc::clone(&swarm.tools), ctx).with_filter(ToolFilter {
-            toolsets: Some(req.toolsets),
-            node_caps: req.node_caps,
-            in_task: req.in_task,
-        });
+        let recorder = self.call_recorder();
+        let server = SwarmMcpServer::new(Arc::clone(&swarm.tools), ctx)
+            .with_filter(ToolFilter {
+                toolsets: Some(req.toolsets),
+                node_caps: req.node_caps,
+                in_task: req.in_task,
+            })
+            .with_recorder(recorder);
         let handle = self.turns.register_handle(server);
         // The token is a bearer credential that travels in a URL *path*, and the
         // access log renders paths verbatim. It is registered with the scrubber
@@ -248,10 +262,96 @@ impl McpTurnProvider for BrainMcpProvider {
         let url = format!("http://{addr}/mcp/t/{token}");
         let specs = vec![McpServerSpec::http("swarmbot", url)];
         let secrets = Arc::clone(&self.secrets);
+        let tool_calls = Arc::clone(&self.tool_calls);
+        let turn_id = req.turn_id;
         Ok(McpTurnRegistration::new(specs, move || {
             let _ = handle.unregister();
             secrets.forget(&token);
+            // No-op when the runner drained the count before dropping this
+            // registration; it is the backstop for a turn that died between the
+            // two, so the map cannot grow one entry per abandoned turn.
+            let mut counts = tool_calls.lock().unwrap_or_else(|e| e.into_inner());
+            counts.remove(&turn_id);
         }))
+    }
+
+    fn take_tool_calls(&self, turn_id: &swarmbot_contracts::id::TurnId) -> u32 {
+        self.tool_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(turn_id)
+            .unwrap_or(0)
+    }
+}
+
+impl BrainMcpProvider {
+    /// The recorder every per-turn server reports through.
+    ///
+    /// Two jobs, and they are the same job seen twice: count the call for the
+    /// turn's usage, and write the transcript card the UI shows. A backend that
+    /// owns its tool loop never yields `ChatResponse::tool_calls`, so without
+    /// this a bot that messaged four teammates looks like a bot that did
+    /// nothing — no card, `usage.tool_calls == 0`, and `/api/usage` reporting a
+    /// team that never touched a tool.
+    ///
+    /// It must never fail the call: the tool already ran and the model already
+    /// has its answer, so a transcript write that fails is logged loudly and
+    /// dropped (the same rule the audit log follows).
+    fn call_recorder(&self) -> CallRecorder {
+        let counter = Arc::clone(&self.tool_calls);
+        let swarm = self.swarm.clone();
+        Arc::new(move |record: McpCallRecord| {
+            if let Some(turn_id) = record.invocation.turn_id.as_ref() {
+                let mut counts = counter.lock().unwrap_or_else(|e| e.into_inner());
+                *counts.entry(turn_id.clone()).or_insert(0) += 1;
+            }
+            let Some(swarm) = swarm.upgrade() else {
+                return;
+            };
+            let Some(turn_id) = record.invocation.turn_id.clone() else {
+                // No turn, no card: a call outside a turn has nowhere to hang.
+                return;
+            };
+            let call_id = record.invocation.tool_call_id.clone().unwrap_or_default();
+            let entry = swarm.transcript.tool_call(
+                &record.invocation.conversation_id,
+                Some(turn_id.clone()),
+                call_id,
+                record.tool.clone(),
+                record.args.clone(),
+                record.invocation.node_id.clone(),
+                record.invocation.task_id.clone(),
+            );
+            let mut entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        tool = %record.tool,
+                        "an MCP tool call could not be written to the transcript; the call itself succeeded"
+                    );
+                    return;
+                }
+            };
+            let status = if record.is_error {
+                ToolCallStatus::Failed
+            } else {
+                ToolCallStatus::Completed
+            };
+            if let Err(error) = swarm.transcript.finish_tool_call(
+                &mut entry,
+                status,
+                Some(record.result_text.clone()),
+                None,
+                Some(record.duration_ms),
+            ) {
+                tracing::error!(
+                    %error,
+                    tool = %record.tool,
+                    "an MCP tool-call card could not be finished; the call itself succeeded"
+                );
+            }
+        })
     }
 }
 

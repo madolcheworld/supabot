@@ -111,6 +111,20 @@ impl Drop for McpTurnRegistration {
 /// Port implemented by `brain` (or tests) to expose scoped MCP servers per turn.
 pub trait McpTurnProvider: Send + Sync {
     fn register_turn(&self, request: McpTurnRequest) -> Result<McpTurnRegistration, DomainError>;
+
+    /// Tool calls this turn made through the MCP endpoint since the last call,
+    /// clearing them.
+    ///
+    /// A backend that owns its tool loop (`BackendKind::owns_tool_loop`) never
+    /// fills `ChatResponse::tool_calls`: the agent runs the tool itself, through
+    /// the per-turn MCP registration. The runner therefore cannot count those
+    /// calls from the response, and without this the turn would be stored with
+    /// `usage.tool_calls == 0` however many teammates it messaged — and
+    /// `/api/usage` would report a team that never touched a tool. Default `0`
+    /// keeps every non-brain test double honest without implementing it.
+    fn take_tool_calls(&self, _turn_id: &TurnId) -> u32 {
+        0
+    }
 }
 
 pub type McpProviderSlot = Arc<RwLock<Option<Arc<dyn McpTurnProvider>>>>;
