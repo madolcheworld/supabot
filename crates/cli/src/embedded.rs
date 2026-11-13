@@ -30,6 +30,7 @@ use swarmbot_contracts::live::LiveEvent;
 use swarmbot_contracts::node::{NodeInfo, NodeRoot};
 use swarmbot_contracts::request::{Decision, RuntimeRequest};
 use swarmbot_contracts::task::Task;
+use swarmbot_contracts::turn::{DEFAULT_WINDOW_HOURS, UsageReport};
 use swarmbot_core::compose;
 use swarmbot_core::swarm::Swarm;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -89,6 +90,11 @@ impl Embedded {
                 tracing::info!("{}", report.summary());
             }
             composed.start_expiry_ticker();
+            // The embedded brain is a brain: a routine that only fires under
+            // `swarmbot-brain` would make `swarmbot chat` a different product
+            // from the daemon it talks to.
+            composed.start_routine_ticker();
+            composed.start_housekeeping_ticker();
         }
         Ok(Self { swarm: composed })
     }
@@ -209,6 +215,31 @@ impl Session for Embedded {
             .store
             .list_nodes()
             .map_err(|err| anyhow!("{err}"))
+    }
+
+    fn usage(&self, since: Option<&str>) -> Result<UsageReport> {
+        // The same window rule the brain's `GET /api/usage` applies, from the
+        // same function: an embedded run and a remote one must not report
+        // different totals for the same turns.
+        let until = chrono::Utc::now();
+        let since = match since {
+            Some(raw) => chrono::DateTime::parse_from_rfc3339(raw.trim())
+                .map(|parsed| parsed.with_timezone(&chrono::Utc))
+                .map_err(|err| {
+                    anyhow!(
+                        "`--since` must be an RFC 3339 timestamp (e.g. 2026-01-31T00:00:00Z), \
+                         got {raw:?}: {err}"
+                    )
+                })?,
+            None => until - chrono::Duration::hours(DEFAULT_WINDOW_HOURS),
+        };
+        if since > until {
+            return Err(anyhow!(
+                "`--since` ({}) is in the future; the report would cover an empty window",
+                since.to_rfc3339()
+            ));
+        }
+        UsageReport::window(self.swarm.store.as_ref(), since, until).map_err(|err| anyhow!("{err}"))
     }
 
     fn tail(&self, conversation: &ConversationId, limit: u32) -> Result<Vec<Entry>> {

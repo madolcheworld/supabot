@@ -39,6 +39,7 @@ use swarmbot_contracts::live::{LiveCursor, LiveEvent};
 use swarmbot_contracts::node::NodeInfo;
 use swarmbot_contracts::request::{Decision, RuntimeRequest};
 use swarmbot_contracts::task::{Task, TaskStatus};
+use swarmbot_contracts::turn::UsageReport;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::embedded::{Embedded, short_conversation};
@@ -722,6 +723,10 @@ impl Session for Remote {
 
     fn nodes(&self) -> Result<Vec<NodeInfo>> {
         self.client.nodes().map_err(|err| self.honest(&err))
+    }
+
+    fn usage(&self, since: Option<&str>) -> Result<UsageReport> {
+        self.client.usage(since).map_err(|err| self.honest(&err))
     }
 
     fn tail(&self, conversation: &ConversationId, limit: u32) -> Result<Vec<Entry>> {

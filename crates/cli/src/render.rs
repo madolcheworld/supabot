@@ -877,6 +877,25 @@ fn short_id(id: &str) -> String {
         .collect()
 }
 
+/// Why a `--json` run stopped — the object appended after the last event.
+///
+/// A `LiveEvent` cannot carry this: the decision to stop is the CLI's own, not
+/// the brain's. So a `--json` run ends with one object of its own, and its
+/// `type` is deliberately *not* a `LiveEvent` tag, so a consumer that switches
+/// on `type` can tell the run's summary from the brain's events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunStop<'a> {
+    /// `"idle"`, `"timeout"` or `"stream_ended"` — the documented words.
+    pub reason: &'a str,
+    /// The same lines the prose report names as still moving (empty when idle).
+    pub still_running: &'a [String],
+    /// Whether the CLI asked the brain to stop the turn it can no longer watch.
+    pub interrupted: bool,
+    /// The session's own account of why the stream ended, when it has one (a
+    /// refused token, a frame this build cannot read). Never a token value.
+    pub stream_error: Option<&'a str>,
+}
+
 /// Writes the rendered stream to a terminal or a pipe.
 ///
 /// Streamed entries (a bot message growing, reasoning, a tool call finishing)
@@ -986,6 +1005,24 @@ impl<W: Write> Printer<W> {
     /// returned, one object per line, through the same sink as the stream.
     pub fn json_entry(&mut self, entry: &Entry) -> Result<()> {
         let line = serde_json::to_string(entry)?;
+        writeln!(self.out, "{line}")?;
+        self.out.flush()?;
+        Ok(())
+    }
+
+    /// The last line of a `--json` run: **why it stopped**, so a script reads
+    /// the reason from the stream instead of parsing the prose a human reads.
+    ///
+    /// One object, one line, same sink as the events. `still_running` is the
+    /// same list the prose report names, so the two cannot disagree.
+    pub fn json_run_stopped(&mut self, stop: &RunStop<'_>) -> Result<()> {
+        let line = serde_json::json!({
+            "type": "run_stopped",
+            "stop_reason": stop.reason,
+            "still_running": stop.still_running,
+            "interrupted": stop.interrupted,
+            "stream_error": stop.stream_error,
+        });
         writeln!(self.out, "{line}")?;
         self.out.flush()?;
         Ok(())
@@ -1785,6 +1822,58 @@ mod tests {
         let first: serde_json::Value = serde_json::from_str(lines[0]).expect("one object per line");
         assert_eq!(first["author"]["kind"], "owner");
         assert_eq!(first["kind"]["text"], "first");
+    }
+
+    /// The run's own stop summary is one object on one line, through the same
+    /// sink as the events — and its `type` is not an event tag, so a consumer
+    /// can tell the CLI's ending from the brain's events.
+    #[test]
+    fn json_run_stopped_is_one_object_per_line() {
+        let still = vec!["task \"x\" is queued".to_string()];
+        let mut buffer = Vec::new();
+        {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            printer
+                .json_event(&LiveEvent::Synchronized {
+                    cursor: LiveCursor::new(1, 2),
+                })
+                .expect("writes");
+            printer
+                .json_run_stopped(&RunStop {
+                    reason: "stream_ended",
+                    still_running: &still,
+                    interrupted: true,
+                    stream_error: Some("the brain refused the token (401)"),
+                })
+                .expect("writes");
+        }
+        let out = String::from_utf8(buffer).expect("utf8");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out:?}");
+        let stop: serde_json::Value = serde_json::from_str(lines[1]).expect("one object per line");
+        assert_eq!(stop["type"], "run_stopped");
+        assert_eq!(stop["stop_reason"], "stream_ended");
+        assert_eq!(stop["still_running"][0], "task \"x\" is queued");
+        assert_eq!(stop["interrupted"], true);
+        assert_eq!(stop["stream_error"], "the brain refused the token (401)");
+        // An idle run carries the same keys, with nothing still moving.
+        let mut buffer = Vec::new();
+        {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            printer
+                .json_run_stopped(&RunStop {
+                    reason: "idle",
+                    still_running: &[],
+                    interrupted: false,
+                    stream_error: None,
+                })
+                .expect("writes");
+        }
+        let out = String::from_utf8(buffer).expect("utf8");
+        let stop: serde_json::Value = serde_json::from_str(out.trim_end()).expect("one object");
+        assert_eq!(stop["stop_reason"], "idle");
+        assert_eq!(stop["still_running"].as_array().map(Vec::len), Some(0));
+        assert_eq!(stop["stream_error"], serde_json::Value::Null);
     }
 
     // Keep the imports used by helpers above referenced once, so an editing

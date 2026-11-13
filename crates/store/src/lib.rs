@@ -24,12 +24,14 @@
 //! Nothing here ever panics: every failure is a
 //! [`DomainError`](swarmbot_contracts::DomainError).
 
+pub mod backup;
 pub mod contract;
 pub mod memory;
 pub mod mirror;
 pub mod sqlite;
 pub mod threaded;
 
+pub use backup::{BackupError, BackupReport, Manifest, VerifyReport, backup, verify};
 pub use contract::run_contract_suite;
 pub use memory::MemoryStore;
 pub use mirror::JsonlMirror;

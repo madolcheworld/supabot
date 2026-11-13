@@ -6,9 +6,24 @@
 //! every line of [`crate::render`] — is written once: a remote run and a local
 //! run are meant to be indistinguishable on screen.
 //!
-//! Exit codes: `0` success, `1` any error (one clean line on stderr; a
-//! backtrace only with `--verbose`), `2` when `run`/`demo` timed out waiting
-//! for the team to go idle.
+//! Exit codes — the contract a wrapper script reads, because `$?` is the only
+//! signal that survives a pipe:
+//!
+//! | code | meaning |
+//! | --- | --- |
+//! | 0 | success: the command did what it was asked, and a `run` saw the team go idle |
+//! | 1 | an error — one clean line on stderr; a backtrace only with `--verbose` |
+//! | 2 | `run`/`demo` timed out waiting for the team to go idle: the team is still working |
+//! | 3 | `run`'s live event stream ended before the team went idle — a dead socket, not a slow team |
+//! | 64 | `EX_USAGE`: the command line could not be parsed (a bad flag, an unknown subcommand) |
+//!
+//! `2` and `3` are deliberately different facts: "the team is slow" and "the
+//! brain's socket died under us" want different reactions from whoever reads the
+//! code. `64` exists because clap's own default for a usage error is `2`, which
+//! would make "the team is slow" and "I typed the command wrong"
+//! indistinguishable; [`main`] maps the parse failure instead of letting clap
+//! exit. `--json` runs also end with one machine-readable object naming the
+//! reason, so a script does not have to parse prose.
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -38,20 +53,32 @@ mod tmp;
 
 use embedded::{BrainParams, Embedded, drain_quiescent, emit_event};
 use remote::{Backend, Remote};
-use render::{Printer, Roster, Theme};
+use render::{Printer, Roster, RunStop, Theme};
 use resolve::Directory;
-use session::{Session, still_running, wait_for_idle};
+use session::{Session, wait_for_idle};
 
 /// How long `shutdown` keeps probing the brain after it acknowledged, before
 /// reporting that it was still answering. The daemon lets the turns in flight
 /// finish first, so "it said ok" and "it is gone" are different facts.
 const SHUTDOWN_WATCH: Duration = Duration::from_secs(10);
 
+/// The exit-code table, in `--help` as well as in the module docs: the codes are
+/// a contract, and a contract nobody can look up from the terminal is folklore.
+const EXIT_CODES_HELP: &str = "\
+Exit codes:
+  0   success (a `run` saw the team go idle)
+  1   an error — one line on stderr; a backtrace only with --verbose
+  2   `run`/`demo` timed out waiting for the team to go idle
+  3   the live event stream ended before the team went idle (a dead socket, not a slow team)
+  64  usage error: the command line could not be parsed
+";
+
 #[derive(Parser)]
 #[command(
     name = "swarmbot",
     version,
-    about = "SwarmBot — named AI bots that chat in DMs and groups and delegate work to each other"
+    about = "SwarmBot — named AI bots that chat in DMs and groups and delegate work to each other",
+    after_help = EXIT_CODES_HELP
 )]
 struct Cli {
     /// Log at debug level (RUST_LOG wins when set).
@@ -133,7 +160,9 @@ enum Command {
         /// Idle budget in seconds before the run is reported as timed out.
         #[arg(long, default_value = "120", value_name = "SECS")]
         wait: u64,
-        /// One JSON object per line (LiveEvents) instead of prose.
+        /// One JSON object per line (LiveEvents) instead of prose. The last
+        /// line is the run's own stop summary: `{"type":"run_stopped",…}` with
+        /// a `stop_reason` of `idle`, `timeout` or `stream_ended`.
         #[arg(long)]
         json: bool,
     },
@@ -187,6 +216,21 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// What the team's turns spent, as the backends reported it.
+    Usage {
+        /// Start of the window, RFC 3339 (e.g. 2026-01-31T00:00:00Z). Default:
+        /// the last 24 hours.
+        #[arg(long, value_name = "TIMESTAMP")]
+        since: Option<String>,
+        /// One JSON object (the UsageReport) instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Snapshot a data dir, or check a snapshot. Local filesystem work.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
     /// Ask a remote brain (--brain) to stop, and say whether it did.
     Shutdown,
 }
@@ -228,9 +272,37 @@ enum ConfigCommand {
     Show,
 }
 
+#[derive(Subcommand)]
+enum BackupCommand {
+    /// Copy the data dir's database and transcripts into a new directory, then
+    /// verify the copy.
+    Create {
+        /// The directory to write. Must not exist, or must be empty: a backup
+        /// that silently overwrote an older one would be a data-loss bug wearing
+        /// a success message.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+    },
+    /// Check a backup directory: SQLite integrity, manifest, and the row counts
+    /// re-derived from the snapshot itself.
+    Verify {
+        /// A directory `backup create` wrote.
+        dir: PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            // clap renders the text itself (help and version on stdout, a
+            // usage error on stderr). Only the exit code is ours to decide: a
+            // usage error must not share `2` with "the team timed out".
+            let _ = err.print();
+            return exit_code(usage_exit(&err));
+        }
+    };
     init_tracing(cli.verbose);
     match dispatch(&cli).await {
         Ok(code) => exit_code(code),
@@ -242,13 +314,101 @@ async fn main() -> std::process::ExitCode {
             } else {
                 eprintln!("swarmbot: {err:#}");
             }
-            exit_code(1)
+            exit_code(EXIT_ERROR)
         }
     }
 }
 
 fn exit_code(code: i32) -> std::process::ExitCode {
     std::process::ExitCode::from(code.clamp(0, 255) as u8)
+}
+
+/// The code a `clap` parse failure exits with.
+///
+/// `--help` and `--version` are answers, not failures: they print and exit `0`.
+/// Every other kind — an unknown flag, an unknown subcommand, a missing
+/// argument — is a usage error and gets [`EXIT_USAGE`] instead of clap's own
+/// `2`, which this CLI already uses for a timeout.
+fn usage_exit(err: &clap::Error) -> i32 {
+    use clap::error::ErrorKind;
+    match err.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+        _ => EXIT_USAGE,
+    }
+}
+
+// The exit codes, named once so the table in the module docs has one source.
+//
+// `2` and `3` are different facts on purpose: "the team is slow" and "the
+// brain's socket died under us" want different reactions, and folding the
+// second into the first is how a front end blames a team for a dead socket.
+
+/// Any error: one clean line on stderr (a backtrace only with `--verbose`).
+const EXIT_ERROR: i32 = 1;
+/// `run`/`demo` ran out of idle budget while the team was still working.
+const EXIT_TIMEOUT: i32 = 2;
+/// `run`'s live event stream ended before the team went idle.
+const EXIT_STREAM_ENDED: i32 = 3;
+/// `EX_USAGE` from `sysexits.h`. clap's default for a usage error is `2`, the
+/// same code as a timeout — a wrapper script could not tell "the team is slow"
+/// from "I typed the command wrong", which is why [`main`] maps a parse failure
+/// here instead of letting clap exit.
+const EXIT_USAGE: i32 = 64;
+
+/// How a `run` stopped — the fact the exit code and the `--json` summary both
+/// report.
+///
+/// A `bool` could not tell "the team went quiet inside the budget" from "the
+/// socket closed while the team was still working". Those are different truths,
+/// and both the exit code and the machine-readable summary have to say which
+/// one happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopReason {
+    /// The team went idle inside the budget: the normal ending.
+    Idle,
+    /// The budget ran out while the team was still working.
+    Timeout,
+    /// The live event stream ended before the team went idle. Nothing said the
+    /// team was finished and nothing more can arrive, so this is not a timeout.
+    StreamEnded,
+}
+
+impl StopReason {
+    /// The word a `--json` consumer matches on. Stable and documented: a script
+    /// parses this, never the prose.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Timeout => "timeout",
+            Self::StreamEnded => "stream_ended",
+        }
+    }
+
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::Idle => 0,
+            Self::Timeout => EXIT_TIMEOUT,
+            Self::StreamEnded => EXIT_STREAM_ENDED,
+        }
+    }
+
+    /// The line a prose run prints when it did not go idle, or `None` for the
+    /// normal ending.
+    ///
+    /// `stream_error` is the session's own account of why the socket died (a
+    /// refused token, a frame this build cannot read). It is appended in
+    /// parentheses rather than replacing the sentence: "the stream ended" is
+    /// still the fact about the run, and the reason is what makes it useful.
+    fn headline(self, budget: Duration, stream_error: Option<&str>) -> Option<String> {
+        match self {
+            Self::Idle => None,
+            Self::Timeout => Some(format!("TIMED OUT after {}s", budget.as_secs())),
+            Self::StreamEnded => Some(match stream_error {
+                Some(why) => format!("the live stream ended before the team went idle ({why})"),
+                None => "the live stream ended before the team went idle".to_string(),
+            }),
+        }
+    }
 }
 
 /// RUST_LOG wins; `-v` means debug; the default keeps warnings and errors on
@@ -346,6 +506,11 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
         },
         Command::Config { command } => match command {
             ConfigCommand::Show => cmd_config_show(cli).await,
+        },
+        Command::Usage { since, json } => cmd_usage(cli, since.as_deref(), *json).await,
+        Command::Backup { command } => match command {
+            BackupCommand::Create { out } => cmd_backup_create(cli, out.clone()).await,
+            BackupCommand::Verify { dir } => cmd_backup_verify(cli, dir.clone()).await,
         },
         Command::Shutdown => cmd_shutdown(cli).await,
     }
@@ -522,7 +687,14 @@ async fn cmd_demo(cli: &Cli, offline: bool, script: Option<&PathBuf>) -> Result<
     )
     .await?;
     printer.finish()?;
-    Ok(if report.idle { 0 } else { 2 })
+    // The demo has no stream to lose (it is an in-process, scripted story), so
+    // its two endings are the documented idle/timeout pair.
+    Ok(if report.idle {
+        StopReason::Idle
+    } else {
+        StopReason::Timeout
+    }
+    .exit_code())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -688,7 +860,8 @@ pub struct RunOnce<'a> {
 
 /// Send one message, stream every event until the team is idle (budget
 /// `wait`), print the final reply and the `delegated:` line, and answer with
-/// the exit code: 0 when idle, 2 when the budget ran out.
+/// the exit code of the [`StopReason`]: `0` idle, `2` timed out, `3` the live
+/// stream ended.
 ///
 /// One body for both halves of the seam: the events come from a
 /// `UnboundedReceiver<LiveEvent>` whichever brain produced them, and the
@@ -720,27 +893,32 @@ pub async fn run_once<W: Write, S: Session>(
         let _ = idle_tx.send(wait_for_idle(&waiter, budget).await);
     });
 
-    let mut idle = false;
-    loop {
+    let stop = loop {
         tokio::select! {
             event = rx.recv() => match event {
                 Some(event) => emit_event(printer, &mut roster, &event, options.json, false)?,
-                // The stream ended (a remote brain closed the socket): finish
-                // with what arrived instead of waiting for events that cannot
-                // come any more.
-                None => break,
+                // The stream ended (a remote brain closed the socket): report
+                // *that* instead of waiting for events that cannot come any
+                // more. A dead socket is not a slow team, so it must not be
+                // printed as a timeout.
+                None => break StopReason::StreamEnded,
             },
             result = &mut idle_rx => {
-                idle = match result {
+                break match result {
                     // A probe that failed is reported, never folded into
                     // "still running": the team is not to blame for a socket.
-                    Ok(value) => value?,
-                    Err(_) => false,
+                    Ok(value) => match value? {
+                        true => StopReason::Idle,
+                        false => StopReason::Timeout,
+                    },
+                    // The waiter task ended without answering (it is spawned,
+                    // so only a cancelled runtime does that). No probe failed
+                    // and none said idle, so the budget is the only fact left.
+                    Err(_) => StopReason::Timeout,
                 };
-                break;
             }
         }
-    }
+    };
     drain_quiescent(
         &mut rx,
         printer,
@@ -754,14 +932,19 @@ pub async fn run_once<W: Write, S: Session>(
     if !options.json && !printer.theme.quiet {
         print_run_summary(session, &options.conversation, printer)?;
     }
-    if !idle {
-        // Stop the turn before reporting the timeout. In-process the brain dies
-        // with this process anyway; against a daemon it does not, and leaving a
-        // bot working on an answer nobody will read is worse than saying it was
-        // stopped. `interrupt` answers `false` when nothing was running, which
-        // is a fact, not a failure.
+
+    let mut still = Vec::new();
+    let mut interrupted = false;
+    if let Some(headline) = stop.headline(budget, session.stream_error().as_deref()) {
+        // Stop the turn before reporting a run that did not go idle. In-process
+        // the brain dies with this process anyway; against a daemon it does not,
+        // and leaving a bot working on an answer nobody will read is worse than
+        // saying it was stopped — the same for a stream this CLI has lost, not
+        // just for a budget it ran out of. `interrupt` answers `false` when
+        // nothing was running, which is a fact, not a failure.
         let stopped = session.interrupt(&options.conversation);
-        let still = still_running(session);
+        interrupted = matches!(&stopped, Ok(true));
+        still = still_running_after(session, stop);
         if options.json {
             // stdout belongs to the JSON stream; diagnostics go to stderr.
             for line in &still {
@@ -775,17 +958,48 @@ pub async fn run_once<W: Write, S: Session>(
                 printer.note(&format!("cannot interrupt the conversation: {err}"))?;
             }
             printer.line(&printer.theme.paint(
-                &format!(
-                    "TIMED OUT after {}s — still running: {}",
-                    budget.as_secs(),
-                    still.join("; ")
-                ),
+                &format!("{headline} — still running: {}", still.join("; ")),
                 Color::Red,
             ))?;
         }
-        return Ok(2);
     }
-    Ok(0)
+    if options.json {
+        // The last line of the stream, and the only one this CLI writes itself:
+        // a script reads the reason from here instead of parsing prose.
+        printer.json_run_stopped(&RunStop {
+            reason: stop.as_str(),
+            still_running: &still,
+            interrupted,
+            stream_error: session.stream_error().as_deref(),
+        })?;
+    }
+    Ok(stop.exit_code())
+}
+
+/// The "still running" lines for a run that did not go idle.
+///
+/// The probe is the one [`wait_for_idle`] asks, so the lines are the words the
+/// timeout report always used; only the fallback differs, because "nothing
+/// reports as busy" means two different things: after a timeout the check
+/// itself ran out of budget, while after a stream that ended it means the team
+/// really did go quiet and this CLI can no longer see it.
+fn still_running_after<S: Session>(session: &S, stop: StopReason) -> Vec<String> {
+    match session.busy() {
+        Ok(lines) if !lines.is_empty() => lines,
+        Ok(_) => vec![match stop {
+            StopReason::Timeout => {
+                "nothing reports as busy (the idle check itself timed out)".to_string()
+            }
+            StopReason::StreamEnded => {
+                "nothing reports as busy (the stream ended, so this is its last answer)".to_string()
+            }
+            StopReason::Idle => "nothing reports as busy".to_string(),
+        }],
+        Err(err) => vec![format!(
+            "cannot ask {} what is running: {err}",
+            session.describe()
+        )],
+    }
 }
 
 /// The closing block of a prose run: the last bot reply and the delegation
@@ -1040,6 +1254,167 @@ async fn cmd_nodes_pair(cli: &Cli) -> Result<i32> {
 /// `POST /api/shutdown` answers before the daemon exits — it has to, or the
 /// answer would never arrive — so this command keeps probing `/api/health` for a
 /// few seconds and reports which of the two happened.
+/// `swarmbot backup create --out DIR`
+///
+/// A backup is **local filesystem work**: it reads `<data>/swarmbot.sqlite` and
+/// `<data>/transcripts` from disk. With `--brain` those files live on whatever
+/// machine runs the daemon, and this CLI cannot reach them — the REST API
+/// deliberately exposes no file-level operations. Refusing is the honest answer;
+/// quietly backing up a stale local directory that happens to share a path would
+/// be a backup of the wrong thing wearing a success message.
+async fn cmd_backup_create(cli: &Cli, out: PathBuf) -> Result<i32> {
+    if let Some(url) = &cli.brain {
+        return Err(anyhow!(
+            "`backup create` reads the data directory on this machine, but --brain points at the \
+             brain at {url}: its database is on that machine. Run `swarmbot backup create` there \
+             (with its --data-dir), or drop --brain to back up the data dir here"
+        ));
+    }
+    let data_dir = data_dir_for(cli);
+    // Blocking file work and a SQLite connection: it belongs off the runtime's
+    // worker threads, which is the same reason every other command wraps the
+    // in-process half this way.
+    let report = tokio::task::spawn_blocking({
+        let data_dir = data_dir.clone();
+        let out = out.clone();
+        move || swarmbot_store::backup::backup(&data_dir, &out)
+    })
+    .await
+    .map_err(|err| anyhow!("the backup task stopped: {err}"))?
+    .map_err(|err| anyhow!("{err}"))?;
+
+    // A backup nobody opened is a guess, so the command verifies what it just
+    // wrote before it reports success.
+    let verify = tokio::task::spawn_blocking({
+        let out = out.clone();
+        move || swarmbot_store::backup::verify(&out)
+    })
+    .await
+    .map_err(|err| anyhow!("the verify task stopped: {err}"))?
+    .map_err(|err| anyhow!("the backup was written but does not verify: {err}"))?;
+
+    let mut printer = stdout_printer(cli, false);
+    printer.line(&format!(
+        "backup {} → {}",
+        data_dir.display(),
+        report.out_dir.display()
+    ))?;
+    printer.line(&format!(
+        "  snapshot {} ({} bytes, schema v{})",
+        report.snapshot.display(),
+        report.manifest.database_bytes,
+        report.manifest.schema_version
+    ))?;
+    printer.line(&format!(
+        "  transcripts {} files ({} bytes)",
+        report.manifest.transcript_files, report.manifest.transcript_bytes
+    ))?;
+    printer.line(&format!("  tables {}", tables_line(&verify.tables)))?;
+    printer.line(&format!(
+        "  verified: integrity_check={} · manifest matched the snapshot",
+        verify.integrity_check
+    ))?;
+    Ok(0)
+}
+
+/// `swarmbot backup verify DIR`
+async fn cmd_backup_verify(cli: &Cli, dir: PathBuf) -> Result<i32> {
+    let report = tokio::task::spawn_blocking(move || swarmbot_store::backup::verify(&dir))
+        .await
+        .map_err(|err| anyhow!("the verify task stopped: {err}"))?
+        .map_err(|err| anyhow!("{err}"))?;
+    let mut printer = stdout_printer(cli, false);
+    printer.line(&format!(
+        "{} is a backup taken {} by swarmbot {} (schema v{})",
+        report.out_dir.display(),
+        report.manifest.created_at,
+        report.manifest.crate_version,
+        report.manifest.schema_version
+    ))?;
+    printer.line(&format!("  integrity_check={}", report.integrity_check))?;
+    printer.line(&format!("  tables {}", tables_line(&report.tables)))?;
+    printer.line(&format!("  transcripts {} files", report.transcript_files))?;
+    Ok(0)
+}
+
+/// `bot=3, conversation=2, …` — the row counts, in the manifest's own order.
+fn tables_line(tables: &std::collections::BTreeMap<String, i64>) -> String {
+    if tables.is_empty() {
+        return "none".to_string();
+    }
+    tables
+        .iter()
+        .map(|(table, rows)| format!("{table}={rows}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `swarmbot usage [--since T] [--json]`
+///
+/// Two front ends, one answer: the embedded half folds its own store and the
+/// remote half asks `GET /api/usage`, and both go through
+/// `UsageReport::window`, so a local run and a daemon run cannot disagree about
+/// the same turns.
+///
+/// The numbers are printed as reported and nothing is priced. A backend that
+/// reports no usage leaves its turns looking free, which is why the turn count
+/// is on the same screen: "0 tokens over 3 turns" is a different fact from
+/// "nothing ran".
+async fn cmd_usage(cli: &Cli, since: Option<&str>, json: bool) -> Result<i32> {
+    let report = match backend_for(cli).await? {
+        Backend::Embedded(embedded) => embedded.usage(since)?,
+        Backend::Remote(remote) => remote.usage(since)?,
+    };
+    if json {
+        let mut out = std::io::stdout();
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string(&report).context("cannot encode the usage report")?
+        )?;
+        out.flush()?;
+        return Ok(0);
+    }
+
+    let mut printer = stdout_printer(cli, false);
+    printer.line(&format!(
+        "usage {} → {}",
+        report.since.to_rfc3339(),
+        report.until.to_rfc3339()
+    ))?;
+    if report.is_empty() {
+        // Distinct from a window full of turns whose backends reported nothing:
+        // saying "0 tokens" here would invite the wrong conclusion.
+        printer.note("no turn ran in this window")?;
+        return Ok(0);
+    }
+    printer.line(&format!(
+        "  total in {} · out {} · {} llm calls · {} tool calls · {} turns",
+        report.totals.input_tokens,
+        report.totals.output_tokens,
+        report.totals.llm_calls,
+        report.totals.tool_calls,
+        report.turns
+    ))?;
+    for row in &report.by_bot {
+        let name = row.bot_name.as_deref().unwrap_or("(deleted bot)");
+        printer.line(&format!(
+            "  @{name} in {} · out {} · {} llm · {} tools",
+            row.usage.input_tokens,
+            row.usage.output_tokens,
+            row.usage.llm_calls,
+            row.usage.tool_calls
+        ))?;
+    }
+    if report.totals.total_tokens() == 0 {
+        printer.note(
+            "the backends reported no token usage for these turns; this is what they said, \
+             not an estimate",
+        )?;
+    }
+    Ok(0)
+}
+
 async fn cmd_shutdown(cli: &Cli) -> Result<i32> {
     let Some(url) = &cli.brain else {
         return Err(remote::needs_brain(
@@ -1126,12 +1501,168 @@ mod tests {
     use super::*;
     use crate::remote::Remote;
     use crate::render::Theme;
+    use crate::session::SendReport;
     use crate::tmp::TempDir;
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use swarmbot_client::testing::StubBrain;
     use swarmbot_contracts::config::BrainConfig;
+    use swarmbot_contracts::entry::Entry;
+    use swarmbot_contracts::id::RequestId;
+    use swarmbot_contracts::live::{LiveCursor, LiveEvent};
+    use swarmbot_contracts::request::{Decision, RuntimeRequest};
+    use swarmbot_contracts::task::Task;
     use swarmbot_llm::ScriptedTurn;
+    use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+    /// A session whose `busy()` answer and stream lifetime the test decides.
+    ///
+    /// `run_once` has to keep three endings apart, and two of them need a brain
+    /// that behaves in a way no canned double does: `StubBrain`'s socket closes
+    /// right after the snapshot (the `StreamEnded` case), and a real brain
+    /// cannot be told to stay busy forever. This double can do both, which is
+    /// what makes a genuine timeout testable without a real second of a real
+    /// team working.
+    #[derive(Clone)]
+    struct NeverIdle {
+        /// What `busy()` answers: the team never goes quiet.
+        busy: Vec<String>,
+        /// Held for as long as the test runs: an alive sender is an open
+        /// stream. Dropped inside `subscribe` for the stream-ended case.
+        stream: Arc<Mutex<Option<UnboundedSender<LiveEvent>>>>,
+        /// `false` ends the stream right after the snapshot, the way a closed
+        /// brain socket ends the pump's channel.
+        keep_open: bool,
+        /// The reason a real session would record for a dead socket, when the
+        /// test wants the report to name one.
+        stream_error: Option<String>,
+        interrupted: Arc<Mutex<Vec<ConversationId>>>,
+    }
+
+    impl NeverIdle {
+        fn new(busy: &str) -> Self {
+            Self {
+                busy: vec![busy.to_string()],
+                stream: Arc::new(Mutex::new(None)),
+                keep_open: true,
+                stream_error: None,
+                interrupted: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// The same team, with its live stream already over.
+        fn ended(busy: &str) -> Self {
+            Self {
+                keep_open: false,
+                ..Self::new(busy)
+            }
+        }
+
+        fn with_stream_error(mut self, reason: &str) -> Self {
+            self.stream_error = Some(reason.to_string());
+            self
+        }
+
+        fn interrupts(&self) -> usize {
+            self.interrupted
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .len()
+        }
+    }
+
+    impl Session for NeverIdle {
+        fn describe(&self) -> String {
+            "the test brain".to_string()
+        }
+        fn poll_interval(&self) -> Duration {
+            // Faster than a real brain's: the test only needs the deadline to
+            // arrive, and 40 probes inside the second keep it cheap.
+            Duration::from_millis(25)
+        }
+        fn bots(&self) -> Result<Vec<Bot>> {
+            Ok(Vec::new())
+        }
+        fn conversations(&self) -> Result<Vec<Conversation>> {
+            Ok(Vec::new())
+        }
+        fn tasks(&self) -> Result<Vec<Task>> {
+            Ok(Vec::new())
+        }
+        fn nodes(&self) -> Result<Vec<NodeInfo>> {
+            Ok(Vec::new())
+        }
+        fn usage(&self, _: Option<&str>) -> Result<swarmbot_contracts::turn::UsageReport> {
+            let now = chrono::Utc::now();
+            Ok(swarmbot_contracts::turn::UsageReport::from_turns(
+                now,
+                now,
+                &[],
+                |_| None,
+            ))
+        }
+        fn tail(&self, _: &ConversationId, _: u32) -> Result<Vec<Entry>> {
+            Ok(Vec::new())
+        }
+        fn send(&self, _: &ConversationId, _: &str) -> Result<SendReport> {
+            Ok(SendReport::default())
+        }
+        fn subscribe(&self, _: Option<ConversationId>) -> Result<UnboundedReceiver<LiveEvent>> {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            // The run waits for the hub's `Synchronized` promise before it
+            // sends; a double that never made it would fail the run before the
+            // ending under test.
+            let _ = tx.send(LiveEvent::Synchronized {
+                cursor: LiveCursor::new(1, 1),
+            });
+            if self.keep_open {
+                *self.stream.lock().unwrap_or_else(|err| err.into_inner()) = Some(tx);
+            }
+            Ok(rx)
+        }
+        fn respond(
+            &self,
+            _: &RequestId,
+            _: Option<Decision>,
+            _: Option<serde_json::Value>,
+        ) -> Result<RuntimeRequest> {
+            Err(anyhow!("the test brain answers no requests"))
+        }
+        fn interrupt(&self, conversation: &ConversationId) -> Result<bool> {
+            self.interrupted
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(conversation.clone());
+            Ok(true)
+        }
+        fn pending_in(&self, _: &ConversationId) -> Result<Vec<RuntimeRequest>> {
+            Ok(Vec::new())
+        }
+        fn new_session(&self, _: &Bot) -> Result<()> {
+            Ok(())
+        }
+        fn busy(&self) -> Result<Vec<String>> {
+            Ok(self.busy.clone())
+        }
+        fn delegation_lines(&self, _: &ConversationId) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn stream_error(&self) -> Option<String> {
+            self.stream_error.clone()
+        }
+    }
+
+    /// The last non-empty line of a `--json` run, parsed — the run's own stop
+    /// summary is always the last thing it writes.
+    fn last_json_line(out: &str) -> serde_json::Value {
+        let line = out
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .expect("a --json run writes at least one line");
+        serde_json::from_str(line)
+            .unwrap_or_else(|err| panic!("`{line}` is one JSON object ({err})"))
+    }
 
     /// An in-memory brain with the demo team on the always-present `fake`
     /// backend — the same double the core's own tests use.
@@ -1355,13 +1886,19 @@ mod tests {
     /// A remote `run`: the events the live pump delivers go through the same
     /// `run_once` and the same `render.rs` as an embedded run.
     ///
-    /// The stub brain serves one permanently queued task, so this run cannot go
-    /// idle and ends the way a real one would in that situation: exit 2, the
-    /// conversation interrupted, and a "still running" line naming the task.
-    /// What is pinned here is the rendering and the honesty of the timeout, not
-    /// a happy ending the stub has no way to produce.
+    /// The stub brain serves one permanently queued task and then **closes its
+    /// live socket**, so this run ends with a dead stream while the team is
+    /// still busy — the case that used to be printed as "TIMED OUT after 1s"
+    /// and exit `2`, blaming the team for a socket. What is pinned here is that
+    /// it is reported as what it is: exit `3`, the stream-ended sentence, the
+    /// busy lines, and an interrupt so the daemon is not left working on an
+    /// answer nobody will read.
+    ///
+    /// The genuine timeout is
+    /// [`a_team_that_never_goes_idle_times_out_with_exit_2`]'s job: the stub
+    /// cannot stay connected long enough to time out.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_remote_run_streams_and_reports_a_timeout_honestly() {
+    async fn a_remote_run_whose_stream_ends_is_not_reported_as_a_timeout() {
         let dir = TempDir::new("remote-run").expect("temp");
         let stub = StubBrain::start();
         let remote = Remote::connect(&stub.url(), Some("tok"), dir.path(), false)
@@ -1388,7 +1925,11 @@ mod tests {
             .await
             .expect("runs")
         };
-        assert_eq!(code, 2, "the stub's canned task never leaves the queue");
+        assert_eq!(
+            code, EXIT_STREAM_ENDED,
+            "a socket that closed is not a slow team, and 3 says so"
+        );
+        assert_ne!(code, EXIT_TIMEOUT, "2 means the team timed out");
 
         let out = String::from_utf8(buffer).expect("utf8");
         // The streamed reply, rendered by the shared path with the roster the
@@ -1399,7 +1940,14 @@ mod tests {
             out.contains("delegated: @stub → @stub \"stub task\" (queued)"),
             "{out}"
         );
-        assert!(out.contains("TIMED OUT after 1s"), "{out}");
+        assert!(
+            !out.contains("TIMED OUT"),
+            "a dead socket must not be blamed on the team: {out}"
+        );
+        assert!(
+            out.contains("the live stream ended before the team went idle"),
+            "{out}"
+        );
         assert!(out.contains("task \"stub task\" is queued"), "{out}");
 
         // The message went out with the token in a header, never in the URL …
@@ -1415,15 +1963,58 @@ mod tests {
             !sent.path.contains("tok") && !sent.query.contains("tok"),
             "{sent:?}"
         );
-        // … and the timeout really interrupted the conversation, instead of
-        // leaving a daemon working on an answer nobody will read.
+        // … and a run that stops watching still stops the work, instead of
+        // leaving a daemon busy with an answer nobody will read.
         assert!(
             stub.last_request(
                 "POST",
                 &format!("/api/conversations/{conversation}/interrupt")
             )
             .is_some(),
-            "the run interrupted the conversation it timed out on"
+            "the run interrupted the conversation whose stream it lost"
+        );
+    }
+
+    /// The real timeout: a team that never goes idle inside the budget. Exit
+    /// `2`, the documented "TIMED OUT after Ns" line, the busy lines, and an
+    /// interrupt.
+    ///
+    /// The session double is deliberate. `StubBrain`'s socket closes after the
+    /// snapshot, so a stub-driven run can only ever be the stream-ended case;
+    /// and waiting on a real brain for a real second would test the scheduler
+    /// instead of the report.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_team_that_never_goes_idle_times_out_with_exit_2() {
+        let session = NeverIdle::new("task \"stub task\" is queued");
+        let mut buffer = Vec::new();
+        let code = {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            run_once(
+                &session,
+                &RunOnce {
+                    text: "@lead status?",
+                    conversation: ConversationId::new(),
+                    wait: Duration::from_secs(1),
+                    json: false,
+                },
+                &mut printer,
+            )
+            .await
+            .expect("runs")
+        };
+        assert_eq!(code, EXIT_TIMEOUT, "a slow team is the documented timeout");
+
+        let out = String::from_utf8(buffer).expect("utf8");
+        assert!(out.contains("TIMED OUT after 1s"), "{out}");
+        assert!(out.contains("task \"stub task\" is queued"), "{out}");
+        assert!(
+            !out.contains("the live stream ended"),
+            "the stream was open the whole time: {out}"
+        );
+        assert_eq!(
+            session.interrupts(),
+            1,
+            "a run that gives up stops the work it stopped watching"
         );
     }
 
@@ -1456,7 +2047,7 @@ mod tests {
             )
             .await
             .expect("runs");
-            assert_eq!(code, 2, "the stub's task never leaves the queue");
+            assert_eq!(code, EXIT_STREAM_ENDED, "the stub's socket closed");
         }
         let out = String::from_utf8(buffer).expect("utf8");
         assert!(
@@ -1474,6 +2065,140 @@ mod tests {
         }
         assert!(saw_synchronized, "the stream synchronized: {out}");
         assert!(saw_reply, "the bot's reply streamed as JSON: {out}");
+        // … and the machine-readable ending says why, without prose parsing.
+        let stop = last_json_line(&out);
+        assert_eq!(stop["type"], "run_stopped", "{out}");
+        assert_eq!(stop["stop_reason"], "stream_ended", "{out}");
+        assert_eq!(stop["interrupted"], true, "{out}");
+        assert!(
+            stop["still_running"].as_array().is_some_and(|lines| lines
+                .iter()
+                .any(|line| line.as_str().is_some_and(|line| line.contains("stub task")))),
+            "{out}"
+        );
+    }
+
+    /// The `--json` contract for the stop itself: every run ends with **one**
+    /// object naming the reason, whichever of the three endings it had — so a
+    /// script never has to parse the prose a human reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_json_run_ends_with_one_object_that_names_the_stop_reason() {
+        // 1. idle — the embedded brain the other tests use, with a scripted
+        //    answer so it really finishes.
+        let dir = TempDir::new("json-stop").expect("temp");
+        let embedded = embedded(dir.path());
+        let swarm = Arc::clone(&embedded.swarm);
+        swarm
+            .backends
+            .registry()
+            .fake("fake")
+            .expect("the fake")
+            .push_turn(ScriptedTurn::text("done"));
+        let group = swarm
+            .conversations
+            .find_by_title("Team")
+            .expect("list")
+            .expect("the demo group");
+        let mut buffer = Vec::new();
+        let code = {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            run_once(
+                &embedded,
+                &RunOnce {
+                    text: "@lead status?",
+                    conversation: group.id.clone(),
+                    wait: Duration::from_secs(30),
+                    json: true,
+                },
+                &mut printer,
+            )
+            .await
+            .expect("runs")
+        };
+        assert_eq!(code, 0);
+        let out = String::from_utf8(buffer).expect("utf8");
+        let stop = last_json_line(&out);
+        assert_eq!(stop["type"], "run_stopped", "{out}");
+        assert_eq!(stop["stop_reason"], "idle", "{out}");
+        assert_eq!(stop["interrupted"], false, "{out}");
+        assert_eq!(
+            stop["still_running"].as_array().map(Vec::len),
+            Some(0),
+            "{out}"
+        );
+        assert_eq!(stop["stream_error"], serde_json::Value::Null, "{out}");
+        // Exactly one stop object: the summary is the run's, not a per-event
+        // line, and the "one JSON object per line" contract is unchanged.
+        assert_eq!(
+            out.lines()
+                .filter(|line| line.contains("\"run_stopped\""))
+                .count(),
+            1,
+            "{out}"
+        );
+        embedded.shutdown().await;
+
+        // 2. timeout — a team that never goes idle.
+        let stuck = NeverIdle::new("task \"stub task\" is queued");
+        let mut buffer = Vec::new();
+        let code = {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            run_once(
+                &stuck,
+                &RunOnce {
+                    text: "@lead status?",
+                    conversation: ConversationId::new(),
+                    wait: Duration::from_secs(1),
+                    json: true,
+                },
+                &mut printer,
+            )
+            .await
+            .expect("runs")
+        };
+        assert_eq!(code, EXIT_TIMEOUT);
+        let out = String::from_utf8(buffer).expect("utf8");
+        let stop = last_json_line(&out);
+        assert_eq!(stop["stop_reason"], "timeout", "{out}");
+        assert_eq!(stop["interrupted"], true, "{out}");
+        assert!(
+            stop["still_running"]
+                .as_array()
+                .is_some_and(|lines| !lines.is_empty()),
+            "{out}"
+        );
+
+        // 3. stream ended — the same team, with its socket already gone.
+        let cut = NeverIdle::ended("task \"stub task\" is queued")
+            .with_stream_error("the brain at http://127.0.0.1:1 refused the token (401)");
+        let mut buffer = Vec::new();
+        let code = {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            run_once(
+                &cut,
+                &RunOnce {
+                    text: "@lead status?",
+                    conversation: ConversationId::new(),
+                    wait: Duration::from_secs(1),
+                    json: true,
+                },
+                &mut printer,
+            )
+            .await
+            .expect("runs")
+        };
+        assert_eq!(code, EXIT_STREAM_ENDED);
+        let out = String::from_utf8(buffer).expect("utf8");
+        let stop = last_json_line(&out);
+        assert_eq!(stop["stop_reason"], "stream_ended", "{out}");
+        // The session's own reason travels with it, so a script can tell a
+        // refused token from a dropped connection without reading stderr.
+        assert!(
+            stop["stream_error"]
+                .as_str()
+                .is_some_and(|why| why.contains("401")),
+            "{out}"
+        );
     }
 
     #[tokio::test]
@@ -1705,6 +2430,51 @@ mod tests {
         let _ = exit_code(2);
         let _ = exit_code(-3);
         assert_eq!((-3i32).clamp(0, 255), 0);
+    }
+
+    /// The `clap` error for a command line that must not parse. `Cli` has no
+    /// `Debug` (it carries a config path and a token path), so `expect_err` is
+    /// not available here; this says the same thing.
+    fn parse_error(argv: &[&str]) -> clap::Error {
+        match Cli::try_parse_from(argv) {
+            Ok(_) => panic!("{argv:?} should not parse"),
+            Err(err) => err,
+        }
+    }
+
+    /// A usage error is not a timeout: clap's own `2` would make "the team is
+    /// slow" and "I typed the command wrong" the same code, which is exactly
+    /// what a wrapper script cannot afford. `--help`/`--version` are answers,
+    /// not failures.
+    ///
+    /// The real binary is checked against this table in
+    /// `tests/exit_codes.rs`; this pins the mapping `main` uses.
+    #[test]
+    fn a_usage_error_is_never_the_timeout_code() {
+        for argv in [
+            vec!["swarmbot", "--nonsense"],
+            vec!["swarmbot", "nope"],
+            vec!["swarmbot", "run"],
+        ] {
+            let err = parse_error(&argv);
+            assert_eq!(
+                usage_exit(&err),
+                EXIT_USAGE,
+                "{argv:?} is a usage error, not a timeout"
+            );
+            assert_ne!(usage_exit(&err), EXIT_TIMEOUT, "{argv:?}");
+        }
+
+        for argv in [vec!["swarmbot", "--help"], vec!["swarmbot", "--version"]] {
+            let answer = parse_error(&argv);
+            assert_eq!(usage_exit(&answer), 0, "{argv:?} is an answer");
+        }
+
+        // The table is where a user can find it, not only in this module's docs.
+        let help = parse_error(&["swarmbot", "--help"]).to_string();
+        assert!(help.contains("Exit codes"), "{help}");
+        assert!(help.contains("64"), "{help}");
+        assert!(help.contains("stream ended"), "{help}");
     }
 
     /// The `cmd_run` sequence on an unscripted fake, with the two streams a

@@ -38,7 +38,7 @@ use swarmbot_contracts::live::LiveEvent;
 use swarmbot_contracts::node::NodeInfo;
 use swarmbot_contracts::request::{Decision, RuntimeRequest};
 use swarmbot_contracts::task::Task;
-use swarmbot_contracts::turn::Turn;
+use swarmbot_contracts::turn::{Turn, UsageReport};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// What one sent message did, in the only fact a front end prints.
@@ -89,6 +89,16 @@ pub trait Session: Clone + Send + Sync + 'static {
     fn tasks(&self) -> Result<Vec<Task>>;
 
     fn nodes(&self) -> Result<Vec<NodeInfo>>;
+
+    /// What the team's turns spent in `[since, now]`, as the backends reported
+    /// it. `since` is RFC 3339 text; `None` means the brain's default window.
+    ///
+    /// A method on this port rather than a command that reaches into the store:
+    /// both halves must answer it, and the embedded half reads its own database
+    /// while the remote half asks `GET /api/usage`. Both fold through the same
+    /// [`swarmbot_contracts::turn::UsageReport::window`], so the two modes
+    /// cannot report different totals for the same turns.
+    fn usage(&self, since: Option<&str>) -> Result<UsageReport>;
 
     /// The newest `limit` entries of one conversation, ascending.
     fn tail(&self, conversation: &ConversationId, limit: u32) -> Result<Vec<Entry>>;
@@ -339,6 +349,10 @@ mod tests {
         }
         fn nodes(&self) -> Result<Vec<NodeInfo>> {
             Ok(Vec::new())
+        }
+        fn usage(&self, _: Option<&str>) -> Result<UsageReport> {
+            let now = chrono::Utc::now();
+            Ok(UsageReport::from_turns(now, now, &[], |_| None))
         }
         fn tail(&self, _: &ConversationId, _: u32) -> Result<Vec<Entry>> {
             Ok(Vec::new())
