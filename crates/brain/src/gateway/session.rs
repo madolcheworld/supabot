@@ -277,7 +277,19 @@ async fn hello(
             "node.hello claimed a different id than the upgrade was signed for; using the verified one"
         );
     }
-    apply_hello(state, node, &hello).await?;
+    if let Err(failure) = apply_hello(state, node, &hello).await {
+        let (code, reason) = match failure {
+            // 4401 is the one code that makes a node stop redialing for good,
+            // which is what a revocation has to mean.
+            RosterFailure::Revoked => (
+                swarmbot_node_protocol::CLOSE_REVOKED,
+                "this node was revoked by its owner; re-pair it to reconnect",
+            ),
+            RosterFailure::Unusable => (CLOSE_HELLO_FAILED, "node.hello could not be recorded"),
+        };
+        peer.close(code, reason).await;
+        return Err(());
+    }
     info!(
         node = %node,
         hostname = %hello.hostname,
@@ -291,73 +303,237 @@ async fn hello(
     Ok(hello)
 }
 
+/// How many times one roster write is retried after a revision conflict.
+///
+/// Four writers share the row — `node.hello`, `node.heartbeat`, `node.event` and
+/// presence changes — and the mux spawns a task per inbound request, so they
+/// genuinely overlap rather than merely being able to. A conflict therefore
+/// means "somebody else got there first", and the answer is to re-read and
+/// re-apply, not to fail. The bound is here so a pathological writer cannot spin
+/// in this loop forever; with four writers, exhausting it means something else is
+/// wrong, and every caller reports that rather than swallowing it.
+const ROSTER_WRITE_ATTEMPTS: usize = 8;
+
+/// Read–modify–write one roster row, retrying a revision conflict.
+///
+/// This is the only way the gateway writes a node row, and the reason it exists
+/// is the lost update it replaces: every writer used to do `get_node` → mutate →
+/// `update_node` by hand, and `update_node` writes the **whole row**. A heartbeat
+/// that read the row before `node.hello` wrote it therefore restored the pre-hello
+/// row — reverting `policy`, `roots` and `declared` on a node that was visibly
+/// online. The brain then planned against a ceiling the node did not have.
+///
+/// `change` is [`Fn`], not `FnOnce`, on purpose: a retry calls it again on the
+/// *fresh* row, which is the whole point. Every change here assigns fields from
+/// data the caller already holds, so re-applying is what it meant anyway; a
+/// change that depended on the row it first read would be a bug, and would now
+/// silently differ between attempt one and attempt two.
+///
+/// Returns the row as written so the caller can publish exactly what was stored,
+/// or `None` when the node has no roster row — which is not an error here,
+/// because the callers differ on whether that is fatal.
+///
+/// Synchronous, and deliberately so: there is no `.await` between the read and
+/// the write, so a single task cannot be interleaved *inside* one attempt. Two
+/// tasks on different workers still can be — `get_node` and `update_node` take
+/// the store's lock separately, and `ThreadedStore` even serves them on
+/// different lanes — which is exactly what the revision guard and the retry are
+/// for.
+pub(crate) fn mutate_node(
+    store: &(dyn swarmbot_contracts::repo::NodeRepo + Send + Sync),
+    node: &NodeId,
+    change: impl Fn(&mut NodeInfo),
+) -> Result<Option<NodeInfo>, swarmbot_contracts::DomainError> {
+    match mutate_node_vetoed(store, node, |_| false, change)? {
+        RosterWrite::Written(row) => Ok(Some(*row)),
+        // No veto can fire here, so `Vetoed` is unreachable by construction —
+        // and `Absent` is the only other outcome.
+        RosterWrite::Absent | RosterWrite::Vetoed => Ok(None),
+    }
+}
+
+/// What one guarded roster write ended in doing.
+pub(crate) enum RosterWrite {
+    /// The row was written; this is what the store now holds. Boxed because
+    /// `NodeInfo` is 288 bytes against two data-less variants, and clippy's
+    /// `large_enum_variant` is right that every `Absent` would otherwise pay
+    /// for it.
+    Written(Box<NodeInfo>),
+    /// There is no roster row for this node.
+    Absent,
+    /// The veto refused the write, and nothing was stored. The caller already
+    /// knows which veto it passed, so there is no row to hand back.
+    Vetoed,
+}
+
+/// [`mutate_node`], with a veto that is evaluated on the **freshly read** row
+/// inside the retry loop.
+///
+/// The veto has to live inside the loop, not before it. A check that runs once
+/// before the write has the same window the revision guard exists to close:
+/// read (not revoked) → somebody revokes → write. Checking after the write is
+/// worse still — the row has already been changed by then, so a refused hello
+/// would leave the node marked `online` with freshly re-approved capabilities.
+/// Inside the loop the veto and the write are guarded by the same generation:
+/// if a revoke lands in between, the write conflicts, the loop re-reads, and the
+/// veto then sees `revoked` and refuses without having stored anything.
+pub(crate) fn mutate_node_vetoed(
+    store: &(dyn swarmbot_contracts::repo::NodeRepo + Send + Sync),
+    node: &NodeId,
+    veto: impl Fn(&NodeInfo) -> bool,
+    change: impl Fn(&mut NodeInfo),
+) -> Result<RosterWrite, swarmbot_contracts::DomainError> {
+    for _ in 0..ROSTER_WRITE_ATTEMPTS {
+        let Some(mut row) = store.get_node(node)? else {
+            return Ok(RosterWrite::Absent);
+        };
+        if veto(&row) {
+            return Ok(RosterWrite::Vetoed);
+        }
+        change(&mut row);
+        row.bump_revision();
+        match store.update_node(&row) {
+            Ok(()) => return Ok(RosterWrite::Written(Box::new(row))),
+            // Somebody wrote between the read and the write. Re-read and apply
+            // our own change on top of theirs: both writers keep their fields,
+            // which is what the row should have said all along. Re-reading also
+            // re-runs the veto, which is the point.
+            Err(swarmbot_contracts::DomainError::Conflict { .. }) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(swarmbot_contracts::DomainError::conflict(format!(
+        "node {node} could not be written after {ROSTER_WRITE_ATTEMPTS} attempts; \
+         the roster row is being rewritten faster than this writer can re-read it"
+    )))
+}
+
+/// Why a hello could not be *recorded*, and the close code each one deserves.
+///
+/// Named apart from [`HelloFailure`], which is about the `node.hello` RPC call
+/// itself: a node that never answered is a different fact from a node that
+/// answered and whose row this brain then refused to write.
+///
+/// These are separate because they mean different things to the node on the
+/// other end: a revoked node must stop redialing for good (4401), while a
+/// roster bug should let it try again (4403). Collapsing them would leave a
+/// revoked machine knocking forever, or a confused one giving up.
+#[derive(Debug)]
+enum RosterFailure {
+    /// The node authenticated but has no roster row, or the row could not be
+    /// read or written. A wiring or storage problem, not a decision.
+    Unusable,
+    /// The owner revoked this node while its handshake was still in flight.
+    Revoked,
+}
+
 /// Write the hello's facts into the roster row and publish them.
-async fn apply_hello(state: &AppState, node: &NodeId, hello: &NodeHello) -> Result<(), ()> {
-    let mut stored = match state.swarm.store.get_node(node) {
-        Ok(Some(node)) => node,
-        Ok(None) => {
+async fn apply_hello(
+    state: &AppState,
+    node: &NodeId,
+    hello: &NodeHello,
+) -> Result<(), RosterFailure> {
+    // The veto runs inside the guarded write, not before it: a revoke that
+    // lands while this hello is in flight has to be seen by the same read that
+    // the write is based on, or the row gets marked online first and refused
+    // afterwards — which leaves a revoked node sitting in the roster as
+    // `online: true` with freshly re-approved capabilities.
+    let written = match mutate_node_vetoed(
+        state.swarm.store.as_ref(),
+        node,
+        |row| row.revoked,
+        |stored| {
+            stored.hostname = hello.hostname.clone();
+            stored.platform = hello.platform.clone();
+            stored.arch = hello.arch.clone();
+            stored.version = hello.version.clone();
+            stored.protocol = hello.protocol;
+            stored.roots = hello.roots.clone();
+            stored.declared = hello.capabilities.clone();
+            // Redeeming a single-use pairing code *is* the owner's approval of
+            // the machine, so the first hello's declarations are approved. A
+            // capability a node starts declaring later is not: the effective set
+            // stays `declared ∩ approved`, and it takes an owner to widen it.
+            if stored.approved.as_slice().is_empty() {
+                stored.approved = stored.declared.clone();
+            }
+            // The hello carries one aggregate ceiling — the strictest of the
+            // node's per-surface ceilings. Storing it uniformly is the
+            // conservative reading: the brain can then never plan an auto-run
+            // the node would refuse. The node still enforces per surface, and
+            // the effective rule stays `min(brain, node)`.
+            stored.policy = PolicyMap::uniform(hello.policy.ceiling);
+            stored.online = true;
+            stored.last_seen_at = Some(Utc::now());
+            // `revoked` is deliberately *not* touched here. Revocation is the
+            // owner's decision and only re-pairing — which writes a fresh row —
+            // may clear it. This line used to reset it, so a hello already in
+            // flight when the owner pressed revoke un-revoked the node.
+        },
+    ) {
+        Ok(RosterWrite::Written(row)) => *row,
+        Ok(RosterWrite::Absent) => {
             warn!(%node, "a node authenticated but has no roster row; it cannot be served");
-            return Err(());
+            return Err(RosterFailure::Unusable);
+        }
+        Ok(RosterWrite::Vetoed) => {
+            // The owner revoked this node while its upgrade was in flight: the
+            // upgrade check passed when the row was still clean, and the
+            // revocation landed afterwards. Serving it anyway would be a bypass,
+            // so the socket closes with 4401 — the one code that makes a node
+            // stop redialing for good.
+            warn!(
+                %node,
+                "node.hello arrived for a node its owner revoked during the handshake; \
+                 nothing was written and the socket closes with 4401"
+            );
+            return Err(RosterFailure::Revoked);
         }
         Err(error) => {
-            warn!(%node, %error, "cannot read the roster row for an authenticated node");
-            return Err(());
+            // Failing here closes the socket with `CLOSE_HELLO_FAILED`, which is
+            // the honest outcome: a node whose ceiling the brain could not record
+            // must not be served, because the brain would plan against a policy
+            // it never read. The node redials and the hello is retried.
+            warn!(%node, %error, "cannot record the node's hello");
+            return Err(RosterFailure::Unusable);
         }
     };
-    stored.hostname = hello.hostname.clone();
-    stored.platform = hello.platform.clone();
-    stored.arch = hello.arch.clone();
-    stored.version = hello.version.clone();
-    stored.protocol = hello.protocol;
-    stored.roots = hello.roots.clone();
-    stored.declared = hello.capabilities.clone();
-    // Redeeming a single-use pairing code *is* the owner's approval of the
-    // machine, so the first hello's declarations are approved. A capability a
-    // node starts declaring later is not: the effective set stays
-    // `declared ∩ approved`, and it takes an owner to widen it.
-    if stored.approved.as_slice().is_empty() {
-        stored.approved = stored.declared.clone();
-    }
-    // The hello carries one aggregate ceiling — the strictest of the node's
-    // per-surface ceilings. Storing it uniformly is the conservative reading: the
-    // brain can then never plan an auto-run the node would refuse. The node still
-    // enforces per surface, and the effective rule stays `min(brain, node)`.
-    stored.policy = PolicyMap::uniform(hello.policy.ceiling);
-    stored.online = true;
-    stored.last_seen_at = Some(Utc::now());
-    stored.revoked = false;
-
-    if let Err(error) = state.swarm.store.update_node(&stored) {
-        warn!(%node, %error, "cannot record the node's hello");
-        return Err(());
-    }
     state.swarm.hub.publish(Change::NodePresence {
         node_id: node.clone(),
         online: true,
     });
-    state.swarm.hub.publish(Change::Node(stored));
+    state.swarm.hub.publish(Change::Node(written));
     Ok(())
 }
 
 /// Mark a node online or offline in the roster, and say so on the live bus.
 async fn set_online(state: &AppState, node: &NodeId, online: bool) {
-    let Ok(Some(mut stored)) = state.swarm.store.get_node(node) else {
+    // The pre-read is only here to skip the common no-op: publishing a presence
+    // change for a node whose presence did not change would make the UI's node
+    // panel flicker on every reconnect attempt. Racing this check is harmless —
+    // the closure below writes the state we were asked for regardless.
+    let Ok(Some(current)) = state.swarm.store.get_node(node) else {
         return;
     };
-    if stored.online == online {
+    if current.online == online {
         return;
     }
-    stored.online = online;
-    stored.last_seen_at = Some(Utc::now());
-    if let Err(error) = state.swarm.store.update_node(&stored) {
-        warn!(%node, %error, online, "cannot record a node's presence");
-        return;
-    }
+    let written = match mutate_node(state.swarm.store.as_ref(), node, |stored| {
+        stored.online = online;
+        stored.last_seen_at = Some(Utc::now());
+    }) {
+        Ok(Some(row)) => row,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(%node, %error, online, "cannot record a node's presence");
+            return;
+        }
+    };
     state.swarm.hub.publish(Change::NodePresence {
         node_id: node.clone(),
         online,
     });
-    state.swarm.hub.publish(Change::Node(stored));
+    state.swarm.hub.publish(Change::Node(written));
 }
 
 /// Close a node's live socket because its pairing was revoked.
@@ -441,11 +617,11 @@ impl BrainHandler {
                     if let Some(version) = version {
                         node.version = version.to_string();
                     }
-                    if let Some(roots) = roots {
-                        node.roots = roots;
+                    if let Some(roots) = &roots {
+                        node.roots = roots.clone();
                     }
-                    if let Some(capabilities) = capabilities {
-                        node.declared = capabilities;
+                    if let Some(capabilities) = &capabilities {
+                        node.declared = capabilities.clone();
                         if node.approved.as_slice().is_empty() {
                             node.approved = node.declared.clone();
                         }
@@ -468,7 +644,7 @@ impl BrainHandler {
                 if let Some(roots) = roots {
                     let count = roots.len();
                     self.update_node(move |node| {
-                        node.roots = roots;
+                        node.roots = roots.clone();
                         node.last_seen_at = Some(Utc::now());
                     })
                     .await;
@@ -516,17 +692,24 @@ impl BrainHandler {
     }
 
     /// Apply a change to this node's roster row and publish it.
-    async fn update_node(&self, change: impl FnOnce(&mut NodeInfo)) {
-        let Ok(Some(mut node)) = self.state.swarm.store.get_node(&self.node_id) else {
-            warn!(node = %self.node_id, "a node sent an update but has no roster row");
-            return;
-        };
-        change(&mut node);
-        if let Err(error) = self.state.swarm.store.update_node(&node) {
-            warn!(node = %self.node_id, %error, "cannot record a node update");
-            return;
+    async fn update_node(&self, change: impl Fn(&mut NodeInfo) + Send) {
+        // `Fn`, not `FnOnce`: `mutate_node` re-applies the change on a fresh row
+        // after a revision conflict, so a closure that consumed its captures
+        // could not be retried. The call sites clone what they assign rather
+        // than move it, which is a few bytes on a roster row.
+        match mutate_node(self.state.swarm.store.as_ref(), &self.node_id, change) {
+            // `publish` returns a cursor; this arm must not make that the
+            // match's value, or the two `warn!` arms below fail to typecheck.
+            Ok(Some(node)) => {
+                self.state.swarm.hub.publish(Change::Node(node));
+            }
+            Ok(None) => {
+                warn!(node = %self.node_id, "a node sent an update but has no roster row");
+            }
+            Err(error) => {
+                warn!(node = %self.node_id, %error, "cannot record a node update");
+            }
         }
-        self.state.swarm.hub.publish(Change::Node(node));
     }
 }
 
@@ -819,7 +1002,10 @@ mod tests {
     use super::*;
     use chrono::TimeZone as _;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use swarmbot_contracts::DomainError;
     use swarmbot_contracts::id::RequestId;
+    use swarmbot_contracts::repo::NodeRepo as _;
     use swarmbot_node_protocol::testing::duplex_pair;
     use swarmbot_node_protocol::wire::{Frame, parse as parse_frame};
 
@@ -1033,5 +1219,291 @@ mod tests {
         let roots: Vec<NodeRoot> =
             serde_json::from_value(event.data["roots"].clone()).expect("roots decode");
         assert!(roots.is_empty());
+    }
+
+    /// A [`NodeRepo`] that fails its first `failures` writes with a conflict,
+    /// so the retry in [`mutate_node`] can be tested without manufacturing a
+    /// real race: two tasks on two worker threads interleaving between
+    /// `get_node` and `update_node` is exactly what happens under load, and a
+    /// test that waits for the scheduler to produce it is a test that passes or
+    /// fails by luck.
+    struct ConflictingStore {
+        inner: swarmbot_store::MemoryStore,
+        failures: AtomicUsize,
+        writes: AtomicUsize,
+    }
+
+    impl ConflictingStore {
+        fn new(failures: usize) -> Self {
+            Self {
+                inner: swarmbot_store::MemoryStore::default(),
+                failures: AtomicUsize::new(failures),
+                writes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl swarmbot_contracts::repo::NodeRepo for ConflictingStore {
+        fn update_node(&self, node: &NodeInfo) -> Result<(), DomainError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.failures.fetch_sub(1, Ordering::SeqCst) > 0 {
+                // The same error a genuinely superseded row produces, so the
+                // retry path cannot tell this apart from the real thing.
+                return Err(DomainError::conflict(
+                    "injected: another writer reached the row first",
+                ));
+            }
+            self.inner.update_node(node)
+        }
+
+        fn insert_node(&self, node: &NodeInfo) -> Result<(), DomainError> {
+            self.inner.insert_node(node)
+        }
+        fn get_node(&self, id: &NodeId) -> Result<Option<NodeInfo>, DomainError> {
+            self.inner.get_node(id)
+        }
+        fn list_nodes(&self) -> Result<Vec<NodeInfo>, DomainError> {
+            self.inner.list_nodes()
+        }
+        fn insert_pairing(
+            &self,
+            record: &swarmbot_contracts::node::PairingRecord,
+        ) -> Result<(), DomainError> {
+            self.inner.insert_pairing(record)
+        }
+        fn get_pairing(
+            &self,
+            code_hash: &str,
+        ) -> Result<Option<swarmbot_contracts::node::PairingRecord>, DomainError> {
+            self.inner.get_pairing(code_hash)
+        }
+        fn update_pairing(
+            &self,
+            record: &swarmbot_contracts::node::PairingRecord,
+        ) -> Result<(), DomainError> {
+            self.inner.update_pairing(record)
+        }
+        fn expired_pairings(
+            &self,
+            now: DateTime<Utc>,
+        ) -> Result<Vec<swarmbot_contracts::node::PairingRecord>, DomainError> {
+            self.inner.expired_pairings(now)
+        }
+        fn put_node_key(&self, node: &NodeId, key: &str) -> Result<(), DomainError> {
+            self.inner.put_node_key(node, key)
+        }
+        fn node_key(&self, node: &NodeId) -> Result<Option<String>, DomainError> {
+            self.inner.node_key(node)
+        }
+        fn list_node_keys(&self) -> Result<Vec<(NodeId, String)>, DomainError> {
+            self.inner.list_node_keys()
+        }
+    }
+
+    /// A conflicting write is retried, and the change still lands.
+    ///
+    /// Without the retry this is where a heartbeat would silently drop
+    /// `last_seen_at` — or, in the hello's case, where the node's ceiling would
+    /// never be recorded and the brain would plan against the default.
+    #[test]
+    fn a_conflicting_roster_write_is_retried_and_lands() {
+        let store = ConflictingStore::new(2);
+        let node = NodeInfo::local("box", vec![], PolicyMap::default());
+        store.insert_node(&node).expect("the row exists");
+
+        let written = mutate_node(&store, &node.id, |row| {
+            row.policy = PolicyMap::uniform(PolicyCeiling::Never);
+        })
+        .expect("the write eventually succeeds")
+        .expect("the row exists");
+
+        assert_eq!(
+            written.policy,
+            PolicyMap::uniform(PolicyCeiling::Never),
+            "the change landed: {written:?}"
+        );
+        assert_eq!(
+            store.writes.load(Ordering::SeqCst),
+            3,
+            "two injected conflicts, then the accepted write"
+        );
+        assert_eq!(
+            store
+                .get_node(&node.id)
+                .expect("reads")
+                .expect("row")
+                .revision,
+            1,
+            "the row advanced by exactly one generation, not one per attempt"
+        );
+    }
+
+    /// Retrying has a bound: a row that keeps changing underneath is reported,
+    /// not spun on forever.
+    #[test]
+    fn a_roster_write_that_never_wins_is_reported_not_spun_on() {
+        let store = ConflictingStore::new(ROSTER_WRITE_ATTEMPTS + 5);
+        let node = NodeInfo::local("box", vec![], PolicyMap::default());
+        store.insert_node(&node).expect("the row exists");
+
+        let error = mutate_node(&store, &node.id, |row| {
+            row.online = false;
+        })
+        .expect_err("a writer that never wins must fail");
+        assert!(
+            matches!(error, DomainError::Conflict { .. }),
+            "the failure is a typed conflict: {error}"
+        );
+        assert_eq!(
+            store.writes.load(Ordering::SeqCst),
+            ROSTER_WRITE_ATTEMPTS,
+            "it stopped at the bound instead of retrying forever"
+        );
+    }
+
+    /// A node with no roster row is `Ok(None)`, not an error: `apply_hello`
+    /// treats it as fatal and closes the socket, while a heartbeat only warns,
+    /// and that difference belongs to the callers.
+    #[test]
+    fn mutating_a_node_that_is_not_in_the_roster_is_none_not_an_error() {
+        let store = ConflictingStore::new(0);
+        let missing = NodeId::new();
+        let outcome = mutate_node(&store, &missing, |row| row.online = false)
+            .expect("a missing row is not a store failure");
+        assert!(outcome.is_none(), "{outcome:?}");
+        assert_eq!(
+            store.writes.load(Ordering::SeqCst),
+            0,
+            "nothing was written"
+        );
+    }
+
+    /// A hello that lands after the owner revoked the node must not un-revoke it.
+    ///
+    /// The window is real, not theoretical: the upgrade is verified while the row
+    /// is still clean, the owner presses revoke, and the hello that was already
+    /// in flight is recorded afterwards. `apply_hello` used to assign
+    /// `revoked = false` as part of "the node is live again", so the roster ended
+    /// up saying a machine the owner had just cut off was trusted — and
+    /// `NodeDispatcher` routes on that row, so the brain would send it tool calls
+    /// again. Revocation is the owner's decision; only re-pairing, which writes
+    /// a fresh row, may clear it.
+    #[tokio::test]
+    async fn a_hello_for_a_revoked_node_does_not_unrevoke_it() {
+        use std::collections::BTreeMap;
+        use swarmbot_contracts::config::BrainConfig;
+        use swarmbot_node_protocol::rpc::HelloPolicy;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let swarm = swarmbot_core::compose::memory(
+            BrainConfig {
+                team: Some(BrainConfig::demo_team("fake")),
+                ..BrainConfig::default()
+            },
+            dir.path(),
+            vec![],
+            &BTreeMap::new(),
+        )
+        .expect("a swarm");
+        swarm.boot().expect("boots");
+        let state = AppState::ephemeral(
+            Arc::clone(&swarm),
+            Arc::new(crate::config::Resolved {
+                config: BrainConfig::default(),
+                data_dir: dir.path().to_path_buf(),
+                paths: crate::config::Paths::new(dir.path()),
+                config_path: None,
+                team_path: None,
+                roots: Vec::new(),
+                expiry_ticker: false,
+                offline: true,
+                fresh: true,
+            }),
+            crate::gateway::NodeGateway::new("http://127.0.0.1:0"),
+        )
+        .expect("a state");
+
+        // A paired node, then its owner revokes it — through the same guarded
+        // writer the route uses, so the row is exactly what a revoke leaves.
+        let node = NodeId::new();
+        let mut row = NodeInfo::local("it-node", vec![], PolicyMap::default());
+        row.id = node.clone();
+        row.kind = swarmbot_contracts::node::NodeKind::Remote;
+        state
+            .swarm
+            .store
+            .insert_node(&row)
+            .expect("the node is paired");
+        let mut revoked = state
+            .swarm
+            .store
+            .get_node(&node)
+            .expect("reads")
+            .expect("the row exists");
+        revoked.revoked = true;
+        revoked.online = false;
+        // What the revoke route also does: a revoked node is approved for
+        // nothing, so the fixture is the row a real revocation leaves behind.
+        revoked.approved = Capabilities::new(Vec::<String>::new());
+        revoked.bump_revision();
+        state
+            .swarm
+            .store
+            .update_node(&revoked)
+            .expect("the revoke is written");
+
+        let hello = NodeHello {
+            node_id: node.clone(),
+            version: "0.1.0".into(),
+            hostname: "it-node".into(),
+            platform: "linux".into(),
+            arch: "x86_64".into(),
+            protocol: PROTOCOL_VERSION,
+            roots: vec![],
+            capabilities: Capabilities::new(["fs@1", "shell@1"]),
+            tunnels: Vec::new(),
+            policy: HelloPolicy {
+                ceiling: PolicyCeiling::Always,
+                remote_managed: false,
+            },
+            brain_verified: true,
+        };
+
+        let failure = apply_hello(&state, &node, &hello)
+            .await
+            .expect_err("a revoked node's hello is refused, not recorded");
+        assert!(
+            matches!(failure, RosterFailure::Revoked),
+            "the refusal says it was revoked, so the socket closes with 4401 and              the node stops redialing: {failure:?}"
+        );
+
+        let after = state
+            .swarm
+            .store
+            .get_node(&node)
+            .expect("reads")
+            .expect("the row exists");
+        assert!(after.revoked, "still revoked: {after:?}");
+        assert!(
+            !after.online,
+            "the refused hello did not mark a revoked node online: {after:?}"
+        );
+        assert_eq!(
+            after.approved.as_slice(),
+            &[] as &[String],
+            "a revoked node is approved for nothing, and the hello did not re-approve it: {after:?}"
+        );
+        // The strongest form of the claim: the refused hello wrote nothing at
+        // all. A check placed *after* the write would pass every assertion above
+        // while still leaving the row marked online with the hello's ceiling.
+        assert_eq!(
+            after.revision, revoked.revision,
+            "the refused hello did not write the row: {after:?}"
+        );
+        assert_eq!(
+            after.policy,
+            PolicyMap::default(),
+            "the hello's ceiling was not recorded for a node that will never be served: {after:?}"
+        );
     }
 }

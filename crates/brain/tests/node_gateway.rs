@@ -986,6 +986,9 @@ async fn a_remote_call_crosses_the_socket_and_comes_back() {
         .expect("the roster reads")
         .expect("the node is registered");
     row.approved = Capabilities::new(["fs@1"]);
+    // The roster row is revision-guarded, so a write has to claim the next
+    // generation — the same rule the gateway's own writers follow.
+    row.bump_revision();
     brain
         .swarm
         .store
@@ -1022,6 +1025,7 @@ async fn a_remote_call_crosses_the_socket_and_comes_back() {
         .expect("fs is approved");
     assert!(!result.is_error, "{}", result.text_only());
     row.approved = Capabilities::new(["fs@1", "shell@1"]);
+    row.bump_revision();
     brain
         .swarm
         .store

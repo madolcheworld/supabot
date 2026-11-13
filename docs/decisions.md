@@ -227,7 +227,10 @@ Status: accepted for the M0–M6 prototype.
   rather than fatal.
 - **D6.2 Whole-entry upserts with a revision guard.** An entry is replaced as a
   whole and its `revision` must increase; a stale write is a `Conflict`, not a
-  silent overwrite. This is what lets a streaming reply grow in place.
+  silent overwrite. This is what lets a streaming reply grow in place. The same
+  guard now covers node roster rows (D9.18): a whole-row upsert with several
+  concurrent writers is exactly the shape that loses updates, and "it has always
+  worked" was only true until two writers overlapped.
 - **D6.3 Commit before publish.** A change is written, then appended to the event
   log, then broadcast. A subscriber can always read back what it was told.
 - **D6.4 A cursor is a promise.** Live clients resume with `{epoch, sequence}`; a
@@ -420,3 +423,23 @@ what it is holding back.
   store", which `SqliteStore::open` already does, and the test suite proves that
   rather than trusting the bytes. A non-empty target is a typed refusal, never a
   silent overwrite.
+- **D9.18 The node roster row is revision-guarded, and a hello cannot undo a
+  revocation.** Several writers share one row — `node.hello`, `node.heartbeat`,
+  `node.event`, presence changes and revocation — and the mux spawns a task per
+  inbound request, so they overlap in practice, not in theory. Each used to be a
+  hand-rolled `get_node` → mutate → `update_node`, and `update_node` writes the
+  whole row: a heartbeat that read before the hello wrote restored the pre-hello
+  row, reverting the node's `policy` while it was visibly online, and the brain
+  then planned auto-runs against a ceiling the node did not have. `NodeInfo` now
+  carries a `revision` (D6.2's invariant), both stores answer `Conflict` on a
+  stale write, and every gateway writer goes through `session::mutate_node`,
+  which re-reads and re-applies on conflict up to a bound.
+  The second half is a security rule, not a concurrency one: **`apply_hello` must
+  never clear `revoked`.** It used to, so a hello already in flight when the owner
+  revoked the node resurrected it — and `NodeDispatcher` routes on that row, so
+  the brain would send tool calls to a machine its owner had just cut off. The
+  revoked check lives *inside* the CAS-guarded loop (`mutate_node_vetoed`), not
+  before or after it: a check placed before has the same window the guard closes,
+  and a check placed after has already written `online: true` and re-approved the
+  node's capabilities. A vetoed hello writes nothing and the socket closes 4401.
+  Only re-pairing, which writes a fresh row, may clear a revocation.

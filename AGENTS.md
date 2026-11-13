@@ -154,10 +154,13 @@ rewrite history unless the owner asks.
 ## Known debt
 
 Recorded on purpose, so nobody "fixes" them by accident or trusts them further
-than they go. Two entries that used to live here — the `exec_shell` mirror and the
-node's out-of-root spill dir — are **closed**; they are described in
+than they go. This list carries two kinds of entry, and says which is which: what
+is **still open**, and what was **closed in a way worth remembering** — because a
+closed bug whose shape is not written down gets reintroduced by somebody who has
+never seen it fail. Two further closed entries (the `exec_shell` mirror and the
+node's out-of-root spill dir) live in
 [`node-protocol.md`](docs/node-protocol.md) §13 items 1–2 with the tests that pin
-them, so this list only carries what is still open.
+them.
 
 * **One CLI test is suspected flaky under port reuse.** A single gate run showed
   `105 passed; 1 failed`; the failing name was not captured and it never
@@ -182,19 +185,33 @@ them, so this list only carries what is still open.
   **when a helper matches a short token against a log line, strip the prefix
   first.** A remaining `real_brain` failure is a real failure; do not call it a
   flake without the log line in hand.
-* **The node roster can lose an update, and that is a product bug, not a flake.**
-  `node.hello` and `node.heartbeat` both do read–modify–write on the same row
-  (`session.rs`: `get_node` → mutate one field → `update_node`), and
-  `update_node` is a whole-row upsert with no CAS. The brain side runs with
-  `require_hello: false`, so a heartbeat can arrive *while* the hello handler is
-  mid-flight: the heartbeat reads the old row, hello writes the real policy, the
-  heartbeat then writes its stale copy back and the policy silently reverts.
-  Under 6× parallel load this fails a `real_brain` roster wait with
-  `online: true` and the wrong `policy.default`. Until it is fixed (revision-CAS
-  in the port, per-field SQL, or a single actor owning the row — a change to
-  `contracts` + `store` + `brain`), **do not trust a node's roster row under
-  concurrency**, and do not "fix" the test by widening its wait: the wait is not
-  what is wrong. See [`review.md`](docs/review.md) §9.
+* **Four bugs shared one symptom: "`real_brain` is flaky under load."** All four
+  are fixed; they are listed here because the shape recurs and the fix for each
+  was different. (1) The roster row had several concurrent writers doing
+  read–modify–write against a whole-row upsert, so a heartbeat could restore the
+  pre-hello row and revert a node's `policy`. `NodeInfo` now carries a
+  `revision`, `update_node` answers `Conflict` on a stale write in both stores,
+  and every gateway writer goes through `session::mutate_node`, which re-reads
+  and re-applies. **If you add a roster writer, use `mutate_node`.**
+  (2) `Swarm::wait_for_idle` trusted only in-memory signals, which all read quiet
+  in the window at the start of a turn — it now also believes
+  `store.running_turns()`. This was not only a test problem: `swarmbot run --wait`
+  uses the same function and could exit 0 claiming a finished team.
+  (3) A panicking runner cleared its `busy` flag but left its turn `Running`
+  forever; it is now closed as `Failed` naming the panic. (4) `apply_hello`
+  assigned `revoked = false`, so a hello in flight when the owner revoked
+  resurrected the node — and the dispatcher routes on that row. The revoked check
+  now lives *inside* the CAS-guarded loop, so there is no window: a conflicting
+  write re-reads, the veto fires, nothing is stored, and the socket closes 4401.
+  The lesson that generalises: **make the failure print the state, not just the
+  expectation.** One `turn_report()` in an assertion message turned "the
+  transcript is empty" into "the turn is still Running with 0 LLM calls", which
+  is what identified (2). Tests: the lost-update interleaving in `store`'s
+  contract suite, `a_conflicting_roster_write_is_retried_and_lands`,
+  `a_turn_the_store_calls_running_is_not_idle`, and
+  `a_hello_for_a_revoked_node_does_not_unrevoke_it` — the last asserts the
+  revision did not move, i.e. a refused hello writes nothing at all. Verified
+  48/48 green under 6× parallel load; the same harness failed 4/30 before.
 * **The embedded CLI cannot reach a remote node** — not a missing wire but a
   property of the mode: a node dials the brain's gateway, and `swarmbot` in-process
   has no listener, so nothing can pair with it. A bot configured against a foreign
@@ -204,7 +221,7 @@ them, so this list only carries what is still open.
 ## State of the tree
 
 Check before you assume — it moves while people work. **All twelve crates are
-built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.283
+built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.288
 passed, 0 failed, 4 ignored** — two live tests, behind `PROTO_LIVE_LLM` and
 `PROTO_LIVE_ACP`, and two doctests in `store/src/threaded.rs` marked `ignore`
 because a doctest has no runtime to await on): `contracts`,

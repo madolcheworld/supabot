@@ -519,6 +519,17 @@ impl Swarm {
 
     /// Wait until no bot is busy, or the budget runs out. Tests and the CLI's
     /// one-shot mode use this instead of sleeping on a guess.
+    ///
+    /// "Idle" means four things at once, and the fourth is the one that is easy
+    /// to forget: no runner is busy, nothing is queued, no task is pending, and
+    /// **the store holds no turn still marked `Running`**. Without that last
+    /// check there is a window at the start of every turn — the delivery has
+    /// left the queue and the runner has not yet flipped itself to busy, or has
+    /// written the turn and not yet counted an LLM call — in which all the
+    /// in-memory signals read quiet while work is in flight. A caller then
+    /// reports success and reads a transcript that is missing everything the
+    /// turn was about to do. The store row is the authoritative answer because
+    /// it is written before the turn does anything and closed when it ends.
     pub async fn wait_for_idle(&self, budget: std::time::Duration) -> bool {
         let deadline = tokio::time::Instant::now() + budget;
         loop {
@@ -541,7 +552,21 @@ impl Swarm {
                 .queued_tasks()
                 .map(|tasks| tasks.len())
                 .unwrap_or(0);
-            if !busy && queued == 0 && tasks_pending == 0 && self.runners.parked_count() == 0 {
+            // A turn the store still calls `Running` is work in flight even when
+            // every in-memory signal has already gone quiet. An unreadable store
+            // counts as "not idle" rather than as idle: guessing quiet here is
+            // what makes a caller report success on a half-written transcript.
+            let turns_running = self
+                .store
+                .running_turns()
+                .map(|turns| turns.len())
+                .unwrap_or(1);
+            if !busy
+                && queued == 0
+                && tasks_pending == 0
+                && turns_running == 0
+                && self.runners.parked_count() == 0
+            {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -682,6 +707,61 @@ mod tests {
             runs[0].status,
             swarmbot_contracts::routine::RunStatus::Failed,
             "a run no turn ever finished must not stay Running forever"
+        );
+    }
+
+    /// A turn the store still calls `Running` keeps the swarm from reporting
+    /// idle, even when every in-memory signal has gone quiet.
+    ///
+    /// This is the window that made a real end-to-end test fail under load with
+    /// a transcript holding only the owner's message: the delivery had left the
+    /// queue and the runner had not yet flipped itself busy (or had written the
+    /// turn and not yet counted an LLM call), so `busy`, `queued`, `tasks` and
+    /// `parked_count` all read "nothing happening" and the caller went ahead and
+    /// asserted on a transcript the turn had not written yet. The store row is
+    /// the one signal that is true from the moment the turn starts.
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_the_store_calls_running_is_not_idle() {
+        use swarmbot_contracts::turn::{Turn, TurnInitiator, TurnStatus};
+
+        let (swarm, _dir) = test_swarm();
+        let lead = swarm.bots.by_name("lead").expect("lead");
+
+        // Nothing is queued, no runner is busy, no task is pending: every
+        // in-memory signal says idle before this turn exists.
+        assert!(
+            swarm
+                .wait_for_idle(std::time::Duration::from_millis(200))
+                .await,
+            "a quiet swarm with no turns is idle"
+        );
+
+        let mut turn = Turn::start(
+            lead.id.clone(),
+            lead.direct_conversation_id.clone(),
+            TurnInitiator::Owner,
+            None,
+            None,
+        );
+        assert_eq!(turn.status, TurnStatus::Running, "a new turn is running");
+        swarm.store.insert_turn(&turn).expect("the turn is stored");
+
+        assert!(
+            !swarm
+                .wait_for_idle(std::time::Duration::from_millis(200))
+                .await,
+            "a turn still marked Running is work in flight, not idleness"
+        );
+
+        // Closing it is what lets the swarm report idle again.
+        turn.status = TurnStatus::Completed;
+        turn.ended_at = Some(chrono::Utc::now());
+        swarm.store.update_turn(&turn).expect("the turn closes");
+        assert!(
+            swarm
+                .wait_for_idle(std::time::Duration::from_millis(200))
+                .await,
+            "a closed turn leaves the swarm idle"
         );
     }
 }

@@ -1108,12 +1108,78 @@ pub fn contract_nodes<S: Persistence>(store: &S) -> anyhow::Result<()> {
 
     let mut offline = local.clone();
     offline.online = false;
+    offline.bump_revision();
     store.update_node(&offline)?;
     ensure_eq!(
         store.get_node(&local.id)?.map(|node| node.online),
         Some(false),
         "update_node persists presence"
     );
+
+    // The lost update this guard exists for. Two writers read the same
+    // generation and each change a *different* field — exactly what
+    // `node.hello` (policy, roots, declared) and `node.heartbeat` (online,
+    // last_seen) do on one connection, since the mux runs a task per inbound
+    // request. Without the revision guard the second writer restores the row it
+    // read and silently erases the first writer's field; the observed symptom
+    // was a node online with its pre-hello ceiling.
+    let generation = store.get_node(&local.id)?.context("the node exists")?;
+    let mut hello_writer = generation.clone();
+    hello_writer.policy = PolicyMap::uniform(PolicyCeiling::Never);
+    hello_writer.bump_revision();
+    store.update_node(&hello_writer)?;
+
+    // The heartbeat read `generation` before the hello landed, so its write is
+    // stale and must be refused — not applied.
+    let mut heartbeat_writer = generation.clone();
+    heartbeat_writer.last_seen_at = Some(now + Duration::seconds(5));
+    heartbeat_writer.bump_revision();
+    ensure_that!(
+        matches!(
+            store.update_node(&heartbeat_writer),
+            Err(DomainError::Conflict { .. })
+        ),
+        "a roster write based on a superseded row is a conflict, not an overwrite"
+    );
+    ensure_eq!(
+        store.get_node(&local.id)?.map(|node| node.policy),
+        Some(PolicyMap::uniform(PolicyCeiling::Never)),
+        "the refused write left the winner's field alone"
+    );
+
+    // The recovery the gateway performs: re-read, re-apply, write. Both
+    // writers' fields survive, which is what the row should have said.
+    let mut retry = store.get_node(&local.id)?.context("the node exists")?;
+    retry.last_seen_at = Some(now + Duration::seconds(5));
+    retry.bump_revision();
+    store.update_node(&retry)?;
+    let merged = store.get_node(&local.id)?.context("the node exists")?;
+    ensure_eq!(
+        merged.policy,
+        PolicyMap::uniform(PolicyCeiling::Never),
+        "the hello's ceiling survived the heartbeat's retry"
+    );
+    ensure_eq!(
+        merged.last_seen_at,
+        Some(now + Duration::seconds(5)),
+        "the heartbeat's own field landed on the retry"
+    );
+    ensure_eq!(
+        merged.revision,
+        generation.revision + 2,
+        "each accepted write advances the generation by exactly one"
+    );
+
+    // Writing the same generation twice is a conflict, so a caller that forgets
+    // to bump fails loudly instead of clobbering the row.
+    ensure_that!(
+        matches!(
+            store.update_node(&merged),
+            Err(DomainError::Conflict { .. })
+        ),
+        "re-writing a row at its stored generation is a conflict"
+    );
+
     let mut stranger = NodeInfo::local("ghost", vec![], PolicyMap::default());
     stranger.id = NodeId::new();
     ensure_that!(

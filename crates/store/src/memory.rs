@@ -45,7 +45,7 @@ use swarmbot_contracts::routine::{Routine, RoutineRun, RoutineStatus};
 use swarmbot_contracts::task::{Task, TaskStep};
 use swarmbot_contracts::turn::Turn;
 
-use crate::{duplicate_bot_name, duplicate_id, seq_taken, stale_revision, ts};
+use crate::{duplicate_bot_name, duplicate_id, seq_taken, stale_node_revision, stale_revision, ts};
 
 /// The epoch a fresh log starts at — the same value the SQLite migration
 /// seeds, so both doubles report one cursor space.
@@ -643,8 +643,16 @@ impl NodeRepo for MemoryStore {
 
     fn update_node(&self, node: &NodeInfo) -> Result<(), DomainError> {
         let mut nodes = guard(&self.nodes)?;
-        if !nodes.contains_key(&node.id) {
+        let Some(existing) = nodes.get(&node.id) else {
             return Err(not_found::node(&node.id));
+        };
+        // The same guard `SqliteStore` applies, with the same message: the two
+        // stores must stay observably identical, and a roster writer that races
+        // is a real interleaving in both of them — the in-memory store is what
+        // every orchestration test runs on, so if it accepted a stale write the
+        // tests would pass while production lost updates.
+        if existing.revision >= node.revision {
+            return Err(stale_node_revision(node, existing.revision));
         }
         nodes.insert(node.id.clone(), node.clone());
         Ok(())

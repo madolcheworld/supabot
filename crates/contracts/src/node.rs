@@ -216,6 +216,30 @@ pub struct NodeInfo {
     pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
     /// True once the node's key was revoked: it may not redial.
     pub revoked: bool,
+    /// Write generation of this row, for the same reason [`crate::Entry`] has
+    /// one: **a stale write must be a conflict, not a silent overwrite.**
+    ///
+    /// The roster row has several concurrent writers — `node.hello`,
+    /// `node.heartbeat`, `node.event`, presence changes and revocation all run
+    /// on their own task, because the mux spawns one task per inbound request.
+    /// Each of them is a read–modify–write of a whole row, so without a guard
+    /// the second writer restores the row it read and erases what the first one
+    /// put there. That is not a rare interleaving: a heartbeat arriving while
+    /// the hello handler is between its read and its write reverts the node's
+    /// `policy`, and the brain then plans against a ceiling the node does not
+    /// have.
+    ///
+    /// A writer reads the row, applies its own change, sets
+    /// `revision = read + 1` and writes; [`crate::repo::NodeRepo::update_node`]
+    /// rejects anything not strictly newer with [`crate::DomainError::Conflict`].
+    /// Callers answer a conflict by re-reading and re-applying — their change is
+    /// a field assignment, so redoing it on the fresh row is what they meant
+    /// anyway.
+    ///
+    /// `serde(default)` so a row written before this field existed reads back as
+    /// generation 0 rather than failing to deserialize.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl NodeInfo {
@@ -226,6 +250,17 @@ impl NodeInfo {
 
     pub fn can(&self, capability: &str) -> bool {
         self.online && !self.revoked && self.capabilities().has(capability)
+    }
+
+    /// Claim the next write generation, so [`crate::repo::NodeRepo::update_node`]
+    /// accepts this row and rejects anybody still holding the one this was read
+    /// from.
+    ///
+    /// Every roster writer does read → change → `bump_revision` → write. Forgetting
+    /// the bump is not silent: the store answers `Conflict`, because the row it
+    /// holds is already at that revision.
+    pub fn bump_revision(&mut self) {
+        self.revision += 1;
     }
 
     pub fn local(label: impl Into<String>, roots: Vec<NodeRoot>, policy: PolicyMap) -> Self {
@@ -247,6 +282,7 @@ impl NodeInfo {
             paired_at: now,
             last_seen_at: Some(now),
             revoked: false,
+            revision: 0,
         }
     }
 }

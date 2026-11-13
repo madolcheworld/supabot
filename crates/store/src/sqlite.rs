@@ -51,7 +51,10 @@ use swarmbot_contracts::routine::{Routine, RoutineRun, RoutineStatus, RunStatus}
 use swarmbot_contracts::task::{Task, TaskStatus, TaskStep};
 use swarmbot_contracts::turn::{Turn, TurnStatus};
 
-use crate::{duplicate_bot_name, duplicate_id, io_err, json_err, seq_taken, stale_revision, ts};
+use crate::{
+    duplicate_bot_name, duplicate_id, io_err, json_err, seq_taken, stale_node_revision,
+    stale_revision, ts,
+};
 
 /// Ordered schema migrations. `PRAGMA user_version` records how many have
 /// run, so `open` on an existing database never re-runs or duplicates one.
@@ -1281,9 +1284,36 @@ impl NodeRepo for SqliteStore {
     }
 
     fn update_node(&self, node: &NodeInfo) -> Result<(), DomainError> {
-        let conn = self.conn()?;
+        let mut conn = self.conn()?;
+        // One transaction for read-then-write, exactly like `upsert_entry`: the
+        // revision guard is only honest if no other writer can slip between the
+        // check and the write, and the roster has several concurrent ones.
+        let tx = conn.transaction().map_err(sql_err)?;
+        // The revision travels inside `payload` rather than in its own column,
+        // so checking it costs a `json_extract`. That is affordable here — the
+        // roster is a handful of rows and the frequent writer is a heartbeat
+        // every 15 s — and it keeps this change out of the migration list, so a
+        // database written before the field existed still opens. `COALESCE` is
+        // what makes that true: such a payload has no `$.revision` path, and
+        // without the coalesce the check would see NULL and reject every write
+        // to a pre-existing row instead of treating it as generation 0.
+        let stored_revision: Option<i64> = tx
+            .query_row(
+                "SELECT COALESCE(CAST(json_extract(payload, '$.revision') AS INTEGER), 0)
+                 FROM nodes WHERE id = ?1",
+                params![node.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        let Some(stored_revision) = stored_revision else {
+            return Err(not_found::node(&node.id));
+        };
+        if stored_revision >= node.revision as i64 {
+            return Err(stale_node_revision(node, stored_revision.max(0) as u64));
+        }
         let payload = stored(node)?;
-        let changed = conn
+        let changed = tx
             .execute(
                 "UPDATE nodes SET paired_at = ?2, payload = ?3 WHERE id = ?1",
                 params![node.id.as_str(), ts(&node.paired_at), payload],
@@ -1292,7 +1322,7 @@ impl NodeRepo for SqliteStore {
         if changed == 0 {
             return Err(not_found::node(&node.id));
         }
-        Ok(())
+        tx.commit().map_err(sql_err)
     }
 
     fn get_node(&self, id: &NodeId) -> Result<Option<NodeInfo>, DomainError> {

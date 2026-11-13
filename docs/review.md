@@ -453,49 +453,75 @@ lain.
   create --out DIR` memverifikasi hasilnya sendiri sebelum melaporkan sukses, dan
   menolak `--brain` karena database-nya ada di mesin daemon.
 
-### Bug produk yang ditemukan dan **tidak** diperbaiki: lost update di roster node
+### Bug produk yang ditemukan saat memburu flake — dan sudah diperbaiki
 
-Ini temuan paling penting di putaran ini, dan ia tetap terbuka.
+Versi pertama bagian ini menutup dengan "lost update di roster node tidak
+diperbaiki, jangan percaya roster di bawah konkurensi". Itu benar saat ditulis, dan
+ketiganya sekarang sudah diperbaiki. Urutannya penting, karena yang satu baru
+terlihat setelah yang sebelumnya ditutup.
 
-`node.hello` dan `node.heartbeat` sama-sama menulis baris roster dengan pola
-**read–modify–write** yang sama:
+**1. Lost update di roster node.** `node.hello`, `node.heartbeat`, `node.event`,
+perubahan presence dan revocation semuanya menulis **baris yang sama**, dan mux
+men-spawn satu task per request masuk — jadi mereka benar-benar tumpang tindih,
+bukan sekadar "bisa". Setiap penulis dulunya read–modify–write tangan:
 
 ```rust
-// crates/brain/src/gateway/session.rs
 let mut stored = store.get_node(node)?;   // baca
 stored.policy = ...;                      // ubah satu field
-store.update_node(&stored)?;              // tulis SELURUH baris (upsert)
+store.update_node(&stored)?;              // tulis SELURUH baris, tanpa CAS
 ```
 
-`update_node` tidak punya CAS atau revisi (`crates/store/src/sqlite.rs`:
-`UPDATE nodes SET paired_at = ?2, payload = ?3 WHERE id = ?1`), jadi ia menimpa
-seluruh payload. Karena `require_hello` di sisi **brain** bernilai `false`, node
-boleh mengirim `node.heartbeat` kapan saja — termasuk saat handler `node.hello`
-masih berjalan. Urutan yang merusak:
+Heartbeat yang membaca sebelum hello menulis akan mengembalikan baris pra-hello,
+jadi `policy` node yang sedang online kembali ke nilai lama dan brain merencanakan
+auto-run terhadap ceiling yang bukan milik node itu. Perbaikan: `NodeInfo` kini
+membawa `revision` (invarian yang sama dengan `Entry` — *a stale write must be a
+conflict, not a silent overwrite*), `update_node` menjawab `DomainError::Conflict`
+di kedua store, dan semua penulis gateway lewat `session::mutate_node` yang
+membaca ulang dan menerapkan lagi saat conflict. Tes: interleaving lost-update di
+contract suite `store` (jalan di keempat driver) dan
+`a_conflicting_roster_write_is_retried_and_lands` — keduanya diverifikasi dengan
+mutasi.
 
-1. heartbeat membaca baris dengan `policy.default = "ask"` (nilai lama);
-2. hello menulis `policy.default = "never"` (yang benar);
-3. heartbeat menulis salinan lamanya → **policy kembali `ask`**.
+**2. `wait_for_idle` berbohong di awal setiap turn.** Setelah (1) ditutup, tes
+end-to-end masih gagal 3/36 di bawah beban, dengan transkrip yang hanya berisi
+pesan owner. Diagnostik turn yang saya tambahkan menyebut penyebabnya:
+`status=Running, llm_calls=0`. Artinya turn **sedang berjalan** saat `settle()`
+melaporkan idle. Ada jendela di awal turn — delivery sudah keluar dari antrean,
+runner belum menandai dirinya busy — di mana keempat sinyal in-memory (`busy`,
+`queued`, `tasks`, `parked_count`) sama-sama membaca "tidak ada apa-apa".
+`wait_for_idle` sekarang juga membaca `store.running_turns()`: baris di store
+adalah satu-satunya sinyal yang benar sejak turn dibuat. Ini bukan cuma soal tes —
+`swarmbot run --wait` memakai fungsi yang sama, jadi sebelumnya ia bisa keluar 0
+sambil mengklaim tim sudah selesai padahal belum.
 
-Hasilnya tes yang menunggu `policy.default == "never"` habis waktu 45 detik dengan
-baris roster yang `online: true` dan policy `ask`. Di UI, artinya panel node bisa
-menampilkan ceiling yang bukan ceiling node itu — dan otak kemudian merencanakan
-auto-run yang akan ditolak node, atau sebaliknya bertanya padahal node sudah
-mengizinkan.
+**3. Runner yang panic meninggalkan turn terbuka selamanya.** Konsekuensi dari (2):
+jalur panic membersihkan flag `busy` tetapi tidak menutup turn, jadi turn tetap
+`Running` dan `wait_for_idle` akan menghabiskan seluruh budget-nya untuk kerja
+yang sudah mati. Sekarang turn bot itu ditutup sebagai `Failed` dengan alasan
+"the bot runner panicked: …".
 
-Bentuk yang sama ada di `set_online` dan di `BrainHandler::update_node`. Yang
-dibutuhkan adalah salah satu dari: CAS berbasis revisi di port (`update_node_if`),
-atau tulis per-field di SQL (`UPDATE nodes SET policy = ?, online = ?`), atau satu
-aktor yang memiliki baris roster sehingga read–modify–write tidak pernah
-berselang. Ini perubahan `contracts` + `store` + `brain` sekaligus, dan saya
-**tidak** mengerjakannya di putaran ini — saya hanya membuat gejalanya terlihat
-dan mencatat mekanismenya. Jangan menganggap roster node bisa dipercaya di bawah
-konkurensi sampai ini diperbaiki.
+**4. Hello bisa membatalkan revocation.** Ditemukan oleh tes yang saya tulis untuk
+(1): `apply_hello` menulis `stored.revoked = false`. Upgrade memang menolak node
+revoked, tapi bila revocation mendarat *setelah* upgrade diverifikasi dan hello
+masih di jalan, hello itu menghidupkan kembali node yang baru saja diputus
+pemiliknya — dan karena `NodeDispatcher` merutekan berdasarkan baris itu, brain
+akan mengirim tool call lagi ke mesin yang sudah dicabut. Pemeriksaannya sekarang
+ada **di dalam** loop yang dijaga CAS (bukan sebelum atau sesudah tulis), jadi
+tidak ada jendela: bila revoke mendarat di antaranya, tulisannya conflict, loop
+membaca ulang, veto melihat `revoked`, dan tidak ada yang ditulis sama sekali.
+Socket ditutup dengan 4401. Tes `a_hello_for_a_revoked_node_does_not_unrevoke_it`
+mengunci revision tidak berubah — bukti terkuat bahwa hello yang ditolak tidak
+menyentuh barisnya.
+
+Pelajaran dari keempatnya, dan alasan saya menuliskannya: **gejala "flaky di bawah
+beban" adalah empat bug berbeda yang berbagi satu gejala.** Dua di antaranya
+(2 dan 4) adalah bug produk yang bisa terlihat pemilik, bukan kelemahan tes. Yang
+membuatnya ketemu bukan menjalankan tes berulang kali, tetapi membuat kegagalannya
+menyebut keadaan yang sebenarnya — satu `turn_report()` di pesan assertion
+mengubah "transkrip kosong" menjadi "turn masih Running, 0 llm call".
 
 ### Yang tetap tidak terverifikasi setelah putaran ini
 
-* **Roster node di bawah konkurensi** — lihat bagian lost update di atas: bug-nya
-  nyata, teridentifikasi, dan belum diperbaiki.
 * **Adapter sungguhan mengisi `Usage`.** Semua angka yang pernah saya lihat berasal
   dari `FakeBackend::with_usage`. Apakah `openai`, `acp` dan `claude-cli` benar-benar
   mengisi `Usage` belum diuji terhadap model nyata — laporan hanya menampilkan apa

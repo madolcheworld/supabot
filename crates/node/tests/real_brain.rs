@@ -661,6 +661,35 @@ impl Rig {
         );
     }
 
+    /// What the bot's turns did, for a failure message that says *why* a
+    /// transcript is missing a tool call.
+    ///
+    /// "the transcript has no `read_file` call" alone cannot distinguish the
+    /// three things that actually produce it: the turn never ran, the turn
+    /// failed (and the reason is on the turn), or the model was served a
+    /// different script than the one this test pushed. Guessing between those
+    /// costs a debugging session each time, so the report is part of the
+    /// assertion instead of something a future reader has to go and add.
+    fn turn_report(&self, dm: &ConversationId) -> String {
+        let turns = match self.brain.swarm.store.turns_in(dm, 50) {
+            Ok(turns) => turns,
+            Err(error) => return format!("<cannot read turns: {error}>"),
+        };
+        if turns.is_empty() {
+            return "<no turn ran in this conversation at all>".to_string();
+        }
+        turns
+            .iter()
+            .map(|turn| {
+                format!(
+                    "{:?} status={:?} error={:?} llm_calls={} tool_calls={}",
+                    turn.id, turn.status, turn.error, turn.usage.llm_calls, turn.usage.tool_calls
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    }
+
     /// The transcript of one conversation, ascending.
     fn entries(&self, dm: &ConversationId) -> Vec<Entry> {
         self.brain
@@ -840,6 +869,17 @@ async fn a_real_node_serves_a_bound_bots_read_and_shell_calls() {
     // node, and the text that came back is the NODE's marker — the assertion
     // that proves the call really crossed the socket.
     let entries = rig.entries(&dm);
+    // Named here rather than left to `tool_call`'s generic panic: the turn
+    // report is what distinguishes "never ran" from "failed" from "ran a
+    // different script", and those have different fixes.
+    assert!(
+        entries.iter().any(|entry| {
+            matches!(&entry.kind, EntryKind::ToolCall(call) if call.tool == "read_file")
+        }),
+        "the bound bot called `read_file`; transcript={} entries\n  turns:\n  {}",
+        entries.len(),
+        rig.turn_report(&dm)
+    );
     let read = tool_call(&entries, "read_file");
     assert_eq!(
         read.status,

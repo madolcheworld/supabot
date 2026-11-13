@@ -789,6 +789,20 @@ target-dir lock while tests run, so doing that would deadlock). Three tests,
    `revoked:true, online:false, approved:[]`, the child exits **by itself** with
    code 1 naming 4401, and a redial is refused with 401 *before* any upgrade.
 
+One case the three above do not cover, because it needs a revocation to land in
+the middle of a handshake: **a hello in flight cannot un-revoke a node.** The
+upgrade is verified while the row is still clean, so a `node.hello` can arrive
+*after* the owner revoked. Recording it normally would mark the node `online`
+again and re-approve its capabilities — and the dispatcher routes on that row, so
+the brain would start sending tool calls to a machine its owner had just cut off.
+`apply_hello` therefore never writes `revoked`, and checks it **inside** the
+revision-guarded write loop: if the row is revoked the write is vetoed, nothing is
+stored, and the socket closes `CLOSE_REVOKED` (4401) so the node stops redialing.
+Checked before the loop it would still race; checked after, the row would already
+have been changed. Only re-pairing, which writes a fresh row, clears a revocation
+(D9.18). Test: `a_hello_for_a_revoked_node_does_not_unrevoke_it`, which asserts the
+row's `revision` did not move — proof the refused hello wrote nothing at all.
+
 The old `#[ignore]`d `pair_and_serve_against_a_real_brain` — an empty body with a
 six-step recipe in a comment — was **deleted**, because an empty test is a lie that
 reads as coverage (D9.13). A comment now names where each of its six steps is

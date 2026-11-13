@@ -73,8 +73,10 @@ value that a local executor runs is the value that will cross a socket.
 ## 2. Domain model
 
 Ids are `<prefix>_<uuid v7 simple>` — time-sortable, so `ORDER BY id` is honest.
-Every entity is a whole-entity upsert; entries additionally carry a `revision`
-and a stale write is a `Conflict`, never a silent overwrite.
+Every entity is a whole-entity upsert; entries **and node roster rows** carry a
+`revision`, and a stale write is a `Conflict`, never a silent overwrite. Both are
+rows with more than one writer, and a whole-row upsert from a reader of an older
+generation is how a concurrent write disappears.
 
 | Entity | Type (contracts) | Id prefix | SQLite table | Written by |
 | --- | --- | --- | --- | --- |

@@ -110,6 +110,43 @@ impl SharedState {
     }
 }
 
+/// Close every turn this bot still has open, marking the panic as the reason.
+///
+/// Best effort on purpose: this runs on the path where a runner has already
+/// died, and failing to record that must not itself panic or mask the original
+/// error. Anything that goes wrong is logged — a turn left `Running` is then at
+/// least visible, and boot recovery settles it on the next start.
+fn settle_turns_of_a_panicking_runner(
+    store: &Arc<dyn Persistence>,
+    bot: &BotId,
+    panic_message: &str,
+) {
+    let running = match store.running_turns() {
+        Ok(running) => running,
+        Err(error) => {
+            tracing::error!(
+                bot = %bot,
+                %error,
+                "cannot read the running turns after a runner panic; they stay open until the next boot"
+            );
+            return;
+        }
+    };
+    for mut turn in running.into_iter().filter(|turn| &turn.bot_id == bot) {
+        turn.status = TurnStatus::Failed;
+        turn.error = Some(format!("the bot runner panicked: {panic_message}"));
+        turn.ended_at = Some(chrono::Utc::now());
+        if let Err(error) = store.update_turn(&turn) {
+            tracing::error!(
+                bot = %bot,
+                turn = %turn.id,
+                %error,
+                "cannot close a turn whose runner panicked; it stays open until the next boot"
+            );
+        }
+    }
+}
+
 /// The text of a caught panic payload, for a log line that says what happened.
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(text) = payload.downcast_ref::<&str>() {
@@ -483,6 +520,7 @@ impl BotRunner {
         let runners = Arc::clone(&runner.env.runners);
         let panic_bot = runner.bot_id.clone();
         let panic_state = Arc::clone(&runner.state);
+        let panic_store = Arc::clone(&runner.env.store);
         tokio::spawn(async move {
             // A panic in this task used to be **silent**: tokio stores it in
             // the `JoinHandle`, and nothing here awaits that handle, so a
@@ -500,6 +538,15 @@ impl BotRunner {
                     "a bot runner panicked; this bot will not answer again until the brain restarts"
                 );
                 panic_state.busy.store(false, Ordering::SeqCst);
+                // Clearing `busy` is not enough. The turn this runner was in the
+                // middle of is still `Running` in the store, and nothing else
+                // will ever close it: the runner that owned it is gone. A turn
+                // left open is a lie in two places — the transcript says work is
+                // in flight, and `Swarm::wait_for_idle` (which now believes the
+                // store, because the in-memory signals have a quiet window at
+                // the start of a turn) waits out its whole budget for a turn
+                // that died. So settle it here, naming the panic as the reason.
+                settle_turns_of_a_panicking_runner(&panic_store, &panic_bot, &message);
             }
             // `notify_one`, not `notify_waiters`: a permit is stored when
             // nobody is waiting, so a `joined()` that arrives *after* the task
@@ -2439,6 +2486,44 @@ mod tests {
         assert!(
             !handle.is_busy(),
             "a panicked runner must not leave the bot marked Working"
+        );
+
+        // The turn it was in the middle of is closed, and says why. Left open,
+        // it would be a permanent lie: the transcript would claim work in
+        // flight that nothing can finish, and `wait_for_idle` — which believes
+        // the store's `Running` turns, because the in-memory signals have a
+        // quiet window at the start of a turn — would wait out its whole budget.
+        let still_running = swarm.store.running_turns().expect("turns read");
+        assert!(
+            !still_running.iter().any(|turn| turn.bot_id == lead.id),
+            "a panicked runner leaves no turn of its own running: {still_running:?}"
+        );
+        let turns = swarm
+            .store
+            .turns_in(&lead.direct_conversation_id, 10)
+            .expect("turns read");
+        let panicked = turns
+            .iter()
+            .find(|turn| turn.status == TurnStatus::Failed)
+            .unwrap_or_else(|| panic!("the turn is marked failed: {turns:?}"));
+        assert!(
+            panicked
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("panicked")),
+            "the failure names the panic rather than looking like a backend error: {:?}",
+            panicked.error
+        );
+        assert!(
+            panicked.ended_at.is_some(),
+            "a closed turn has an end time: {panicked:?}"
+        );
+
+        // And the swarm now reports idle, which is the behaviour the CLI's
+        // `run --wait` and every test's `settle()` depend on.
+        assert!(
+            swarm.wait_for_idle(Duration::from_secs(5)).await,
+            "a panicked runner's swarm goes idle instead of waiting out the budget"
         );
     }
 

@@ -411,7 +411,7 @@ tes dari `cargo test --workspace` (bukan hasil grep).
 | **M7** Penguatan | routines, memory, skills, data stream `/node/stream/:id`, backend `codex app-server`, backup | **sebagian**: routines berjalan (ticker dipanggil di brain dan CLI embedded, `RoutineRun` ditutup saat turn selesai), memory punya jalur tulis (`remember` → `MEMORY.md`), skills dibaca dari pustaka `<data>/skills/<nama>/SKILL.md`, **backup selesai** (`swarmbot backup create/verify`, `VACUUM INTO` + manifest yang diverifikasi ulang dari snapshot), dan **usage token punya permukaan** (`GET /api/usage`, `swarmbot usage`, `UsageReport`). **Belum**: data stream `/node/stream/:id` (token ada, framing belum), backend `codex app-server` (masih refusal bertipe) |
 
 Run terakhir yang tercatat: `scripts/check.sh` exit 0 — fmt + clippy + tes,
-**1.283 lulus, 0 gagal, 4 di-`#[ignore]`** (289 s tes; 336 s total). Yang
+**1.288 lulus, 0 gagal, 4 di-`#[ignore]`** (289 s tes; 336 s total). Yang
 diabaikan memang butuh sesuatu yang tidak ada di gate: dua tes live — gateway llm
 (`PROTO_LIVE_LLM=1`) dan agen ACP (`PROTO_LIVE_ACP=1`, plus `PROTO_LIVE_ACP_CMD`;
 tanpa `PROTO_LIVE_ACP_PROMPT=1` ia berhenti di handshake yang gratis) — plus dua
@@ -435,7 +435,6 @@ Ditulis di sini supaya tidak ada yang mengira ini sudah terbukti:
 | `LiveEvent::Resync` karena broadcast yang **lagged** | resync akibat cursor basi/epoch lain teruji (`brain/tests/live.rs`, `client_contract.rs`); cabang `Lagged` di `LiveHub::subscribe` tidak punya pemicu deterministik |
 | Frame rate GPUI di GPU nyata | sesi ini tidak punya `/dev/dri`; semua render lewat llvmpipe |
 | Windows | `crates/node` memanggil `libc::gethostname` dan `killpg` tanpa syarat, jadi daemon-nya unix-only dalam praktik |
-| Roster node di bawah konkurensi | `node.hello` dan `node.heartbeat` sama-sama read–modify–write pada baris roster yang sama, dan `update_node` menulis seluruh baris tanpa CAS. Heartbeat yang membaca sebelum hello menulis akan menimpa policy dengan nilai lama — di UI artinya ceiling yang ditampilkan bisa bukan ceiling node itu. Teridentifikasi dan tercatat di [`review.md`](docs/review.md) §9; **belum diperbaiki** |
 | Apakah adapter sungguhan mengisi `Usage` | semua angka yang pernah dilihat gate berasal dari `FakeBackend::with_usage`; `UsageReport` menampilkan apa yang ada di `Turn.usage`, dan untuk backend yang tidak melaporkan apa pun hasilnya nol dengan `turns` bukan nol. `openai`/`acp`/`claude-cli` terhadap model nyata belum diuji untuk ini |
 | Panel usage di UI desktop | route `GET /api/usage` dan `swarmbot usage` ada; GPUI belum menampilkannya |
 | Restore backup ke brain yang **sedang berjalan** | yang terbukti: snapshot dibuka sebagai store yang berfungsi dan berisi data pemilik (tes `the_snapshot_opens_as_a_store_and_serves_the_owners_data`), dan backup dari store hidup dengan WAL belum di-checkpoint konsisten. Prosedur "taruh kembali sebagai `<data>/swarmbot.sqlite` sambil brain hidup" tidak diuji |
@@ -493,6 +492,17 @@ D5.1–D5.7. Ringkasnya:
   **read-only**), `audit/`, `node-state.json`. `spill/` sengaja read-only: teks
   spill yang diterima model menunjuk berkas yang benar-benar bisa ia buka, dan
   direktori itu tidak bisa dipakai sebagai ruang tulis bebas.
+- **Revocation tidak bisa dibatalkan oleh node itu sendiri.** Baris roster ditulis
+  oleh beberapa pihak sekaligus (`node.hello`, `node.heartbeat`, `node.event`,
+  presence, revocation) dan mux menjalankan satu task per request masuk, jadi mereka
+  benar-benar tumpang tindih. Karena itu `NodeInfo` membawa `revision` dan tulis
+  yang basi dijawab `Conflict` — bukan ditimpa diam-diam. Dua jaminan yang
+  bergantung padanya: ceiling sebuah node tidak bisa dikembalikan ke nilai lama oleh
+  heartbeat yang lewat belakangan, dan **hello yang masih di jalan saat pemilik
+  mencabut node tidak bisa menghidupkannya kembali** (dulu `apply_hello` menulis
+  `revoked = false`; sekarang pemeriksaan itu ada di dalam loop yang dijaga CAS,
+  jadi tidak ada jendela — tidak ada yang ditulis, dan socket ditutup dengan 4401).
+  Hanya re-pairing, yang menulis baris baru, yang boleh menghapus revocation.
 - **Tidak ada endpoint tanpa auth.** Termasuk `/api/health`: UI yang men-spawn
   brain membaca `owner-token` yang brain itu baru minting (D9.10) alih-alih meminta
   pengecualian. Upgrade WebSocket juga wajib lolos allow-list `Origin`, karena

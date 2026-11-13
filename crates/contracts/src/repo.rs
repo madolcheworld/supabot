@@ -155,6 +155,22 @@ pub trait RuleRepo: Send + Sync {
 
 pub trait NodeRepo: Send + Sync {
     fn insert_node(&self, node: &NodeInfo) -> Result<(), DomainError>;
+    /// Write a whole roster row, guarded by [`NodeInfo::revision`].
+    ///
+    /// The revision must be **strictly newer** than the stored one, exactly like
+    /// [`Entry`]: a stale write is [`DomainError::Conflict`], never a silent
+    /// overwrite. The guard exists because the row has several concurrent
+    /// writers on one connection — the mux spawns a task per inbound request, so
+    /// `node.hello` and `node.heartbeat` genuinely overlap — and each is a
+    /// read–modify–write of the *whole* row. Without the guard the loser
+    /// restores the row it read and erases the winner's fields; the observed
+    /// symptom was a node's `policy` reverting to its pre-hello value while the
+    /// node was online.
+    ///
+    /// A conflict is not an error condition to surface to a user: the caller
+    /// re-reads, re-applies its own field and retries. Implementations must make
+    /// the read-and-write atomic (one transaction, or one locked connection),
+    /// otherwise the guard can be raced the same way the row was.
     fn update_node(&self, node: &NodeInfo) -> Result<(), DomainError>;
     fn get_node(&self, id: &NodeId) -> Result<Option<NodeInfo>, DomainError>;
     fn list_nodes(&self) -> Result<Vec<NodeInfo>, DomainError>;

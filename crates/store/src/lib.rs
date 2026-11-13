@@ -43,6 +43,7 @@ use swarmbot_contracts::Seq;
 use swarmbot_contracts::entry::Entry;
 use swarmbot_contracts::error::DomainError;
 use swarmbot_contracts::id::{ConversationId, EntryId};
+use swarmbot_contracts::node::NodeInfo;
 
 /// The one timestamp format both stores write and compare.
 ///
@@ -82,6 +83,18 @@ pub(crate) fn stale_revision(entry: &Entry, stored: u32) -> DomainError {
     DomainError::conflict(format!(
         "entry {} revision {} is not newer than the stored revision {stored}",
         entry.id, entry.revision
+    ))
+}
+
+/// The roster row's twin of [`stale_revision`].
+///
+/// The message names both generations because the caller's recovery is to
+/// re-read and re-apply, and a log line that only said "conflict" would not tell
+/// an operator how far behind the writer was.
+pub(crate) fn stale_node_revision(node: &NodeInfo, stored: u64) -> DomainError {
+    DomainError::conflict(format!(
+        "node {} revision {} is not newer than the stored revision {stored}",
+        node.id, node.revision
     ))
 }
 

@@ -171,6 +171,9 @@ pub async fn pair(
         paired_at: now,
         last_seen_at: None,
         revoked: false,
+        // Generation 0: nothing has written this row yet, so the first
+        // read–modify–write (the node's hello) bumps it to 1 and wins.
+        revision: 0,
     };
     state.swarm.store.insert_node(&node)?;
     state.swarm.hub.publish(Change::Node(node));

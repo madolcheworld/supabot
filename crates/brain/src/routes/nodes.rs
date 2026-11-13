@@ -83,28 +83,35 @@ pub async fn revoke(
             "the local node cannot be revoked: it runs inside this process",
         ));
     }
-    let Some(mut node) = state.swarm.store.get_node(&id)? else {
+    let Some(node) = state.swarm.store.get_node(&id)? else {
         return Err(ApiError::from(DomainError::not_found("node", &id)));
     };
     if node.revoked {
         return Ok(StatusCode::NO_CONTENT);
     }
-    node.revoked = true;
-    node.online = false;
-    node.last_seen_at = Some(Utc::now());
-    // Drop the approved capabilities as well as the flag: a revoked node that
-    // somehow reached the gateway should find nothing it is allowed to do.
-    node.approved = Capabilities::new(Vec::<String>::new());
-    state.swarm.store.update_node(&node)?;
-    state.swarm.hub.publish(Change::Node(node.clone()));
+    // Through the gateway's guarded writer, not a bare `update_node`: a
+    // revocation racing a heartbeat used to be able to lose either side, and
+    // "the owner revoked this node" losing to a liveness ping is the worse of
+    // the two. On conflict the closure is re-applied to the fresh row.
+    let written = session::mutate_node(state.swarm.store.as_ref(), &id, |node| {
+        node.revoked = true;
+        node.online = false;
+        node.last_seen_at = Some(Utc::now());
+        // Drop the approved capabilities as well as the flag: a revoked node that
+        // somehow reached the gateway should find nothing it is allowed to do.
+        node.approved = Capabilities::new(Vec::<String>::new());
+    })
+    .map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::from(DomainError::not_found("node", &id)))?;
+    state.swarm.hub.publish(Change::Node(written.clone()));
     // A node that is connected right now is told with the one close code that
     // makes it stop redialing for good: 4401. Anything else and it would knock
     // every 30 seconds forever, filling two logs with a decision the owner
     // already made.
     if session::revoke(&state.gateway, &id).await {
-        info!(node = %id, label = %node.label, "a connected node was revoked and told to stop redialing");
+        info!(node = %id, label = %written.label, "a connected node was revoked and told to stop redialing");
     } else {
-        info!(node = %id, label = %node.label, "a node was revoked");
+        info!(node = %id, label = %written.label, "a node was revoked");
     }
     Ok(StatusCode::NO_CONTENT)
 }
