@@ -21,6 +21,13 @@ pub enum DeliveryKind {
     OwnerMessage,
     /// Another bot sent it (`message_bot`, `post_to_group`).
     BotMessage,
+    /// A teammate's answer to your `message_bot`, forwarded back **once**.
+    ///
+    /// The turn that receives this has already been answered: it reads the
+    /// answer and never forwards a reply back, so a bot-to-bot exchange ends
+    /// after one reply instead of two models acknowledging each other until
+    /// the hop limit (D4.8).
+    BotReply,
     /// A routine fired.
     Routine,
     /// The brain restarted and is resuming work.
@@ -167,6 +174,24 @@ impl Delivery {
         delivery
     }
 
+    /// An answer to a `message_bot`, forwarded back to the bot that asked.
+    ///
+    /// A turn that receives this is the **end** of the exchange: it must not
+    /// forward a reply back to the same teammate (D4.8). `from_bot` is the
+    /// teammate who answered, exactly as on [`Self::bot_message`].
+    pub fn bot_reply(
+        conversation_id: ConversationId,
+        from: BotId,
+        to: BotId,
+        text: impl Into<String>,
+        causal: CausalChain,
+    ) -> Self {
+        let mut delivery = Self::new(conversation_id, to, DeliveryKind::BotReply, text.into());
+        delivery.from_bot = Some(from);
+        delivery.causal = causal;
+        delivery
+    }
+
     /// One piece of work for the receiving bot to run as a task.
     pub fn task(
         conversation_id: ConversationId,
@@ -244,7 +269,13 @@ impl Delivery {
     }
 
     pub fn is_from_bot(&self) -> bool {
-        matches!(self.kind, DeliveryKind::BotMessage)
+        matches!(self.kind, DeliveryKind::BotMessage | DeliveryKind::BotReply)
+    }
+
+    /// True when this delivery answers a bot's own message, i.e. the exchange
+    /// it belongs to is over and nothing may be forwarded back (D4.8).
+    pub fn ends_exchange(&self) -> bool {
+        matches!(self.kind, DeliveryKind::BotReply)
     }
 
     /// A bot message never interrupts a turn; only the owner's can.
@@ -309,6 +340,38 @@ mod tests {
         assert!(!bot.may_interrupt());
         assert!(bot.is_from_bot());
         assert_eq!(bot.causal.hops, 1);
+    }
+
+    #[test]
+    fn an_answer_carries_its_sender_and_ends_the_exchange() {
+        let root = Delivery::owner_message(ConversationId::new(), BotId::new(), "go");
+        let reply = Delivery::bot_reply(
+            ConversationId::new(),
+            BotId::new(),
+            BotId::new(),
+            "port is 8080",
+            root.causal.next().unwrap(),
+        );
+        assert_eq!(reply.kind, DeliveryKind::BotReply);
+        assert!(reply.is_from_bot());
+        assert!(reply.ends_exchange());
+        assert!(!reply.may_interrupt(), "an answer never interrupts a turn");
+        assert_eq!(reply.urgency, Urgency::Background);
+        assert_eq!(reply.causal.hops, 1);
+        assert!(reply.from_bot.is_some());
+
+        // An ordinary bot message is still a question, not an answer.
+        assert!(
+            !Delivery::bot_message(
+                ConversationId::new(),
+                BotId::new(),
+                BotId::new(),
+                "check this",
+                reply.causal.next().unwrap(),
+                Urgency::Background,
+            )
+            .ends_exchange()
+        );
     }
 
     #[test]

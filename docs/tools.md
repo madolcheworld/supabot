@@ -283,7 +283,7 @@ run no command, so they never raise an approval card of their own.
 
 | Tool | Toolset | Read-only | Arguments (`*` = required) | Returns |
 | --- | --- | --- | --- | --- |
-| `message_bot` | `Bot` | no | `to*` (handle, `@` optional), `text*`, `urgency` (`urgent` \| `background`, default `background`) | `Messaged @x in their DM.` or `… in this group — a message to a fellow member stays where the owner can see it.`, plus how it landed: woken / woken-and-flagged-urgent / `They are mid-turn right now; your message waits for that turn to end.` / `They were NOT woken (a disabled bot stays asleep)…`. Messaging yourself is refused (`that is you; there is nobody to message`) |
+| `message_bot` | `Bot` | no | `to*` (handle, `@` optional), `text*`, `urgency` (`urgent` \| `background`, default `background`) | `Messaged @x in their DM.` or `… in this group — a message to a fellow member stays where the owner can see it.`, plus how it landed: woken / woken-and-flagged-urgent / `They are mid-turn right now; your message waits for that turn to end.` / `They were NOT woken (a disabled bot stays asleep)…`. Messaging yourself is refused (`that is you; there is nobody to message`). Their answer comes back to you **once**, labelled `[Answer — the exchange is over, no reply needed]`, and that turn never messages you back (D4.8) |
 | `post_to_group` | `Bot` | no | `group*` (title or `cnv_…` id), `text*` | `Posted in "<title>". Teammates you @mentioned were woken and will read it on their next turn.` |
 | `handoff_task` | `Bot` | no | `to*`, `title*`, `task*` (self-contained), `context?` | `Handed "<title>" to @x as task tsk_…. It is theirs to run; when they finish, their result comes back to this conversation. Follow progress with check_task.` A handoff to yourself is refused with `use start_task for your own work` |
 | `react` | `Bot` | no | `emoji*` | `Your 👍 reaction was recorded in the transcript. Nobody was woken — if you have something to say, use message_bot.` |
@@ -302,11 +302,13 @@ Both hop-limit and kill-switch behaviour come from `Messaging`: at
 event line in the transcript; with `settings.bot_messaging = false` the call fails
 with `bot messaging is switched off by the owner`.
 
-One asymmetry worth knowing: `message_bot` and `post_to_group` pass the chain on
-(one hop further), but `handoff_task` hands the task to `BackgroundTasks::submit`,
-and the delivery the pump builds starts a **fresh** chain. So `max_hops` bounds
-message chains, while a handoff-to-handoff chain is bounded by
-`max_running_tasks_per_bot` and `max_tool_rounds` instead
+Every one of the four carrying tools passes the chain on: `message_bot`,
+`post_to_group` and `handoff_task` each advance it one hop, and
+`handoff_task`'s chain **travels with the task** (`Task.causal`, D9.1) so the
+pump's delivery and the task result inherit it. `start_task` is the one that
+starts a fresh chain (`CausalChain::root()`), because work a bot takes on itself
+is not a delegation. Before D9.1 a handoff loop restarted the count at zero on
+every hop, and `max_hops` was silently untrue
 ([`architecture.md`](architecture.md) §4).
 
 ## 5. Node calls (the wire shape, and who runs them)

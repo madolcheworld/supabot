@@ -190,6 +190,35 @@ Status: accepted for the M0–M6 prototype.
 - **D4.7 Deviation: `react` writes an event line.** Entries are whole-entity
   upserts, and a reaction would need its own schema; a line
   ("@scout reacted 👍 to the owner's message") is honest and searchable.
+- **D4.8 An answer ends a bot-to-bot exchange.** When a bot replies to a DM
+  `message_bot` and its reply addresses the sender, that reply is forwarded back
+  **once** as `DeliveryKind::BotReply`, rendered
+  `[Answer — the exchange is over, no reply needed]` under the
+  `[Direct message from @x]` origin tag. A turn started by a `BotReply` never
+  forwards a reply back — the DM forwarding loop only forwards a `BotMessage`,
+  which is a question — so an exchange is "message, answer" and stops there.
+  Before this the forwarded answer was an ordinary `BotMessage`, so two models
+  could acknowledge each other until the hop limit: a conversation nobody asked
+  for, paid for turn by turn. The asker is still woken, because it has to read
+  the answer to act on it, and that turn is where it reports to the owner. An
+  explicit `message_bot` from a bot that genuinely needs something new is a
+  fresh question and still travels (the hop limit still applies); the
+  instructions say not to message back just to acknowledge, and name the one
+  other reason to speak again — **to correct a mistake**. A correction is
+  therefore not swallowed by this rule, **but it has to be an explicit
+  `message_bot` call**: on a turn triggered by an answer, plain text that
+  mentions the teammate by name is not forwarded, because forwarding it is the
+  acknowledgement loop again — one "@name" per answer would restart the
+  exchange. So the bot that read a wrong answer messages the correction as a
+  tool call, that turn reaches the other bot, and the corrected answer comes
+  back once and ends the exchange again. The instructions say both things
+  (`When a teammate messages you in a DM, … either one is forwarded` and
+  `Once you have been answered, only an explicit message_bot reaches that
+  teammate`), because a model told only the first would lose every correction.
+  Group mentions are unchanged: a group is the owner-visible discussion, and an
+  `@mention` there is a fresh ask. Tested by
+  `a_correction_travels_and_is_itself_bounded_to_one_answer` and, at the
+  boundary, `a_plain_text_correction_on_an_answer_turn_does_not_travel`.
 
 ## D5. Approvals and safety
 

@@ -161,6 +161,10 @@ execute_turn:
    after the loop:
           group reply → GroupRouter::wake_from_reply (minus already-addressed) →
                         hooks.wake_mentioned → Messaging (hop limit applies)
+          DM reply    → forwarded once, only to a teammate who asked (a `BotMessage`)
+                        and only when the text addresses them:
+                        hooks.forward_dm_reply → Messaging::forward_answer, a
+                        DeliveryKind::BotReply that a turn never answers (D4.8)
           NO_REPLY   → event line "@x had nothing to add"
           session.needs_compaction(context_window, compact_at_fraction) → compact
           session.save
@@ -249,7 +253,8 @@ is silently lost.
 | Queue, don't interrupt | `RunnerMap::deliver` / `RunnerHandle::steer` | only an *urgent* delivery for the *same* conversation is steered into the running turn; a bot message never interrupts; only the owner can stop a turn |
 | A task delivery is never batched | `BotRunner::take_batch` | one turn settles exactly one task, so a delivery with a `task_id` always runs alone: folding two into one turn left the second `Running` forever, and a task stuck running occupies the per-bot cap and starves everything queued behind it (D9.2) |
 | A stopped turn fails its task | `run_turn` tail → `settle_task` | an aborted turn reports "the turn running this task was stopped" as a **failure**, never an empty success — the requester has to learn the work did not finish (D9.3) |
-| Origin tags | `session::origin_tag`, `runners::render_turn_text` | `[Group chat "Team" · members: … · lead: @lead — your reply is posted here]`, `[Direct message from @ada]`, `[DM with the owner]` (only when the previous turn was elsewhere), `[Task "…"]`, `[An answer to what you asked]`, `[Routine run]` |
+| An answer ends the exchange | `run_turn` tail + `Messaging::forward_answer` | a DM reply is forwarded once as `DeliveryKind::BotReply`; the forwarding loop only forwards a `BotMessage` (a question), so a turn started by an answer never sends one back (D4.8) |
+| Origin tags | `session::origin_tag`, `runners::render_turn_text` | `[Group chat "Team" · members: … · lead: @lead — your reply is posted here]`, `[Direct message from @ada]`, `[Answer — the exchange is over, no reply needed]` (under the `[Direct message from @ada]` tag), `[DM with the owner]` (only when the previous turn was elsewhere), `[Task "…"]`, `[An answer to what you asked]`, `[Routine run]` |
 | Seen cursors | `Session::seen` / `mark_seen` | a group catch-up shows each message to each bot exactly once, never its own words, ≤60 entries and ≤8 KiB per turn |
 | Compaction | `Session::needs_compaction` / `compact` | past `compact_at_fraction` (0.6) of the context window the oldest messages fold into a summary that keeps the newest `COMPACT_KEEP_LAST = 8` verbatim; the prototype's summary is head-and-tail text (`runners::compact_summary`), not a model-written one |
 | New session | `Session::reset_native` | drops `history` and `native_session_id`, **keeps** `seen`: what a bot saw is a fact about the transcript, not about the model's memory |

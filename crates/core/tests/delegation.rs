@@ -1095,8 +1095,10 @@ async fn dm_bot_to_bot_reply_via_plain_text_and_via_tool_avoid_deadlock() {
         .requests();
     let got_dm_reply = lead_requests.iter().any(|req| {
         req.messages.iter().any(|m| {
-            m.content
-                .contains("[Direct message from @scout] @lead Port is 8080.")
+            m.content.contains("[Direct message from @scout]")
+                && m.content.contains(
+                    "[Answer — the exchange is over, no reply needed] @lead Port is 8080.",
+                )
         })
     });
     assert!(
@@ -1305,6 +1307,312 @@ async fn dm_plain_acknowledgement_and_third_person_do_not_ping_pong() {
 }
 
 #[tokio::test]
+async fn a_teammates_answer_is_forwarded_once_and_never_answered_back() {
+    let rig = rig();
+    let lead_dm = rig.dm_of(&rig.lead);
+    let scout_dm = rig.dm_of(&rig.scout);
+
+    // Lead asks scout in its DM. Scout answers, addressing `@lead`. Lead reads
+    // the answer — and then says "@scout Thanks, noted." in its own DM, which
+    // used to be forwarded straight back to scout as an ordinary `BotMessage`
+    // and could start a second round. It is now the end of the exchange (D4.8).
+    rig.script(
+        LEAD,
+        vec![
+            ScriptedTurn::text("@scout what is the port?").with_tool_call(
+                "message_bot",
+                json!({"to": "scout", "text": "what is the port?", "urgency": "urgent"}),
+            ),
+            ScriptedTurn::text("Asked scout."),
+            ScriptedTurn::text("@scout Thanks, noted."),
+        ],
+    );
+    rig.script(SCOUT, vec![ScriptedTurn::text("@lead Port is 8080.")]);
+
+    rig.swarm
+        .send(&lead_dm, "ask scout about the port")
+        .expect("sent");
+    rig.settle().await;
+
+    // The asker is still woken by the answer: it has to read it to act on it.
+    let lead_requests = rig
+        .swarm
+        .backends
+        .registry()
+        .fake(LEAD)
+        .expect("fake lead")
+        .requests();
+    let answer_prompt = lead_requests
+        .iter()
+        .find(|req| {
+            req.messages.iter().any(|m| {
+                m.content
+                    .contains("[Answer — the exchange is over, no reply needed]")
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!("lead must be woken with the answer, labelled as one: {lead_requests:?}")
+        });
+    assert!(
+        answer_prompt
+            .messages
+            .iter()
+            .any(|m| { m.content.contains("@lead Port is 8080.") }),
+        "the answer itself reaches lead: {answer_prompt:?}"
+    );
+
+    // The exchange stops after one answer: scout is not woken again, even
+    // though lead's closing text names @scout by handle.
+    assert_eq!(
+        rig.swarm
+            .backends
+            .registry()
+            .fake(SCOUT)
+            .expect("fake scout")
+            .requests()
+            .len(),
+        1,
+        "an answer must never be answered back (D4.8): {scout_dm:?}"
+    );
+    assert!(
+        rig.swarm
+            .store
+            .queued_deliveries(&rig.scout)
+            .expect("scout deliveries")
+            .is_empty(),
+        "nothing is queued for scout after it answered"
+    );
+    assert!(
+        !rig.transcript(&scout_dm).contains("Thanks, noted."),
+        "lead's acknowledgement stays in lead's own DM: {}",
+        rig.transcript(&scout_dm)
+    );
+    assert!(
+        rig.transcript(&lead_dm).contains("@lead Port is 8080."),
+        "the forwarded answer is in the asker's DM: {}",
+        rig.transcript(&lead_dm)
+    );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_bot_that_needs_something_new_can_still_message_after_an_answer() {
+    let rig = rig();
+    let lead_dm = rig.dm_of(&rig.lead);
+
+    // The rule ends *acknowledgements*, not conversation: an explicit
+    // `message_bot` from a turn that was started by an answer is a new
+    // question and still travels (D4.8).
+    rig.script(
+        LEAD,
+        vec![
+            ScriptedTurn::text("First question.").with_tool_call(
+                "message_bot",
+                json!({"to": "scout", "text": "port?", "urgency": "urgent"}),
+            ),
+            ScriptedTurn::text("Asked once."),
+            ScriptedTurn::text("Second question.").with_tool_call(
+                "message_bot",
+                json!({"to": "scout", "text": "and the host?", "urgency": "urgent"}),
+            ),
+            ScriptedTurn::text("Asked twice."),
+        ],
+    );
+    rig.script(
+        SCOUT,
+        vec![
+            ScriptedTurn::text("@lead 8080."),
+            ScriptedTurn::text("@lead localhost."),
+        ],
+    );
+
+    rig.swarm.send(&lead_dm, "find the address").expect("sent");
+    rig.settle().await;
+
+    assert_eq!(
+        rig.swarm
+            .backends
+            .registry()
+            .fake(SCOUT)
+            .expect("fake scout")
+            .requests()
+            .len(),
+        2,
+        "an explicit follow-up question still reaches the teammate"
+    );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_plain_text_correction_on_an_answer_turn_does_not_travel() {
+    let rig = rig();
+    let lead_dm = rig.dm_of(&rig.lead);
+    let scout_dm = rig.dm_of(&rig.scout);
+
+    // The boundary of D4.8, pinned on purpose: on a turn triggered by a
+    // teammate's answer, addressing them in plain text is NOT forwarded. If
+    // this ever starts travelling, the acknowledgement loop is back — a model
+    // only has to write "@scout ..." once per answer. A correction therefore
+    // has to be an explicit `message_bot`, which is what the instructions say.
+    rig.script(
+        LEAD,
+        vec![
+            ScriptedTurn::text("Asking for the port.").with_tool_call(
+                "message_bot",
+                json!({"to": "scout", "text": "which port?", "urgency": "urgent"}),
+            ),
+            ScriptedTurn::text("Asked scout."),
+            ScriptedTurn::text("@scout that is the staging port, use 9090."),
+        ],
+    );
+    rig.script(SCOUT, vec![ScriptedTurn::text("@lead Port is 8080.")]);
+
+    rig.swarm.send(&lead_dm, "find the port").expect("sent");
+    rig.settle().await;
+
+    assert_eq!(
+        rig.swarm
+            .backends
+            .registry()
+            .fake(SCOUT)
+            .expect("fake scout")
+            .requests()
+            .len(),
+        1,
+        "plain text on an answer turn must not wake the teammate again"
+    );
+    assert!(
+        rig.swarm
+            .store
+            .queued_deliveries(&rig.scout)
+            .expect("scout deliveries")
+            .is_empty(),
+        "nothing was queued for scout from lead's answer turn"
+    );
+    assert!(
+        !rig.transcript(&scout_dm).contains("staging port"),
+        "the un-forwarded text never reaches scout's DM: {}",
+        rig.transcript(&scout_dm)
+    );
+    assert!(
+        rig.transcript(&lead_dm)
+            .contains("that is the staging port"),
+        "it stays where the owner can read it — lead's own DM: {}",
+        rig.transcript(&lead_dm)
+    );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_correction_travels_and_is_itself_bounded_to_one_answer() {
+    let rig = rig();
+    let lead_dm = rig.dm_of(&rig.lead);
+    let scout_dm = rig.dm_of(&rig.scout);
+
+    // D4.8 stops acknowledgements, not corrections. Lead asks for the port,
+    // scout answers the *wrong* one, lead reads the answer and explicitly
+    // sends the correction back with `message_bot`. That is a fresh question,
+    // so it travels — and it is bounded by the same rule: scout's corrected
+    // answer comes back once as a `BotReply`, and lead's "Noted." is not
+    // forwarded a third time.
+    rig.script(
+        LEAD,
+        vec![
+            ScriptedTurn::text("Asking for the port.").with_tool_call(
+                "message_bot",
+                json!({"to": "scout", "text": "which port?", "urgency": "urgent"}),
+            ),
+            ScriptedTurn::text("Asked scout."),
+            ScriptedTurn::text("That is the staging port.").with_tool_call(
+                "message_bot",
+                json!({"to": "scout", "text": "that is staging; production is 9090", "urgency": "urgent"}),
+            ),
+            ScriptedTurn::text("Sent the correction."),
+            ScriptedTurn::text("@scout Noted."),
+        ],
+    );
+    rig.script(
+        SCOUT,
+        vec![
+            ScriptedTurn::text("@lead Port is 8080."),
+            ScriptedTurn::text("@lead Production is 9090."),
+        ],
+    );
+
+    rig.swarm.send(&lead_dm, "find the port").expect("sent");
+    rig.settle().await;
+
+    let scout_requests = rig
+        .swarm
+        .backends
+        .registry()
+        .fake(SCOUT)
+        .expect("fake scout")
+        .requests();
+    assert_eq!(
+        scout_requests.len(),
+        2,
+        "the correction reaches the bot that needs it, exactly once"
+    );
+    let correction_prompt = scout_requests[1]
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        correction_prompt.contains("that is staging; production is 9090"),
+        "scout reads the correction on its next turn: {correction_prompt}"
+    );
+
+    let lead_requests = rig
+        .swarm
+        .backends
+        .registry()
+        .fake(LEAD)
+        .expect("fake lead")
+        .requests();
+    let second_answer = lead_requests
+        .iter()
+        .find(|req| {
+            req.messages.iter().any(|m| {
+                m.content.contains(
+                    "[Answer — the exchange is over, no reply needed] @lead Production is 9090.",
+                )
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!("the corrected answer comes back as an answer: {lead_requests:?}")
+        });
+    assert!(
+        second_answer
+            .messages
+            .iter()
+            .any(|m| { m.content.contains("@lead Port is 8080.") }),
+        "lead still remembers the answer it corrected: {second_answer:?}"
+    );
+
+    assert!(
+        !rig.transcript(&scout_dm).contains("Noted."),
+        "the acknowledgement after the corrected answer is not forwarded: {}",
+        rig.transcript(&scout_dm)
+    );
+    assert!(
+        rig.swarm
+            .store
+            .queued_deliveries(&rig.scout)
+            .expect("scout deliveries")
+            .is_empty(),
+        "nothing is queued for scout after it answered the correction"
+    );
+
+    rig.swarm.shutdown().await;
+}
+
+#[tokio::test]
 async fn mcp_turn_provider_attaches_servers_for_acp_filters_node_tools_and_drops_on_finish() {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1392,6 +1700,11 @@ async fn mcp_turn_provider_attaches_servers_for_acp_filters_node_tools_and_drops
     struct TestMcpProvider {
         requests: Mutex<Vec<McpTurnRequest>>,
         drop_flag: Arc<AtomicBool>,
+        /// How many tool calls the "agent" made through this turn's endpoint.
+        /// A real harness-driven backend runs the tools itself, so the runner
+        /// never sees them in `ChatResponse::tool_calls`.
+        mcp_tool_calls: u32,
+        taken: Mutex<Vec<swarmbot_contracts::id::TurnId>>,
     }
 
     impl McpTurnProvider for TestMcpProvider {
@@ -1410,6 +1723,11 @@ async fn mcp_turn_provider_attaches_servers_for_acp_filters_node_tools_and_drops
                     flag.store(true, Ordering::SeqCst);
                 },
             ))
+        }
+
+        fn take_tool_calls(&self, turn_id: &swarmbot_contracts::id::TurnId) -> u32 {
+            self.taken.lock().unwrap().push(turn_id.clone());
+            self.mcp_tool_calls
         }
     }
 
@@ -1466,9 +1784,14 @@ async fn mcp_turn_provider_attaches_servers_for_acp_filters_node_tools_and_drops
         .update(&lead_bot)
         .expect("switch lead to mock-acp-mcp");
 
+    // Three calls the "agent" made itself: the runner must fold them into the
+    // turn's usage, or a bot that messaged three teammates is stored as a turn
+    // that used no tool at all.
     let provider = Arc::new(TestMcpProvider {
         requests: Mutex::new(Vec::new()),
         drop_flag: Arc::clone(&reg_drop_flag),
+        mcp_tool_calls: 3,
+        taken: Mutex::new(Vec::new()),
     });
     rig.swarm
         .set_mcp_provider(Arc::clone(&provider) as Arc<dyn McpTurnProvider>);
@@ -1509,6 +1832,26 @@ async fn mcp_turn_provider_attaches_servers_for_acp_filters_node_tools_and_drops
         reg_drop_flag.load(Ordering::SeqCst),
         "MCP registration handle must drop cleanly when the turn ends"
     );
+
+    // The count the provider reported is on the stored turn. Without the fix
+    // this is 0 — the number a turn that never called a tool has — and
+    // `/api/usage` under-reports every ACP bot.
+    {
+        let turns = rig
+            .swarm
+            .store
+            .turns_in(&rig.dm_of(&rig.lead), 10)
+            .expect("turns");
+        let latest = turns.last().expect("the mock-acp-mcp turn");
+        assert_eq!(
+            latest.usage.tool_calls, 3,
+            "the MCP tool calls an owns-tool-loop backend makes must reach the turn's usage"
+        );
+        assert!(
+            !provider.taken.lock().unwrap().is_empty(),
+            "the runner must drain the provider's counter"
+        );
+    }
 
     rig.swarm.shutdown().await;
 }

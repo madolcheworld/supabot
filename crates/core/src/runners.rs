@@ -1193,12 +1193,12 @@ async fn execute_turn(
         .unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
     let dm_addressed_to = if conversation.is_direct() {
-        deliveries.iter().find_map(|d| {
-            if d.kind == DeliveryKind::BotMessage {
-                d.from_bot.clone()
-            } else {
-                None
-            }
+        deliveries.iter().find_map(|d| match d.kind {
+            // A `BotReply` is a teammate's answer to this bot, so the reply
+            // this turn posts is addressed to that teammate — it is just never
+            // forwarded back (D4.8).
+            DeliveryKind::BotMessage | DeliveryKind::BotReply => d.from_bot.clone(),
+            _ => None,
         })
     } else {
         None
@@ -1409,6 +1409,10 @@ async fn execute_turn(
             && !in_task
             && !turn_cancel.is_cancelled()
         {
+            // Only a `BotMessage` is a question that deserves an answer. A
+            // `BotReply` is the answer that already closed this exchange, so
+            // it is skipped here and nothing travels back — that is what keeps
+            // two bots from acknowledging each other (D4.8).
             let mut forwarded_to: HashSet<BotId> = HashSet::new();
             for delivery in deliveries.iter().chain(consumed_steers.iter()) {
                 if delivery.kind != DeliveryKind::BotMessage {
@@ -1706,6 +1710,12 @@ fn render_turn_text(
                 Some(name) => format!("[Direct message from @{name}] "),
                 None => "[Direct message from a teammate] ".to_string(),
             },
+            // The answer that closed the exchange. The origin tag above already
+            // names the teammate; this line says what the delivery is, so the
+            // model does not reply back to it (D4.8).
+            (DeliveryKind::BotReply, _, _) => {
+                "[Answer — the exchange is over, no reply needed] ".to_string()
+            }
             (DeliveryKind::Task, _, _) => String::new(),
             (DeliveryKind::TaskResult, _, _) => String::new(),
             (DeliveryKind::AsyncAnswer, _, _) => "[An answer to what you asked] ".to_string(),
@@ -2045,7 +2055,7 @@ fn initiator_of(delivery: &Delivery, task: Option<&Task>) -> TurnInitiator {
     }
     match delivery.kind {
         DeliveryKind::OwnerMessage => TurnInitiator::Owner,
-        DeliveryKind::BotMessage => TurnInitiator::Bot {
+        DeliveryKind::BotMessage | DeliveryKind::BotReply => TurnInitiator::Bot {
             bot_id: delivery
                 .from_bot
                 .clone()
@@ -2072,6 +2082,7 @@ fn activity_of(delivery: &Delivery) -> String {
     match delivery.kind {
         DeliveryKind::OwnerMessage => "Answering the owner",
         DeliveryKind::BotMessage => "Answering a teammate",
+        DeliveryKind::BotReply => "Reading a teammate's answer",
         DeliveryKind::Routine => "Running a routine",
         DeliveryKind::Task => "Working on a task",
         DeliveryKind::TaskResult => "Reading a task result",

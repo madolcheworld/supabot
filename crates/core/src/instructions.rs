@@ -267,8 +267,11 @@ fn base_rules_for_tools(messaging_enabled: bool, has_tools: bool) -> String {
                  - Hand a piece of work to the teammate who owns it with `handoff_task`; ask a \
                  question or pass a direct note with `message_bot`; speak in a group from another \
                  conversation with `post_to_group`.\n\
-                 - When replying to a teammate who messaged you in a DM, either call `message_bot` \
-                 or address them with `@name` in your reply.\n\
+                 - When a teammate messages you in a DM, you may answer with `message_bot` or by \
+                 addressing them with `@name`; either one is forwarded.\n\
+                 - Once you have been answered (the tag says the exchange is over), only an \
+                 explicit `message_bot` reaches that teammate — plain text in your reply stays in \
+                 your own DM. Use it to correct a mistake or to ask something new.\n\
                  - If the user addresses or mentions a teammate by name (e.g. 'halo scout', \
                  'scout tolong...', or asks for another bot), collaborate or hand off that work \
                  to that teammate with `handoff_task`, `message_bot`, or `@name` in a group chat \
@@ -277,7 +280,9 @@ fn base_rules_for_tools(messaging_enabled: bool, has_tools: bool) -> String {
                  Never mention somebody just to thank them — an acknowledgement wakes them for nothing.\n\
                  - In a group, reply only when you have something to add. When you do not, answer \
                  with exactly `NO_REPLY` and nothing else, or `react` with an emoji instead.\n\
-                 - You are woken at most once per teammate reply, with their final message.",
+                 - You are woken at most once per teammate reply, with their final message.\n\
+                 - A teammate's answer ends the exchange: do not reply to it just to acknowledge \
+                 — message them again only if you need something new, or to correct a mistake.",
             );
         } else {
             rules.push_str(
@@ -287,7 +292,9 @@ fn base_rules_for_tools(messaging_enabled: bool, has_tools: bool) -> String {
                  somebody just to thank them — an acknowledgement wakes them for nothing.\n\
                  - In a group, reply only when you have something to add. When you do not, answer \
                  with exactly `NO_REPLY` and nothing else.\n\
-                 - You are woken at most once per teammate reply, with their final message.",
+                 - You are woken at most once per teammate reply, with their final message.\n\
+                 - A teammate's answer ends the exchange: do not reply to it just to acknowledge \
+                 — reply again only if you need something new, or to correct a mistake.",
             );
         }
     }
@@ -873,6 +880,10 @@ mod tests {
         assert!(!text.contains("`react`"));
         assert!(text.contains("@name"));
         assert!(text.contains("NO_REPLY"));
+        assert!(
+            text.contains("A teammate's answer ends the exchange"),
+            "a bot must be told an answer ends the exchange (D4.8)"
+        );
     }
 
     #[test]
@@ -891,8 +902,16 @@ mod tests {
         assert!(text.contains("handoff_task"));
         assert!(text.contains("message_bot"));
         assert!(text.contains("post_to_group"));
-        assert!(text.contains("When replying to a teammate who messaged you in a DM"));
+        assert!(text.contains("When a teammate messages you in a DM"));
+        assert!(
+            text.contains("only an explicit `message_bot` reaches that teammate"),
+            "after an answer, plain text must be documented as not forwarded (D4.8)"
+        );
         assert!(text.contains("@name"));
         assert!(text.contains("NO_REPLY"));
+        assert!(
+            text.contains("A teammate's answer ends the exchange"),
+            "a bot must be told an answer ends the exchange (D4.8)"
+        );
     }
 }

@@ -167,6 +167,55 @@ impl Messaging {
         })
     }
 
+    /// Forward a teammate's answer back to the bot that asked, once.
+    ///
+    /// This is deliberately **not** `message_bot`: the delivery is
+    /// `DeliveryKind::BotReply`, and a turn triggered by one never forwards a
+    /// reply back. An exchange is therefore "message, answer" and it stops
+    /// there (D4.8); before this the answer was an ordinary `BotMessage` and
+    /// two models could acknowledge each other until the hop limit. The asker
+    /// is still woken — it has to read the answer to act on it — but the answer
+    /// is the last thing that travels between them.
+    pub fn forward_answer(
+        &self,
+        ctx: &SendContext,
+        to: &BotId,
+        text: &str,
+    ) -> Result<Sent, DomainError> {
+        if let Some(blocked) = self.blocked(ctx)? {
+            return Ok(blocked);
+        }
+        let recipient = self.store.get_bot(to)?.ok_or_else(|| {
+            DomainError::invalid(format!(
+                "the teammate this answer belongs to ({to}) no longer exists"
+            ))
+        })?;
+        let chain = self.next_chain(ctx)?;
+        let entry = self.transcript.bot_message(
+            &recipient.direct_conversation_id,
+            &ctx.from.id,
+            text,
+            None,
+            Some(ctx.from.id.clone()),
+        )?;
+        let mut delivery = Delivery::bot_reply(
+            recipient.direct_conversation_id.clone(),
+            ctx.from.id.clone(),
+            recipient.id.clone(),
+            text.to_string(),
+            chain,
+        );
+        delivery.source_entry_id = Some(entry.id.clone());
+        let woke = self.deliver(delivery, &recipient)?;
+        Ok(Sent {
+            conversation: recipient.direct_conversation_id,
+            entry: Some(entry.id),
+            woke,
+            stopped: false,
+            task: None,
+        })
+    }
+
     /// `post_to_group {group, text}` — speak in a group you belong to.
     pub fn post_to_group(
         &self,
@@ -717,6 +766,48 @@ mod tests {
 
         // The delivery is parked for the runner that does not exist yet.
         assert_eq!(rig.runners.parked_count(), 1);
+    }
+
+    #[test]
+    fn an_answer_is_forwarded_once_as_the_end_of_the_exchange() {
+        let rig = rig();
+        // Scout's turn is answering lead's message: it has already made one
+        // hop, so the answer travels as hop 2.
+        let ctx = SendContext {
+            from: rig.scout.clone(),
+            conversation: rig
+                .store
+                .get_conversation(&rig.scout.direct_conversation_id)
+                .unwrap()
+                .unwrap(),
+            hops: 1,
+            source_entry: None,
+        };
+        let sent = rig
+            .messaging
+            .forward_answer(&ctx, &rig.lead.id, "@lead Port is 8080.")
+            .unwrap();
+        assert!(sent.woke);
+        assert_eq!(sent.conversation, rig.lead.direct_conversation_id);
+
+        let entries = rig
+            .store
+            .entry_tail(&rig.lead.direct_conversation_id, 10)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].author.bot_id(), Some(&rig.scout.id));
+        assert_eq!(entries[0].kind.text(), Some("@lead Port is 8080."));
+
+        let deliveries = rig.store.queued_deliveries(&rig.lead.id).unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0].kind,
+            swarmbot_contracts::delivery::DeliveryKind::BotReply
+        );
+        assert!(deliveries[0].ends_exchange());
+        assert_eq!(deliveries[0].from_bot, Some(rig.scout.id.clone()));
+        assert_eq!(deliveries[0].causal.hops, 2);
+        assert_eq!(deliveries[0].source_entry_id, Some(entries[0].id.clone()));
     }
 
     #[test]

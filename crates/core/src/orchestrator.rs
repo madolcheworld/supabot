@@ -14,7 +14,7 @@ use serde_json::Value;
 use swarmbot_contracts::Seq;
 use swarmbot_contracts::bot::{Bot, BotStatus};
 use swarmbot_contracts::conversation::{Conversation, ConversationKind};
-use swarmbot_contracts::delivery::{CausalChain, Delivery, Urgency};
+use swarmbot_contracts::delivery::{CausalChain, Delivery};
 use swarmbot_contracts::entry::{Entry, PostState};
 use swarmbot_contracts::error::DomainError;
 use swarmbot_contracts::id::{BotId, ConversationId, EntryId, RequestId, TaskId, TurnId};
@@ -349,15 +349,15 @@ impl RunnerHooks for Orchestrator {
             hops,
             source_entry,
         };
-        if let Err(err) = self
-            .messaging
-            .message_bot(&ctx, to.as_str(), text, Urgency::Background)
-        {
+        // The answer is forwarded once as a `BotReply`: the receiving turn has
+        // been answered and never forwards one back, which is what ends the
+        // exchange (D4.8).
+        if let Err(err) = self.messaging.forward_answer(&ctx, to, text) {
             warn!(
                 error = %err,
                 from = %from.name,
                 to = %to,
-                "cannot forward DM reply back to teammate"
+                "cannot forward DM answer back to teammate"
             );
         }
     }

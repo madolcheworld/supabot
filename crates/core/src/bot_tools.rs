@@ -129,7 +129,9 @@ impl BotToolKind {
                 "Send a message to another bot on the team. Use `urgent` only for asks that \
                  cannot wait — it may be steered into the turn the recipient is running; \
                  `background` (the default) is read on their next turn. From a group turn, a \
-                 message to a fellow member is posted in the group, where the owner can see it.",
+                 message to a fellow member is posted in the group, where the owner can see it. \
+                 Their answer comes back to you once and ends the exchange — do not message \
+                 them back just to acknowledge it.",
                 json!({
                     "type": "object",
                     "properties": {
