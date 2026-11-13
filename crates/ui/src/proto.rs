@@ -14,7 +14,7 @@ use swarmbot_client::{
 };
 use swarmbot_contracts::{
     Bot, BotId, Conversation, ConversationId, Decision, EntryId, LiveEvent, NodeId, NodeInfo,
-    RequestId, Routine, RoutineId, RoutineRun, RuntimeRequest, Settings, Task, TaskId,
+    RequestId, Routine, RoutineId, RoutineRun, RuntimeRequest, Settings, Task, TaskId, UsageReport,
 };
 
 /// An owner credential in transit: the value behind `--token`,
@@ -133,6 +133,17 @@ pub enum Command {
     ResumeRoutine(RoutineId),
     DeleteRoutine(RoutineId),
     FetchRoutineRuns(RoutineId),
+    /// `GET /api/usage` — what the backends reported the team spent.
+    ///
+    /// `since` is an RFC 3339 instant computed by the caller from its own
+    /// clock; `None` means the brain's default window. It is sent as text
+    /// rather than as a duration because the route takes an instant, and
+    /// turning "7 days" into one is a decision the window buttons make
+    /// explicitly (see `view::usage::since_for`), not something to hide in the
+    /// worker.
+    FetchUsage {
+        since: Option<String>,
+    },
     Shutdown,
     /// Ask the worker threads to exit.
     Stop,
@@ -205,5 +216,9 @@ pub enum CommandResult {
     RoutineUpdated(Result<Routine, ClientError>),
     RoutineDeleted(RoutineId, Result<(), ClientError>),
     RoutineRuns(RoutineId, Result<Vec<RoutineRun>, ClientError>),
+    /// A usage report, or the reason there is none. `Err` is kept as a failure
+    /// and never folded into an empty report: "the fetch broke" and "nothing
+    /// ran in this window" are different truths, and the screen says so.
+    Usage(Result<UsageReport, ClientError>),
     Shutdown(Result<(), ClientError>),
 }

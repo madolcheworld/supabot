@@ -87,6 +87,11 @@ pub struct RunOptions {
     #[arg(long, value_name = "URL")]
     pub brain: Option<String>,
 
+    /// Extra PEM roots to trust for a `wss://`/`https://` brain — a private CA,
+    /// added to the system roots rather than replacing them.
+    #[arg(long, value_name = "FILE")]
+    pub brain_ca: Option<PathBuf>,
+
     /// A read-write root this node will act inside. Repeatable. Replaces the
     /// file's roots **and** the default roots. Defaults to `<data>/workspace`,
     /// next to a read-only `<data>/spill` root — naming any root here drops
@@ -186,6 +191,9 @@ pub fn resolve_config(
     let mut resolved = NodeConfig::load(data_dir(override_dir))?;
     if let Some(url) = &options.brain {
         resolved.brain_url = Some(url.clone());
+    }
+    if let Some(ca) = &options.brain_ca {
+        resolved.brain_ca = Some(config::expand_tilde(ca.clone()));
     }
     if let Some(label) = &options.label {
         resolved.label = label.clone();
@@ -553,6 +561,7 @@ mod tests {
     fn run_options() -> RunOptions {
         RunOptions {
             brain: None,
+            brain_ca: None,
             roots: Vec::new(),
             read_only_roots: Vec::new(),
             ceilings: Vec::new(),

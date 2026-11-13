@@ -240,6 +240,7 @@ pub fn run_command(brain: &dyn Brain, command: Command) -> Option<CommandResult>
         Command::FetchRoutineRuns(id) => {
             CommandResult::RoutineRuns(id.clone(), brain.routine_runs(&id, Some(20)))
         }
+        Command::FetchUsage { since } => CommandResult::Usage(brain.usage(since.as_deref())),
         Command::Shutdown => CommandResult::Shutdown(brain.shutdown()),
         Command::Stop => return None,
     };
@@ -484,6 +485,31 @@ mod tests {
     fn stop_is_a_control_signal_with_no_result() {
         let brain = ScriptedBrain::new();
         assert!(run_command(&brain, Command::Stop).is_none());
+    }
+
+    /// The window the owner picked must reach `GET /api/usage` verbatim: a
+    /// dropped `since` would silently answer "last 24 hours" for a screen that
+    /// says "last 7 days".
+    #[test]
+    fn a_usage_fetch_carries_the_window_it_was_given() {
+        let brain = ScriptedBrain::new();
+        let result = run_command(
+            &brain,
+            Command::FetchUsage {
+                since: Some("2026-11-06T12:00:00Z".into()),
+            },
+        )
+        .expect("a usage fetch yields a result");
+        assert!(
+            matches!(result, CommandResult::Usage(Ok(_))),
+            "expected a report, got {result:?}"
+        );
+        let calls = brain.calls();
+        let usage = calls
+            .iter()
+            .find(|c| c.name == "usage")
+            .expect("the client was called");
+        assert_eq!(usage.detail, "2026-11-06T12:00:00Z");
     }
 
     /// The ticker is the only clock a toast has. If a toast stopped counting as

@@ -978,6 +978,109 @@ async fn a_real_node_serves_a_bound_bots_read_and_shell_calls() {
 /// `--ceiling shell=never` — so the same scripted call is refused *by the node
 /// process*, with the node's own words, and the refusal reaches the model as
 /// `ERROR: …`. Nothing ran on either machine.
+/// `fs.download` end to end over a **real data stream**: the real brain mints a
+/// grant, the real `swarmbot-node` child reads a file under its own policy and
+/// dials the brain's `/node/stream/:id`, and the brain assembles the bytes and
+/// checks the digest the node put in its RPC answer.
+///
+/// This is the piece neither half's own tests can cover. `brain/tests/streams.rs`
+/// proves the endpoint against a scripted dialer; the node's own tests prove the
+/// framing; only this one proves the two halves **agree** — that the
+/// `streamId`/`streamToken` the brain mints is the one the node dials with, that
+/// the file comes back byte-for-byte, and that the digest crosses both machines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_node_streams_a_file_to_the_brain_over_a_data_stream() {
+    use swarmbot_contracts::Invocation;
+    use swarmbot_node_protocol::rpc::FsDownload;
+    use swarmbot_node_protocol::streams::StreamKind;
+
+    let rig = Rig::boot(TempDir::new().expect("a temp dir")).await;
+    let node = rig.pair().await;
+    let daemon = rig.run_daemon("stream-node", &[]);
+    rig.wait_for_online(&node, "stream-node", &daemon).await;
+
+    // Bytes that would not survive a text round trip: a NUL, a lone high byte,
+    // and a line break. A transfer that quietly decoded as UTF-8 would corrupt
+    // every one of them, and the digest is what would catch it.
+    let content: Vec<u8> = b"binary-ish payload\n\x00\xff\x01end".to_vec();
+    std::fs::write(rig.node_root.join("payload.bin"), &content).expect("the node's file");
+
+    // The brain's half: mint and register **before** the RPC, so an immediate
+    // dial finds a ticket.
+    let hub = rig.brain.state.gateway.streams();
+    let ticket = hub.open(StreamKind::Transfer).expect("a grant is minted");
+    let (stream_id, token) = (ticket.stream_id.clone(), ticket.token.clone());
+
+    let peer = rig
+        .brain
+        .state
+        .gateway
+        .peer(&node)
+        .expect("the node's control socket is connected");
+    let inv = Invocation::new(
+        BotId::from_suffix("lead"),
+        ConversationId::from_suffix("dm-lead"),
+    );
+    let call = FsDownload {
+        inv: inv.clone(),
+        path: "payload.bin".into(),
+        stream_id: stream_id.clone(),
+        stream_token: token,
+    };
+    // The RPC and the stream run concurrently: the node answers only *after* it
+    // has finished sending, so awaiting the call first would deadlock on the
+    // very acks the stream is delivering.
+    let answer = tokio::spawn(async move {
+        peer.call(
+            swarmbot_node_protocol::rpc::FS_DOWNLOAD,
+            serde_json::to_value(call).expect("the payload serializes"),
+        )
+        .await
+    });
+
+    let received = tokio::time::timeout(BUDGET, hub.receive(ticket))
+        .await
+        .expect("the transfer finishes within the budget")
+        .expect("the transfer completes");
+    assert_eq!(
+        received.bytes, content,
+        "the bytes crossed the stream unchanged"
+    );
+    assert_eq!(
+        received.sha256,
+        swarmbot_node_protocol::chunk_sha256(&content)
+    );
+
+    // The node's RPC answer names what it sent, and it agrees with what
+    // arrived: the claim and the payload are checked against each other.
+    let answer = tokio::time::timeout(BUDGET, answer)
+        .await
+        .expect("the RPC answers")
+        .expect("the call task did not panic")
+        .expect("fs.download succeeded");
+    assert_eq!(answer["size"].as_u64(), Some(content.len() as u64));
+    assert_eq!(
+        answer["sha256"].as_str(),
+        Some(received.sha256.as_str()),
+        "the node's claim and the arriving bytes hash to the same thing: {answer}"
+    );
+
+    // And the node's own audit log recorded the read, attributed to the bot that
+    // asked — the stream is not a way around attribution.
+    let audit = std::fs::read_to_string(rig.node_dir.join("audit").join(format!("{node}.jsonl")))
+        .unwrap_or_else(|error| panic!("the node's audit log is readable: {error}"));
+    let line = audit
+        .lines()
+        .rfind(|line| line.contains("read_file"))
+        .unwrap_or_else(|| panic!("no read_file line in the node's audit log:\n{audit}"));
+    let entry: Value = serde_json::from_str(line).expect("an audit line is JSON");
+    assert_eq!(
+        entry["bot_id"],
+        json!(inv.bot_id.to_string()),
+        "the audit line names the bot that asked: {entry}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_nodes_own_never_ceiling_refuses_what_the_brain_allowed() {
     let tmp = tempfile::tempdir().expect("a temp dir");

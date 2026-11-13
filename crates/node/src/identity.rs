@@ -34,6 +34,8 @@ use crate::{NODE_VERSION, NodeError};
 
 /// The control socket path the node dials (§3.1).
 pub const CONTROL_PATH: &str = "/node";
+/// Where a data stream dials (§8): `/node/stream/<streamId>`.
+pub const STREAM_PATH: &str = "/node/stream";
 /// The pairing endpoint (§2.3).
 pub const PAIR_PATH: &str = "/node/pair";
 
@@ -378,6 +380,25 @@ fn clip(text: &str, max: usize) -> String {
 /// (decision D1.3).
 pub fn control_socket_url(brain_url: &str) -> Result<String, NodeError> {
     rewrite_url(brain_url, "ws", "wss", CONTROL_PATH)
+}
+
+/// The data-stream socket for one granted stream (§8): the same rewrite rules
+/// as [`control_socket_url`], with the stream id appended.
+///
+/// The token is **not** part of this URL — it rides the `Authorization` header,
+/// because a URL is written to every access log and the token is a credential.
+pub fn stream_socket_url(brain_url: &str, stream_id: &str) -> Result<String, NodeError> {
+    if stream_id.trim().is_empty() {
+        return Err(NodeError::config(
+            "a data stream needs a stream id; the brain's grant carried none".to_string(),
+        ));
+    }
+    rewrite_url(
+        brain_url,
+        "ws",
+        "wss",
+        &format!("{STREAM_PATH}/{stream_id}"),
+    )
 }
 
 /// The pairing endpoint for a brain URL (§2.3): same rules as

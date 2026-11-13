@@ -289,6 +289,20 @@ enum BackupCommand {
         /// A directory `backup create` wrote.
         dir: PathBuf,
     },
+    /// Replace a data dir with a backup. Refused while a brain holds the
+    /// database open, and it takes a safety backup of what it replaces first.
+    Restore {
+        /// A directory `backup create` wrote and `backup verify` accepted.
+        dir: PathBuf,
+        /// The data dir to replace. Defaults to `--data-dir`, then `./data` —
+        /// the same resolution `backup create` uses, so the two commands agree
+        /// about which directory is the brain's.
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        /// Print the report as JSON instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -511,6 +525,11 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
         Command::Backup { command } => match command {
             BackupCommand::Create { out } => cmd_backup_create(cli, out.clone()).await,
             BackupCommand::Verify { dir } => cmd_backup_verify(cli, dir.clone()).await,
+            BackupCommand::Restore {
+                dir,
+                data_dir,
+                json,
+            } => cmd_backup_restore(cli, dir.clone(), data_dir.clone(), *json).await,
         },
         Command::Shutdown => cmd_shutdown(cli).await,
     }
@@ -1313,6 +1332,104 @@ async fn cmd_backup_create(cli: &Cli, out: PathBuf) -> Result<i32> {
     printer.line(&format!(
         "  verified: integrity_check={} · manifest matched the snapshot",
         verify.integrity_check
+    ))?;
+    Ok(0)
+}
+
+/// `swarmbot backup restore DIR [--data-dir DIR]`
+///
+/// The one command in this CLI that **deletes** something, so its refusals are
+/// the interesting part:
+///
+/// * a backup that does not verify is refused, and nothing is touched;
+/// * a data dir another process holds the database open in is refused, because a
+///   running brain keeps writing to the old inode and can overwrite the restored
+///   file — see `store::restore`'s module docs;
+/// * `--brain` is refused outright: the database is on the daemon's machine, and
+///   this command operates on files, not on an API.
+///
+/// It always takes a safety backup of what it replaces and prints where that
+/// went, so a restore of the wrong snapshot has a way back.
+async fn cmd_backup_restore(
+    cli: &Cli,
+    dir: PathBuf,
+    data_dir: Option<PathBuf>,
+    json: bool,
+) -> Result<i32> {
+    if let Some(url) = &cli.brain {
+        return Err(anyhow!(
+            "`backup restore` replaces files on this machine, but --brain points at the brain at \
+             {url}: its data directory is on that machine. Run `swarmbot backup restore` there \
+             (with its --data-dir), after stopping that brain, or drop --brain to restore here"
+        ));
+    }
+    let data_dir = data_dir.unwrap_or_else(|| data_dir_for(cli));
+    let report = tokio::task::spawn_blocking({
+        let dir = dir.clone();
+        let data_dir = data_dir.clone();
+        move || swarmbot_store::restore::restore(&dir, &data_dir)
+    })
+    .await
+    .map_err(|err| anyhow!("the restore task stopped: {err}"))?
+    .map_err(|err| anyhow!("{err}"))?;
+
+    let mut printer = stdout_printer(cli, json);
+    if json {
+        let body = format!(
+            "{{\"from\": {},\"data_dir\": {},\"safety\": {},\"removed_wal\": {},\"removed_shm\": {},\"bots\": {}}}",
+            serde_json::to_string(&report.from.display().to_string())?,
+            serde_json::to_string(&report.data_dir.display().to_string())?,
+            serde_json::to_string(
+                &report
+                    .safety
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            )?,
+            report.removed_wal,
+            report.removed_shm,
+            report.tables.get("bots").copied().unwrap_or(0),
+        );
+        printer.line(&body)?;
+        return Ok(0);
+    }
+    printer.line(&format!(
+        "restored {} → {}",
+        report.from.display(),
+        report.data_dir.display()
+    ))?;
+    printer.line(&format!(
+        "  snapshot {} ({} bytes, schema v{})",
+        report.manifest.database, report.manifest.database_bytes, report.manifest.schema_version
+    ))?;
+    printer.line(&format!(
+        "  transcripts {} files ({} bytes)",
+        report.manifest.transcript_files, report.manifest.transcript_bytes
+    ))?;
+    if report.removed_wal || report.removed_shm {
+        // Worth a line of its own: a stale `-wal` left next to a replaced
+        // database is replayed onto it at the next open, which would silently
+        // undo the restore.
+        printer.line(
+            "  removed the old write-ahead log (a stale one would be replayed onto the restored \
+             database)",
+        )?;
+    }
+    match &report.safety {
+        Some(safety) => printer.line(&format!(
+            "  the previous data dir is at {} — `swarmbot backup restore {}` puts it back",
+            safety.display(),
+            safety.display()
+        ))?,
+        None => printer.line("  there was no previous data dir, so nothing was replaced")?,
+    }
+    printer.line(&format!(
+        "  rows {}",
+        report
+            .tables
+            .iter()
+            .map(|(table, count)| format!("{table}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     ))?;
     Ok(0)
 }

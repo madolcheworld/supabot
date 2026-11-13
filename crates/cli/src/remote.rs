@@ -969,7 +969,6 @@ fn kind_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::OpenAiCompat => "open_ai_compat",
         BackendKind::ClaudeCli => "claude_cli",
-        BackendKind::CodexAppServer => "codex_app_server",
         BackendKind::Acp => "acp",
         BackendKind::Fake => "fake",
     }

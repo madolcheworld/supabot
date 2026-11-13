@@ -28,6 +28,16 @@ if [ -z "${VK_ICD_FILENAMES:-}" ]; then
         export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json"
     elif [ -f /usr/share/vulkan/icd.d/lvp_icd.x86_64.json ]; then
         export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
+    elif [ -f /usr/share/vulkan/icd.d/lvp_icd.json ]; then
+        export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/lvp_icd.json"
+    else
+        # Neither a reachable NVIDIA device nor the llvmpipe ICD. Saying nothing
+        # here would leave the reader to discover it as `swarmbot-ui` panicking
+        # with "Unable to init GPU context: NoSupportedDeviceFound" — which
+        # reads like a bug in the app. It is a missing driver: the fix is
+        # `sudo pacman -S vulkan-swrast` (or the distro's Mesa software Vulkan
+        # package). Everything except the window runs without it.
+        echo "VK_ICD_FILENAMES unset: no Vulkan ICD found; swarmbot-ui cannot open a window" >&2
     fi
 fi
 

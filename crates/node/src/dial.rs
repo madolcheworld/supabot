@@ -35,7 +35,9 @@ use swarmbot_node_protocol::tokio_tungstenite::tungstenite::http::header::{
 use swarmbot_node_protocol::tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use swarmbot_node_protocol::tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
 use swarmbot_node_protocol::tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use swarmbot_node_protocol::tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use swarmbot_node_protocol::tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+};
 use swarmbot_node_protocol::{CLOSE_REVOKED, PROTOCOL_VERSION, ProtocolError, unix_ms_now};
 
 use crate::NODE_VERSION;
@@ -131,6 +133,19 @@ pub async fn connect(
     url: &str,
     authorization: &str,
 ) -> Result<(NodeSocket, Arc<AtomicU16>), NodeError> {
+    connect_trusting(url, authorization, None).await
+}
+
+/// [`connect`] with extra trust anchors for `wss://`/`https://`.
+///
+/// The system roots are **added to**, never replaced: a publicly-signed brain
+/// keeps working with no configuration, and `brain_ca` exists for a brain behind
+/// a private CA (which is exactly how this project's own TLS test runs, D9.25).
+pub async fn connect_trusting(
+    url: &str,
+    authorization: &str,
+    brain_ca: Option<&std::path::Path>,
+) -> Result<(NodeSocket, Arc<AtomicU16>), NodeError> {
     let mut request = url
         .into_client_request()
         .map_err(|error| NodeError::Unreachable {
@@ -154,13 +169,16 @@ pub async fn connect(
         })?;
         request.headers_mut().insert(header, value);
     }
-    let (stream, response) =
-        connect_async(request)
-            .await
-            .map_err(|error| NodeError::Unreachable {
-                url: url.to_string(),
-                reason: error.to_string(),
-            })?;
+    let connector = match brain_ca {
+        Some(path) => Some(extra_roots_connector(path)?),
+        None => None,
+    };
+    let (stream, response) = connect_async_tls_with_config(request, None, false, connector)
+        .await
+        .map_err(|error| NodeError::Unreachable {
+            url: url.to_string(),
+            reason: error.to_string(),
+        })?;
     // The URL is logged, never the Authorization header: it carries a signature
     // over a fresh nonce, which is not a secret worth keeping but is also not
     // anybody's business.
@@ -175,7 +193,59 @@ pub async fn connect(
     ))
 }
 
-/// How one dial ended.
+/// A rustls connector that trusts the system roots **and** the PEM bundle at
+/// `path`.
+///
+/// `add_parsable_certificates` is the right call for a bundle: an operator's file
+/// may hold several roots (a CA plus an intermediate), and one unparsable entry
+/// must not throw the rest away — but a bundle that yields **zero** usable
+/// certificates is a configuration mistake and says so, naming the file. Silently
+/// falling back to the system roots would turn "my private CA is not trusted" into
+/// a handshake failure that blames the brain.
+fn extra_roots_connector(path: &std::path::Path) -> Result<Connector, NodeError> {
+    use tokio_rustls::rustls::pki_types::pem::PemObject as _;
+
+    // rustls panics rather than returning an error when it cannot pick a provider
+    // (two providers' features are on in this workspace), so it must be installed
+    // before any config is built — and this is the same helper the brain's
+    // listener calls (D9.25).
+    swarmbot_node_protocol::ensure_crypto_provider().map_err(NodeError::config)?;
+
+    let file = std::fs::File::open(path).map_err(|error| {
+        NodeError::config(format!(
+            "cannot open the brain CA bundle `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    let mut parsed = 0usize;
+    for cert in tokio_rustls::rustls::pki_types::CertificateDer::pem_reader_iter(&mut reader) {
+        let der = cert.map_err(|error| {
+            NodeError::config(format!(
+                "`{}` holds a certificate that cannot be parsed: {error}",
+                path.display()
+            ))
+        })?;
+        // A root already present is not an error: a bundle that names the same CA
+        // twice, or one the system store also holds, is still a usable bundle.
+        if roots.add(der).is_ok() {
+            parsed += 1;
+        }
+    }
+    if parsed == 0 {
+        return Err(NodeError::config(format!(
+            "`{}` holds no usable PEM certificate, so trusting it would change nothing",
+            path.display()
+        )));
+    }
+    let config = tokio_rustls::rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Connector::Rustls(std::sync::Arc::new(config)))
+}
+
+/// How one dial ended./// How one dial ended.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionEnd {
     /// The socket closed. `close_code` is what the peer sent, if anything.
@@ -377,14 +447,15 @@ pub async fn session(
     // A fresh nonce per dial (§3.1): the brain burns it in its replay cache, so
     // reusing one would be refused as a replay.
     let (authorization, nonce) = runtime.identity.upgrade()?;
-    let (socket, close_code) = match connect(url, &authorization).await {
-        Ok(pair) => pair,
-        Err(error) => {
-            return Ok(SessionEnd::Failed {
-                reason: error.to_string(),
-            });
-        }
-    };
+    let (socket, close_code) =
+        match connect_trusting(url, &authorization, runtime.config.brain_ca.as_deref()).await {
+            Ok(pair) => pair,
+            Err(error) => {
+                return Ok(SessionEnd::Failed {
+                    reason: error.to_string(),
+                });
+            }
+        };
     let handler = NodeHandler::new(Arc::clone(&runtime), nonce);
     let peer = Peer::new(
         socket,

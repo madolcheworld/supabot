@@ -779,6 +779,20 @@ impl ToolCallRepo for MemoryStore {
         );
         Ok(())
     }
+
+    fn prune_tool_calls(&self, before: DateTime<Utc>) -> Result<u64, DomainError> {
+        let mut calls = guard(&self.tool_calls)?;
+        let stale: Vec<(TurnId, ToolCallId)> = calls
+            .iter()
+            .filter(|(_, record)| record.created_at < before)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let removed = stale.len() as u64;
+        for key in stale {
+            calls.remove(&key);
+        }
+        Ok(removed)
+    }
 }
 
 impl EventLog for MemoryStore {

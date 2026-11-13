@@ -22,6 +22,42 @@ use url::Url;
 
 use swarmbot_contracts::{BRAIN_SIGN_PREFIX, NODE_SIGN_PREFIX};
 
+/// Install rustls' process-wide crypto provider, once, and say whether one is
+/// available (D9.25).
+///
+/// **Why this is a shared function and not a line in each TLS endpoint.** rustls
+/// can choose a provider automatically only when exactly one of its
+/// `aws-lc-rs`/`ring` features is enabled. In this workspace **both** are, because
+/// `reqwest` and `tokio-tungstenite` each turn one on and Cargo features are
+/// additive — so `ClientConfig::builder()` and `ServerConfig::builder()` *panic*
+/// with "Could not automatically determine the process-level CryptoProvider"
+/// instead of returning an error. That panic was found the hard way twice: once in
+/// the brain's listener, and once in the node's `--brain-ca` connector — the second
+/// only under the full gate, because a standalone test run had already installed a
+/// provider earlier in the process. Two copies of this function would drift the
+/// same way; both endpoints call this one.
+///
+/// A second call is not an error: whichever provider was installed first is the
+/// process default and stays it, so `install_default`'s `Err` is ignored on
+/// purpose. The provider named here is `aws_lc_rs`, the one this build exposes
+/// (`rustls`'s `ring` module is compiled out).
+///
+/// Returns an error rather than panicking when no provider can be had, so a
+/// caller can report it as a typed failure at start-up.
+pub fn ensure_crypto_provider() -> Result<(), String> {
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        return Err(
+            "no rustls crypto provider is installed, so TLS cannot start; this build installs \
+             `aws-lc-rs` itself, so reaching this means another crate cleared it"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Node revoked or unknown key: do not redial until re-paired (§3.2 table).
 pub const CLOSE_REVOKED: u16 = 4401;
 /// `node.hello` failed (§3.2 table).
@@ -30,6 +66,12 @@ pub const CLOSE_HELLO_FAILED: u16 = 4403;
 pub const CLOSE_NO_PROTOCOL: u16 = 4426;
 /// A newer connection replaced this one; the brain asked us to go (§3.2).
 pub const CLOSE_REPLACED: u16 = 4000;
+/// A data-stream dial was refused: unknown id, expired token or wrong token
+/// (§8). Distinct from [`CLOSE_REVOKED`] on purpose — a stream socket is a
+/// different socket from the control one, and a node that mistook this for a
+/// revocation would stop redialing its control socket and go silent for a bad
+/// token.
+pub const CLOSE_STREAM_REFUSED: u16 = 4405;
 
 /// The auth scheme of the upgrade header (§3.1) — ours, not OpenBot's.
 pub const AUTH_SCHEME: &str = "SwarmBot-Node v1";
@@ -457,6 +499,39 @@ pub fn brain_origin_from_url(url: &str) -> Result<String, AuthError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The provider must be installable **before** any rustls config is built, and
+    /// asking for it twice must be fine.
+    ///
+    /// This is a regression test with a specific history: `ClientConfig::builder()`
+    /// and `ServerConfig::builder()` **panic** in this workspace because two
+    /// providers' features are on at once (`reqwest` and `tokio-tungstenite` each
+    /// enable one, and Cargo features are additive). The brain's listener was fixed
+    /// first; the node's `--brain-ca` connector still panicked, and it only showed
+    /// up under the **full gate** — a standalone test run had already installed a
+    /// provider earlier in the same process, so the panic needed a fresh process to
+    /// reproduce. That is exactly the shape of bug a unit test can pin cheaply, so
+    /// here it is: call the helper, then build a config from *each* side.
+    #[test]
+    fn the_crypto_provider_is_installed_and_a_config_can_be_built_from_both_sides() {
+        ensure_crypto_provider().expect("the provider installs");
+        // Calling it again is the normal case (brain, node, and a test in one
+        // process) and must not fail.
+        ensure_crypto_provider().expect("a second install is a no-op");
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "the process has a provider, so the builders below cannot panic"
+        );
+        // The two builders that used to panic. Building them is the assertion:
+        // reaching the next line at all is the proof.
+        let _client = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        // A server config needs a certificate; the *builder chain* is what matters
+        // here, so `builder()` alone is called and the missing-cert error (if any)
+        // is irrelevant — the panic happened in `builder()`, not in `with_single_cert`.
+        let _server = rustls::ServerConfig::builder().with_no_client_auth();
+    }
     use super::*;
     use ed25519_dalek::SigningKey;
 
@@ -829,5 +904,6 @@ mod tests {
         assert_eq!(CLOSE_HELLO_FAILED, 4403);
         assert_eq!(CLOSE_NO_PROTOCOL, 4426);
         assert_eq!(CLOSE_REPLACED, 4000);
+        assert_eq!(CLOSE_STREAM_REFUSED, 4405);
     }
 }

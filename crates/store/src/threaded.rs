@@ -922,6 +922,13 @@ impl ToolCallRepo for ThreadedStore {
         let record = record.clone();
         self.write(move |store| store.insert_tool_call(&record))
     }
+
+    /// A prune is a **write**: it goes down the writer lane, so it cannot run
+    /// concurrently with another mutation inside the store — and so a caller
+    /// cannot observe the half-deleted state a read lane might serve mid-statement.
+    fn prune_tool_calls(&self, before: DateTime<Utc>) -> Result<u64, DomainError> {
+        self.write(move |store| store.prune_tool_calls(before))
+    }
 }
 
 impl EventLog for ThreadedStore {

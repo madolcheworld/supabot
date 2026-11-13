@@ -279,6 +279,45 @@ pub async fn serve(
     internal: Option<TcpListener>,
     options: ServeOptions,
 ) -> anyhow::Result<()> {
+    serve_public(state, public, None, internal, options).await
+}
+
+/// [`serve`] over TLS (D9.25): the same router, the same middleware, the same
+/// shutdown path, with every connection terminated by `tls` first.
+///
+/// The certificate is loaded **here**, before the listener is announced, so a
+/// brain with an unreadable certificate fails at start-up naming the file instead
+/// of coming up and failing every handshake.
+pub async fn serve_tls(
+    state: AppState,
+    public: TcpListener,
+    tls: crate::tls::TlsPaths,
+    internal: Option<TcpListener>,
+    options: ServeOptions,
+) -> anyhow::Result<()> {
+    // Loaded before anything is spawned: a bad certificate is a start-up error
+    // naming the file, never a connection that fails its handshake later.
+    let config = tls.load()?;
+    serve_public(state, public, Some((config, tls)), internal, options).await
+}
+
+/// The one body both entry points share.
+///
+/// `tls` is `Some` exactly when the public listener is encrypted; the internal
+/// listener is **always** plaintext, because it is loopback-only and reached by a
+/// harness on the same machine (`config::validate_internal_addr` is what makes
+/// that true) — wrapping it in TLS would add a certificate a local harness has no
+/// reason to trust.
+async fn serve_public(
+    state: AppState,
+    public: TcpListener,
+    tls: Option<(
+        Arc<tokio_rustls::rustls::ServerConfig>,
+        crate::tls::TlsPaths,
+    )>,
+    internal: Option<TcpListener>,
+    options: ServeOptions,
+) -> anyhow::Result<()> {
     let public_addr = public
         .local_addr()
         .context("cannot read the bound address")?;
@@ -295,18 +334,35 @@ pub async fn serve(
         }
         None => None,
     };
-    info!(
-        listener = %public_addr,
-        "the public listener is up: REST, /ws/live and the node gateway"
-    );
+    match &tls {
+        Some((_, paths)) => crate::tls::log_enabled(paths, public_addr),
+        None => info!(
+            listener = %public_addr,
+            "the public listener is up: REST, /ws/live and the node gateway"
+        ),
+    }
 
     let serving = state.clone();
-    let public_task = tokio::spawn(async move {
-        axum::serve(public, app(serving.clone()))
+    // Two shapes of the same request. The TLS arm builds a `TlsListener` and
+    // hands *that* to `axum::serve`, which is generic over `Listener` — so the
+    // router, the layers and the shutdown future are shared, not duplicated.
+    let public_task = match tls {
+        Some((config, _)) => tokio::spawn(async move {
+            axum::serve(
+                crate::tls::TlsListener::new(public, config),
+                app(serving.clone()),
+            )
             .with_graceful_shutdown(async move { serving.wait_for_shutdown().await })
             .await
-            .context("the public listener failed")
-    });
+            .context("the TLS public listener failed")
+        }),
+        None => tokio::spawn(async move {
+            axum::serve(public, app(serving.clone()))
+                .with_graceful_shutdown(async move { serving.wait_for_shutdown().await })
+                .await
+                .context("the public listener failed")
+        }),
+    };
 
     let internal_task = internal.map(|listener| {
         let serving = state.clone();

@@ -21,6 +21,10 @@ swarmbot-llm = { workspace = true }
 swarmbot-tools = { workspace = true }
 swarmbot-mcp = { workspace = true }
 swarmbot-store = { workspace = true }
+# TLS termination for the public listener (D9.25). Both were already in the lock
+# as transitive dependencies; naming them here adds no package to the graph.
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 swarmbot-node-protocol = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }

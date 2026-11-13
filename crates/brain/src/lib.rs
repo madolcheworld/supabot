@@ -54,6 +54,7 @@ pub mod routes;
 pub mod server;
 pub mod state;
 pub mod telemetry;
+pub mod tls;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -72,6 +73,7 @@ pub use gateway::{Connected, NodeGateway, RecordedDecision};
 pub use server::{ServeOptions, app, bind, internal_app, serve};
 pub use state::AppState;
 pub use telemetry::{SecretRegistry, init_tracing};
+pub use tls::{TlsListener, TlsPaths};
 
 use crate::config::Resolved as ResolvedConfig;
 
@@ -306,7 +308,23 @@ impl Brain {
             Some(addr) if !addr.trim().is_empty() => Some(bind(addr).await?),
             _ => None,
         };
-        let outcome = server::serve(self.state.clone(), public, internal, options).await;
+        // TLS is decided by the resolved config, not by a separate entry point: a
+        // brain either serves `https://`/`wss://` for every client or plaintext,
+        // and which one it is should not depend on which function the caller
+        // picked.
+        let outcome = match self.resolved.config.tls.as_ref() {
+            Some(tls) => {
+                let paths = crate::tls::TlsPaths {
+                    cert: tls.cert.clone(),
+                    key: tls.key.clone(),
+                };
+                // A bad certificate must fail *before* the swarm is told it is
+                // serving; `serve_tls` loads it first and returns the typed error
+                // naming the file.
+                server::serve_tls(self.state.clone(), public, paths, internal, options).await
+            }
+            None => server::serve(self.state.clone(), public, internal, options).await,
+        };
         info!(
             step = "shutdown",
             "stopping the swarm: turns finish, nothing is left running"

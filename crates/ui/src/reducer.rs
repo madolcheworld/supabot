@@ -379,6 +379,15 @@ pub fn apply_result_at(state: &mut AppState, result: CommandResult, now: Instant
         CommandResult::RoutineRuns(_, Err(err)) => {
             fail(state, "could not load routine runs", &err, now)
         }
+        CommandResult::Usage(Ok(report)) => state.usage = Some(Ok(report)),
+        // Kept as a failure rather than folded into an empty report: "the fetch
+        // broke" and "no turn ran in this window" are different truths, and a
+        // screen that renders zeroes for both teaches the owner to distrust
+        // every number on it.
+        CommandResult::Usage(Err(err)) => {
+            state.usage = Some(Err(err.to_string()));
+            fail(state, "could not load usage", &err, now);
+        }
         CommandResult::Shutdown(Ok(())) => {}
         CommandResult::Shutdown(Err(err)) => fail(state, "shutdown failed", &err, now),
     }
@@ -489,6 +498,43 @@ mod tests {
             Err(message) => assert!(message.contains("boom"), "{message}"),
             Ok(models) => panic!("a failure must not cache as a list: {models:?}"),
         }
+    }
+
+    #[test]
+    fn a_usage_failure_is_cached_as_a_failure_not_as_an_empty_report() {
+        let mut state = AppState::new("http://brain.test");
+        assert!(state.usage.is_none(), "nothing fetched yet");
+
+        apply_msg(
+            &mut state,
+            WorkerMsg::Result(CommandResult::Usage(Err(ClientError::Transport {
+                url: "http://brain.test".into(),
+                reason: "connection refused".into(),
+            }))),
+        );
+        match state.usage.as_ref().expect("cached") {
+            Err(reason) => assert!(reason.contains("connection refused"), "{reason}"),
+            Ok(report) => panic!("a failure must not read as a report: {report:?}"),
+        }
+
+        // A later success replaces the failure — the screen is not stuck.
+        let report = swarmbot_contracts::UsageReport::from_turns(
+            chrono::Utc::now() - chrono::Duration::hours(24),
+            chrono::Utc::now(),
+            &[],
+            |_| None,
+        );
+        apply_msg(
+            &mut state,
+            WorkerMsg::Result(CommandResult::Usage(Ok(report))),
+        );
+        assert!(
+            state
+                .usage
+                .as_ref()
+                .is_some_and(|u| u.as_ref().is_ok_and(|r| r.is_empty())),
+            "an empty window is an Ok report with zero turns, not an error"
+        );
     }
 
     fn drive(events: Vec<LiveEvent>) -> AppState {

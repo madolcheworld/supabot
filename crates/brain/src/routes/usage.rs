@@ -70,7 +70,13 @@ pub async fn get(
     // The window rule (inclusive `since`, `until` as an enforced upper bound,
     // a deleted bot keeping its unnamed row) lives in `UsageReport::window` so
     // the CLI's embedded mode cannot answer the same question differently.
-    let report = UsageReport::window(state.swarm.store.as_ref(), since, until)?;
+    // The facade, not the inline port: this route reads **every turn in the
+    // window** — potentially thousands of rows — so it is the last place that
+    // should park a runtime worker.
+    let store = state.async_store();
+    let report = store
+        .read(move |store| UsageReport::window(store, since, until))
+        .await?;
     Ok(Json(report))
 }
 

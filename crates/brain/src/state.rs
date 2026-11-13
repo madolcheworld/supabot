@@ -55,6 +55,19 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The store as an async caller should use it: a facade that runs a port call
+    /// on a blocking thread (`swarmbot_store::AsyncStore`).
+    ///
+    /// Use it from a route, a socket handler or anything else on the runtime —
+    /// `swarm.store.list_nodes()` there parks a tokio worker for the whole SQLite
+    /// call, and one call that lands in the busy wait then stalls every other task
+    /// on that worker. Blocking paths (composition, the CLI) keep using
+    /// `swarm.store` directly; `AsyncStore::blocking` is there for the places that
+    /// legitimately hold a thread.
+    pub fn async_store(&self) -> swarmbot_store::AsyncStore {
+        swarmbot_store::AsyncStore::new(Arc::clone(&self.swarm.store))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         swarm: Arc<Swarm>,

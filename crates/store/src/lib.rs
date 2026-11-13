@@ -24,17 +24,21 @@
 //! Nothing here ever panics: every failure is a
 //! [`DomainError`](swarmbot_contracts::DomainError).
 
+pub mod async_store;
 pub mod backup;
 pub mod contract;
 pub mod memory;
 pub mod mirror;
+pub mod restore;
 pub mod sqlite;
 pub mod threaded;
 
+pub use async_store::AsyncStore;
 pub use backup::{BackupError, BackupReport, Manifest, VerifyReport, backup, verify};
 pub use contract::run_contract_suite;
 pub use memory::MemoryStore;
 pub use mirror::JsonlMirror;
+pub use restore::{RestoreError, RestoreReport, open_holders, restore, safety_dir};
 pub use sqlite::SqliteStore;
 pub use threaded::ThreadedStore;
 

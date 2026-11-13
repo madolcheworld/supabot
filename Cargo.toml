@@ -79,6 +79,16 @@ reqwest = { version = "0.13.5", default-features = false, features = [
     "rustls",
 ] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+# TLS *termination* for the brain's public listener (D9.25). Both were already
+# resolved as transitive dependencies of `reqwest`/`tokio-tungstenite`, so naming
+# them here adds no package to the graph and does not rewrite the lock's contents
+# — only the `swarmbot-brain` entry that now depends on them.
+tokio-rustls = "0.26"
+rustls-pemfile = "2.2"
+# Named so `swarmbot-node-protocol` can install the process-wide crypto provider
+# that both TLS endpoints need (D9.25). Already in the lock as a transitive
+# dependency of `reqwest`/`tokio-tungstenite`, so no package is added to the graph.
+rustls = "0.23"
 eventsource-stream = "0.2.3"
 ureq = { version = "3.5.1", features = ["json"] }
 tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }

@@ -37,11 +37,14 @@ end-to-end proof is `crates/node/tests/real_brain.rs`: an in-process brain plus 
 **real `swarmbot-node` binary** as a child process, pairing and then serving a bound
 bot's `read_file` and `shell` calls over a real WebSocket (§11).
 
-**What does not exist yet:** the data-stream half — framing, stream kinds and the
-`/node/stream/:id` endpoint (M7, §8). Token minting and brokering are built; there
-is simply nothing to carry yet, and `NodeCall` has no stream-bearing variant, so no
-node can be asked for a pty, a tunnel or a file transfer. Everything else in the
-reference subset is implemented.
+**What the data-stream half covers now (§8):** tokens, stream kinds, framing and
+the `/node/stream/:id` endpoint are built, and `fs.download` sends a file over
+them — proven against the real node binary in the same `real_brain.rs`. **Nothing
+asks for a stream from the product side yet**: no route, tool or CLI command calls
+`fs.download`, so the feature is reachable through the protocol and not through a
+UI. A **pty** is not built at all: `pty.open` stays in the refused table, and
+`StreamKind::Pty` exists only so a foreign node has the vocabulary to be written
+against. Everything else in the reference subset is implemented.
 
 One fossil worth knowing about, because it looks like a contradiction:
 `routes/node_gateway.rs` still exports `NOT_YET` ("node pairing arrives in
@@ -61,7 +64,7 @@ node ──(2) WebSocket /node   Authorization: SwarmBot-Node v1 …────
          ◀── node.hello {brainSig} ──   (brain calls, node serves)
          ── node.requestApproval / node.event / node.heartbeat ──▶
                                                               (node calls, brain serves)
-node ──(3) WebSocket /node/stream/:id  Authorization: Bearer <token>─▶ brain   (§8, tokens only)
+node ──(3) WebSocket /node/stream/:id  Authorization: Bearer <token>─▶ brain   (§8)
 ```
 
 * One **control socket** per node, always dialed **out** by the node
@@ -623,11 +626,35 @@ failures use `FsError` with an errno-style `code` translated from the OS
 
 ## 8. Data streams `/node/stream/:id`
 
-**Token bookkeeping is implemented** (`streams.rs`); framing, stream kinds and the
-endpoint are **not** (M7). Nothing in this build pretends otherwise:
-`tools::NodeCall` has no stream-bearing variant, so a node cannot be asked for a
-pty, a tunnel or a file transfer, and `node.openStream` is in the refused table
-(§9).
+**The brain half is built and tested; the node half is not.** Specifically:
+
+| Piece | State |
+| --- | --- |
+| `mint_stream()` — 96-bit hex id, 128-bit base64url token, 30 s TTL | **built** |
+| `StreamBroker` — register / take-once / forget, constant-time compare | **built** |
+| `StreamKind` (`pty`, `transfer`) — fixed by the grant, never by the dialer | **built** |
+| `StreamFrame` — `data` / `ack` / `done` / `error`, with the caps below | **built** |
+| `GET /node/stream/:id` on the brain — dial, check, assemble, resolve | **built** (`brain/tests/streams.rs`, 4 tests over a real WebSocket) |
+| `StreamHub` — the ticket a caller waits on, `DIAL_TIMEOUT`/`IDLE_TIMEOUT`, `MAX_TRANSFER_BYTES` | **built** (`brain/src/gateway/streams.rs`, 10 unit tests) |
+| **A node that produces a stream** — `fs.download` dialing out and sending the file | **built** (`node/src/stream.rs`) |
+| A **caller**: a REST route or a tool that asks a node for a file | **not built** — nothing in the brain calls `fs.download` yet |
+
+**`fs.download` now works end to end**, proven against the real binaries in
+`crates/node/tests/real_brain.rs`:
+`a_real_node_streams_a_file_to_the_brain_over_a_data_stream` mints a grant on the
+real brain, makes the real `swarmbot-node` child read a file under its own policy
+and dial the stream socket, and asserts the bytes arrive unchanged (a NUL and a
+lone `0xff` in the fixture, so a text round trip would fail), that the digest the
+node claimed in its RPC answer equals the digest computed over the bytes that
+arrived, and that the node's own audit log recorded the read against the bot that
+asked. That test was mutation-checked: with the node's dial replaced by a no-op it
+fails on the ticket timeout.
+
+What is missing is only a **caller**. No route, tool or CLI command asks for a
+download yet, so the feature is reachable through the RPC and the protocol but not
+through the product — and nothing claims otherwise.
+
+### 8.1 Tokens (built)
 
 * `mint_stream() -> Result<StreamGrant, StreamError>` draws from the OS CSPRNG:
   `stream_id` is 96 bits as **24 hex characters** (it appears in the URL path),
@@ -635,20 +662,90 @@ pty, a tunnel or a file transfer, and `node.openStream` is in the refused table
   is `STREAM_TOKEN_TTL = 30 s` out. A failed RNG is a typed error, never a weak
   fallback.
 * `StreamBroker::register(&grant, kind)` records the grant **with its kind**;
-  `take(stream_id, token) -> Result<String /* kind */, TypedError>` consumes it.
+  `take(stream_id, token) -> Result<StreamKind, TypedError>` consumes it.
   Registering prunes expired entries first.
-* `take` is **single use** (the entry is removed on success) and answers
-  `StreamRefused` with a distinct reason for `unknown stream id`, `stream token
-  expired` and `wrong stream token`. Tokens are compared with `constant_time_eq`,
-  and a **wrong token deliberately does not remove the entry** — a guess must not
-  burn the legitimate token.
+* `take` is **single use** and answers `StreamRefused` with a distinct reason for
+  `unknown stream id`, `stream token expired` and `wrong stream token`. Tokens are
+  compared with `constant_time_eq`, and a **wrong token deliberately does not
+  remove the entry** — a guess must not burn the legitimate token.
 * `forget(stream_id)` drops a grant without consuming it, for the RPC that promised
   the stream but failed, so nobody dials a dead id. `len()` prunes then counts.
-* The endpoint shape (M7): the node dials `ws://<brain>/node/stream/<streamId>`
-  with `Authorization: Bearer <streamToken>`; the brain splices frames verbatim and
-  each kind defines its own framing (`pty`, `transfer` with ≤ 1 MiB chunks, a
-  `{"done":true,"sha256":…,"size":N}` terminator and `{"ack":N}` at least every
-  1 MiB, so neither side buffers a whole file).
+
+### 8.2 Framing (built)
+
+The socket is **text-only**, the same rule the control socket follows: one JSON
+object per WebSocket text frame, and a chunk is base64 rather than a binary frame
+so a foreign node has exactly one format to implement.
+
+| Frame | Shape | Meaning |
+| --- | --- | --- |
+| `data` | `{"t":"data","seq":N,"data":"<base64>"}` | Chunk `N` — `seq` starts at 0 and must arrive in order |
+| `ack` | `{"t":"ack","bytes":N}` | Cumulative bytes received, **not** per-chunk, so a lost ack cannot desynchronise the window |
+| `done` | `{"t":"done","sha256":"<hex>","size":N}` | The end of a `transfer`, naming the whole content |
+| `error` | `{"t":"error","code":"…","reason":"…"}` | A refusal that survives; a close frame would carry no reason |
+
+Caps, because the far end chooses how much it sends:
+
+* `MAX_CHUNK_BYTES = 1 MiB` per frame — enforced when **building** a frame (the
+  sender learns at the call site) and again when **decoding** one, on the *text*
+  length, before any buffer is allocated.
+* `ACK_EVERY_BYTES = 1 MiB` — the receiver acks at that boundary.
+* `MAX_IN_FLIGHT_BYTES = 2 MiB` — the sender's window.
+* `MAX_TRANSFER_BYTES = 64 MiB` in the brain's assembler: a larger transfer is a
+  typed failure until the receiving side spills to a file, because the
+  alternative is an unbounded allocation driven by the other machine.
+
+### 8.3 The endpoint (built)
+
+The node dials `ws://<brain>/node/stream/<streamId>` with
+`Authorization: SwarmBot-Node v1 <streamToken>` — **the header, never the query
+string**, because a URL ends up in every access log and this token is a
+credential.
+
+Three rules the handler follows, each of them a way the naive version goes wrong:
+
+* **the token is checked, and the kind comes from the grant.** A dialer cannot ask
+  for a different framing; `take` returns what the brain registered.
+* **the refusal has its own close code, `4405`.** Distinct from `4401` on purpose:
+  a node that mistook a bad stream token for a revocation would stop redialing its
+  *control* socket and go silent.
+* **a truncated stream is an error, not a short payload.** A socket that ends
+  before `Done` resolves the ticket with "the node closed the stream after N
+  frame(s) without finishing it". Assembling whatever arrived would hand the
+  caller a file that looks complete.
+
+### 8.3.1 The node's side (built)
+
+`node/src/stream.rs` dials `stream_socket_url(brain_url, stream_id)` — the URL is
+derived from the brain the node **paired with**, never from a payload, so a node
+cannot be aimed at a third machine by a frame. It sends chunks of at most
+`MAX_CHUNK_BYTES` and blocks whenever the un-acknowledged total would exceed
+`MAX_IN_FLIGHT_BYTES`, reading the brain's cumulative `ack` frames to stay inside
+the window (and an `error` frame aborts the transfer rather than being logged and
+ignored). The last frame is `done {sha256, size}` computed by this side over
+exactly what it sent.
+
+The handler in `node/src/handlers.rs` orders the steps so a refusal costs nothing:
+**resolve → gate → read → dial.** A node that dialled first would spend the
+brain's one-time token on a read it is about to refuse, and leave the brain's
+socket task waiting on a transfer that never comes. The RPC answers only after the
+bytes have been sent, because `{size, sha256}` in that answer is a claim the brain
+checks against what arrived.
+
+### 8.4 What a caller does (built, unused)
+
+```text
+ticket = hub.open(StreamKind::Transfer)        // mint + register, before the RPC
+rpc(node, "fs.download", {path, streamId: ticket.stream_id, streamToken: ticket.token})
+bytes  = hub.receive(ticket).await?            // resolved by the socket, not by the RPC
+```
+
+`open` comes **before** the RPC on purpose: a node on a fast link can dial before
+the brain has recorded what it is waiting for, and an unregistered dial is
+refused, not queued. `receive` then checks the assembled digest against the
+`sha256`/`size` the node put in its RPC answer — the claim and the payload are
+verified against each other, so a node that lies or a link that drops a frame is a
+detected failure.
 
 ## 9. Refusals: what this build answers for what it does not do
 
@@ -661,8 +758,9 @@ silent drop (D0.4):
 | a method nobody defines | the dispatcher's own `PolicyRefused { reason: "unknown method" }` — a different message on purpose, so "this team cannot do that" is distinguishable from "that is not a thing" |
 | a capability the node did not declare, or the owner did not approve | the tool is not offered to the model at all (`ToolRegistry::visible_specs`), and a call that arrives anyway is `NodeUnavailable` on the brain side |
 | a path outside the roots, or inside the deny list | `PathDenied` with a reason that reads on its own |
+| a data-stream dial with an unknown id, an expired token or a wrong token | the socket is accepted, then closed with **`4405`** and the reason in the close frame (§8.3) — not `4401`, so a bad token never looks like a revocation |
 
-The refused set is `rpc::UNIMPLEMENTED_METHODS` — `fs.download`, `fs.upload`,
+The refused set is `rpc::UNIMPLEMENTED_METHODS` — `fs.upload`,
 `pty.open`, `tunnel.open`, `service.start`, `service.stop`, `forward.listen`,
 `browser.ensure`, `browser.action`, `browser.screencast`, `browser.input`,
 `lease.set`, `desktop.ensure`, `desktop.stop`, `computer.act`, `computer.stream`,

@@ -246,6 +246,20 @@ pub trait ToolCallRepo: Send + Sync {
         call: &ToolCallId,
     ) -> Result<Option<ToolCallRecord>, DomainError>;
     fn insert_tool_call(&self, record: &ToolCallRecord) -> Result<(), DomainError>;
+    /// Delete the idempotency rows created before `before`; return how many.
+    ///
+    /// `tool_calls` stores one row per (turn, call) with **the full result
+    /// text**, and nothing ever removed one: it is the last unbounded table in
+    /// the schema (the live-event log and stale routine runs have their own
+    /// housekeeping). It exists for exactly one purpose — a harness may replay a
+    /// call id after a resume — so a row is useful for as long as that replay is
+    /// plausible, and a liability afterwards.
+    ///
+    /// The rule is **age, not count**: a count-based bound would delete today's
+    /// rows on a busy day and keep a month of them on a quiet one, and the thing
+    /// that makes a replay plausible is time, not volume. Both stores must
+    /// answer identically, which the contract suite pins.
+    fn prune_tool_calls(&self, before: DateTime<Utc>) -> Result<u64, DomainError>;
 }
 
 /// The append-only change log that live clients resume from.
@@ -722,6 +736,10 @@ mod tests {
         ) -> Result<Option<ToolCallRecord>, DomainError> {
             Ok(None)
         }
+        fn prune_tool_calls(&self, _: DateTime<Utc>) -> Result<u64, DomainError> {
+            Ok(0)
+        }
+
         fn insert_tool_call(&self, _: &ToolCallRecord) -> Result<(), DomainError> {
             Ok(())
         }

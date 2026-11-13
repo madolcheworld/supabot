@@ -68,7 +68,7 @@ Rules that follow from the split:
 | `pkg-config xkbcommon-x11` missing, `libxkbcommon-x11.so.0` present | `scripts/env.sh` creates `.cargo-home/link-shim/libxkbcommon-x11.so` → the runtime `.so.0` and exports `LIBRARY_PATH`. `LIBRARY_PATH` (unlike `RUSTFLAGS`) does not invalidate the cargo cache, so only the final link is redone. The clean fix is `sudo dnf install libxkbcommon-x11-devel` |
 | `gpui`'s build script runs `bindgen`; `libclang.so.22.1` exists without an unversioned `libclang.so` | `scripts/env.sh` exports `LIBCLANG_PATH=/usr/lib64` |
 | `gpui → gpui_http_client → zed-async-tar → xattr 0.2`, and `xattr 0.2.3` no longer compiles against modern `libc` (`ENOATTR` is `ENODATA` on Linux); it is an optional dep enabled by a default feature a downstream workspace cannot turn off | `vendor/xattr` is the crate with a one-line patch, wired in by `[patch.crates-io]` in the root `Cargo.toml`. See [`../vendor/xattr/VENDORED.md`](../vendor/xattr/VENDORED.md) |
-| no `/dev/dri`, no `/dev/nvidia*` from this session; `nvidia-smi` cannot reach the driver (GPU is a GTX 1660 SUPER) | Vulkan enumerates only Mesa `llvmpipe` (apiVersion 1.4.354). `scripts/env.sh` sets `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json` to make device selection deterministic. **The window opens and renders through llvmpipe** — correct, but CPU-rendered, so expect modest frame rates |
+| no `/dev/dri`, no `/dev/nvidia*` from this session; `nvidia-smi` cannot reach the driver (GPU is a GTX 1660 SUPER) | **As re-checked on 2026-11-13 this is now a hard blocker, not a slow path.** `/usr/share/vulkan/icd.d/` holds only `nvidia_icd.json` (unusable without `/dev/nvidia0`) and `vulkan-swrast` is not installed, so **no ICD enumerates and `swarmbot-ui` panics with `Unable to init GPU context: NoSupportedDeviceFound` before it can open a window**. It used to render through llvmpipe here; the software Vulkan driver has since gone missing from the machine. `scripts/env.sh` now says so on stderr instead of leaving `VK_ICD_FILENAMES` unset and letting the panic look like an app bug. Fix on the box: `sudo pacman -S vulkan-swrast` (or the distro's Mesa software-Vulkan package). Everything except painting — the reducer, the views' logic, `cargo test` — runs without it |
 | `pkg-config vulkan` missing, `libvulkan.so.1` present | enough: blade loads the Vulkan library at runtime |
 | the crate has a `runtime_shaders` feature (off by default) | enables it for shader iteration without a build-time shader toolchain; leave it off for normal builds |
 | `swarmbot-ui` is **not** in the workspace `default-members` | plain `cargo build`/`cargo test` skip it (its dependency chain is minutes long); `--workspace`, `scripts/check.sh` include it, `scripts/check.sh --fast` excludes it again |
@@ -92,6 +92,7 @@ id → hue → `#rrggbb`) unless the roster names one.
 | Cards | `view/cards.rs` | approval (Allow once / Always allow / Deny, reason, expiry countdown), question (`ask_user` fields), handoff (Done / Skip) | `RequestUpsert` → `POST /api/requests/:id/respond` |
 | Nodes | `view/nodes.rs` | an 8-character pairing code (large, copyable, 10-minute TTL), the node list (label, platform, roots, effective capabilities = declared ∩ approved, ceiling, online), Revoke, the `swarmbot-node pair …` line to copy | `NodeUpsert`, `NodePresence` |
 | Settings | `view/settings.rs` | per-bot backend (base url, model, `extra_body` / `extra_headers` for a gateway's own parameters such as an inferhub bid, a masked key field), a **Probe** button showing `BackendStatus` verbatim, safety ceilings, the `bot_messaging` kill switch, `max_hops`, `max_tool_rounds`, the roster | `Snapshot`, settings RPCs |
+| Usage | `view/usage.rs` | `GET /api/usage` for a 24h / 7d / 30d window: totals (tokens, model calls, tool calls), a per-bot table with the biggest spender first, and the turn count. Read-only; three states kept apart (`not fetched`, `failed` with a retry, `a report`) | — (REST only; spend is not a live event) |
 | Palette | `view/palette.rs` | `ctrl-k`: jump to a bot, conversation or screen | — |
 
 Mapping rules worth stating, because they are where a UI usually lies. The first
@@ -279,9 +280,15 @@ are the same code.
 
 ## 10. What is not verified
 
-* **Frame rates under llvmpipe.** The window opens and paints (§2), but this session
-  has no GPU device nodes, so nobody has measured the app on a real GPU — or under
-  a long transcript on a software rasterizer.
+* **Painting, at all, on this machine as of 2026-11-13.** The window used to open
+  and paint through llvmpipe; §2 records that the software Vulkan driver is now
+  missing, so `--selftest` compiles, drives the reducer, and then cannot open a
+  window. Every screen's *logic* is covered by `cargo test -p swarmbot-ui`; no
+  screen's *pixels* were seen in this round. Anything below that says "renders"
+  was true when it was written and has not been re-checked since.
+* **Frame rates under llvmpipe.** Even when it rendered (§2), this session has no
+  GPU device nodes, so nobody has measured the app on a real GPU — or under a
+  long transcript on a software rasterizer.
 * **A real brain round trip from this app.** The tests use the scripted `Brain`
   double; `--offline --spawn-brain` exercises the real client against a real brain,
   but only by hand.

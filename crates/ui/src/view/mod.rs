@@ -18,6 +18,7 @@ pub mod routines;
 pub mod settings;
 pub mod side_panel;
 pub mod sidebar;
+pub mod usage;
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -1624,6 +1625,7 @@ impl Render for Root {
                 &self.routine_prompt,
             ),
             Screen::Settings => settings::render(s, &self.state, &self.commands),
+            Screen::Usage => usage::render(s, &self.state, &self.commands),
         };
 
         // The one renderer of `state.toast` and `state.conn`, above the main

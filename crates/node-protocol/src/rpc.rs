@@ -46,6 +46,10 @@ pub const FS_GREP: &str = "fs.grep";
 pub const FS_MKDIR: &str = "fs.mkdir";
 pub const FS_MOVE: &str = "fs.move";
 pub const FS_REMOVE: &str = "fs.remove";
+/// A file's bytes, sent over a **data stream** rather than the control socket
+/// (§8). The RPC itself carries no content: it names the grant, the node opens
+/// the stream socket, and the RPC answers with the digest of what it sent.
+pub const FS_DOWNLOAD: &str = "fs.download";
 /// The only streaming RPC in our subset (§4.6/§5.1).
 pub const SHELL_EXEC: &str = "shell.exec";
 
@@ -73,6 +77,7 @@ pub const IMPLEMENTED_METHODS: &[&str] = &[
     FS_MKDIR,
     FS_MOVE,
     FS_REMOVE,
+    FS_DOWNLOAD,
     SHELL_EXEC,
     NODE_REQUEST_APPROVAL,
     NODE_EVENT,
@@ -85,7 +90,6 @@ pub const IMPLEMENTED_METHODS: &[&str] = &[
 /// a bot's model learns "this team cannot do that" rather than "the node is
 /// broken".
 pub const UNIMPLEMENTED_METHODS: &[&str] = &[
-    "fs.download",
     "fs.upload",
     "pty.open",
     "tunnel.open",
@@ -403,6 +407,43 @@ pub struct FsRemove {
     pub recursive: Option<bool>,
 }
 
+// --- fs.download (§5.1 + §8, over a data stream) ----------------------------
+
+/// Ask a node to send one file over a freshly minted data stream (§8).
+///
+/// The grant travels **inside the RPC**, not on the stream socket: the node
+/// receives `{streamId, streamToken}` here, dials `ws://<brain>/node/stream/<id>`
+/// with the token as its bearer, and streams the bytes there. That inversion is
+/// the point — the brain mints, the node dials out, so a node behind NAT never
+/// needs an inbound port.
+///
+/// The token is a secret; it lives in this payload for one dial and expires in
+/// [`crate::streams::STREAM_TOKEN_TTL`]. Nothing logs it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsDownload {
+    pub inv: Invocation,
+    pub path: String,
+    /// 24 hex chars from [`crate::streams::mint_stream`].
+    pub stream_id: String,
+    /// The bearer that authorizes the dial. Single use.
+    pub stream_token: String,
+}
+
+/// What a node answers after it has **finished sending** the stream: the size
+/// and SHA-256 of what it actually sent, so the receiver can prove the bytes it
+/// assembled are the bytes the node read (§8).
+///
+/// The pair is the reason a transfer is not just "wrote some bytes and hoped":
+/// a truncated stream that ends without `Done`, or a `Done` whose digest does
+/// not match what arrived, is a detected failure on both sides.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsDownloadResult {
+    pub size: u64,
+    pub sha256: String,
+}
+
 // --- shell.exec (§5.1, streaming) -------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,6 +650,9 @@ mod tests {
         // Implemented methods are not refused...
         assert!(unimplemented(NODE_HELLO).is_none());
         assert!(unimplemented(FS_READ).is_none());
+        // `fs.download` is served: the brain mints the grant, the node dials
+        // and sends (§8, D9.21).
+        assert!(unimplemented(FS_DOWNLOAD).is_none());
         assert!(unimplemented(SHELL_EXEC).is_none());
         // ...and a name nobody ever defined is not "unimplemented" either —
         // the dispatcher answers that as an unknown method.

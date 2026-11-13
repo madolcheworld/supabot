@@ -44,6 +44,13 @@ libc = { workspace = true }
 # node's own config file is `<data>/node.toml`.
 reqwest = { workspace = true }
 toml = { workspace = true }
+# For `--brain-ca` (D9.25): a node talking to a brain behind a **private CA** has
+# to add that anchor to its client. `tokio-tungstenite` exposes the `Connector`
+# that accepts a `rustls::ClientConfig`, and building one needs rustls and a PEM
+# parser directly. Both were already in the lock as transitive dependencies of
+# `reqwest`/`tokio-tungstenite`, so this adds no package to the graph.
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 swarmbot-brain = { path = "../brain" }

@@ -26,14 +26,22 @@
 //!   `killpg` on interrupt/timeout/disconnect.
 //! * [`dial`] — the control socket: signed upgrade, exponential-backoff redial,
 //!   the 4401 stop, heartbeats.
+//! * [`stream`] — the data-stream dialer: `fs.download`'s bytes, sent with
+//!   backpressure and terminated by `{sha256, size}`.
 //! * [`state`] — the small live-state file `run` maintains and `status` reads.
 //!
 //! # What is *not* here
 //!
-//! No pty, no tunnels, no browser, no desktop, no file transfer. Every method
-//! the reference protocol names but this build does not implement answers with
+//! No pty, no tunnels, no browser, no desktop, no upload. Every method the
+//! reference protocol names but this build does not implement answers with
 //! [`swarmbot_node_protocol::rpc::unimplemented`] — a typed
 //! `PolicyRefused { retry: false }`, never a silent success and never a fake.
+//!
+//! **`fs.download` is implemented** and it is the one method whose bytes do not
+//! ride the control socket: [`stream`] dials the brain's `/node/stream/:id` with
+//! the one-time token the RPC carried, sends the file in bounded chunks, and
+//! answers only after the brain has acknowledged the last one. A node behind NAT
+//! still needs no inbound port: this crate only ever dials out.
 //!
 //! # Honesty note on `shell.exec`
 //!
@@ -63,6 +71,7 @@ pub mod handlers;
 pub mod identity;
 pub mod shell;
 pub mod state;
+pub mod stream;
 
 use std::path::PathBuf;
 

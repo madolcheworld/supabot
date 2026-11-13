@@ -17,10 +17,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
-
 use swarmbot_contracts::{BackendKind, BackendSpec, DomainError};
 
 use crate::acp::AcpAgent;
@@ -28,7 +24,7 @@ use crate::backend::{LlmBackend, LlmError};
 use crate::fake::FakeBackend;
 use crate::harness::ClaudeCli;
 use crate::openai::{HttpTransport, OpenAiCompat, ReqwestTransport};
-use crate::types::{BackendStatus, Capabilities, ChatRequest, ChatResponse, LlmEvent};
+use crate::types::BackendStatus;
 
 /// The id that is guaranteed to resolve, even with an empty config.
 pub const FAKE_BACKEND_ID: &str = "fake";
@@ -129,7 +125,6 @@ impl BackendRegistry {
                 // The fake needs nothing; the CLI harness uses the owner's
                 // own login, whose validity `probe` reports honestly.
                 BackendKind::Fake | BackendKind::ClaudeCli => true,
-                BackendKind::CodexAppServer => false,
             };
             let backend: Arc<dyn LlmBackend> = match spec.kind {
                 BackendKind::Fake => {
@@ -153,7 +148,6 @@ impl BackendRegistry {
                 )?),
                 BackendKind::ClaudeCli => Arc::new(ClaudeCli::from_spec(spec.clone())?),
                 BackendKind::Acp => Arc::new(AcpAgent::from_spec(spec.clone(), key)?),
-                BackendKind::CodexAppServer => Arc::new(Unimplemented::new(spec.clone())),
             };
             let info = BackendInfo {
                 id: spec.id.clone(),
@@ -257,65 +251,13 @@ fn resolve_key(spec: &BackendSpec, secrets: &BTreeMap<String, String>) -> Option
         .or_else(|| std::env::var(name).ok().and_then(non_empty))
 }
 
-/// Placeholder for a configured backend kind whose adapter is a later
-/// milestone: present in `list`/`probe_all`, honest in `chat`.
-struct Unimplemented {
-    spec: BackendSpec,
-}
-
-impl Unimplemented {
-    fn new(spec: BackendSpec) -> Self {
-        Self { spec }
-    }
-}
-
-#[async_trait]
-impl LlmBackend for Unimplemented {
-    fn id(&self) -> &str {
-        &self.spec.id
-    }
-
-    fn kind(&self) -> BackendKind {
-        self.spec.kind
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            streaming: false,
-            tool_calls: false,
-            reasoning: false,
-            steer: false,
-            survives_restart: false,
-        }
-    }
-
-    async fn chat(
-        &self,
-        _request: ChatRequest,
-        _events: mpsc::Sender<LlmEvent>,
-        _cancel: CancellationToken,
-    ) -> Result<ChatResponse, LlmError> {
-        Err(LlmError::Unavailable {
-            backend: self.spec.id.clone(),
-            reason: "codex_app_server backend is not implemented in this milestone".to_string(),
-        })
-    }
-
-    async fn probe(&self) -> Result<BackendStatus, LlmError> {
-        Ok(BackendStatus {
-            backend: self.spec.id.clone(),
-            ok: false,
-            detail: "codex_app_server backend is not implemented in this milestone".to_string(),
-            model: self.spec.model.clone(),
-            version: None,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_util::{ScriptedResponse, ScriptedTransport};
+    use crate::types::ChatRequest;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
 
     fn openai_spec(id: &str, key_env: &str) -> BackendSpec {
         BackendSpec::openai_compat(id, "https://api.example.invalid/v1", key_env, "test-model")
@@ -479,27 +421,25 @@ mod tests {
             // GET /models for `inferhub` fails at the transport level.
             ScriptedResponse::fail("connection refused"),
         ]);
-        let mut codex = BackendSpec::fake("codex");
-        codex.kind = BackendKind::CodexAppServer;
         let registry = BackendRegistry::with_transport(
             "fake",
-            vec![
-                openai_spec("inferhub", "SWARMBOT_TEST_KEY_DEFINITELY_UNSET2"),
-                codex,
-            ],
+            vec![openai_spec(
+                "inferhub",
+                "SWARMBOT_TEST_KEY_DEFINITELY_UNSET2",
+            )],
             &BTreeMap::new(),
             Arc::clone(&transport) as Arc<dyn HttpTransport>,
         )
         .expect("builds");
 
         let statuses = registry.probe_all().await;
-        // codex, fake, inferhub — sorted by id, one row each.
+        // fake, inferhub — sorted by id, one row each.
         assert_eq!(
             statuses
                 .iter()
                 .map(|s| s.backend.as_str())
                 .collect::<Vec<_>>(),
-            vec!["codex", "fake", "inferhub"]
+            vec!["fake", "inferhub"]
         );
         assert!(
             statuses
@@ -514,10 +454,6 @@ mod tests {
             .expect("row");
         assert!(!inferhub.ok);
         assert!(inferhub.detail.contains("no api key"), "{inferhub:?}");
-        // The unimplemented kind is honest too.
-        let codex = statuses.iter().find(|s| s.backend == "codex").expect("row");
-        assert!(!codex.ok);
-        assert!(codex.detail.contains("not implemented"), "{codex:?}");
         // The transport failure was never reached (keyless probe short-circuits).
         assert_eq!(transport.requests().len(), 0);
     }

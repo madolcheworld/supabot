@@ -24,6 +24,10 @@ hex = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 url = { workspace = true }
+# The TLS endpoints on both sides need rustls' crypto provider installed before
+# any `ClientConfig`/`ServerConfig` is built; this crate owns the one helper that
+# does it (D9.25). Already in the lock.
+rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

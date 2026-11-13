@@ -64,8 +64,9 @@ Status: accepted for the M0–M6 prototype.
   `chat(request, events, cancel) -> ChatResponse` and `probe()`. Adapters:
   `OpenAiCompat` (SSE + native tool calls), `AcpAgent` (every Agent Client
   Protocol agent — D2.5), `Fake` (scripted, deterministic), `ClaudeCli`
-  (skeleton in M3, finished with the MCP gateway), `CodexAppServer` (not
-  built).
+  (skeleton in M3, finished with the MCP gateway). There is no adapter of its
+  own for `codex app-server` — the variant was removed rather than built, for
+  the reasons in D9.19.
 - **D2.2 Gateway quirks are configuration, not code.** A request carries
   `extra_body` and `extra_headers` that are merged verbatim, last. This exists
   because `api.inferhub.dev` auctions requests and answers a bid-less call with
@@ -419,10 +420,11 @@ what it is holding back.
   directory that `verify` refuses rather than one that merely looks complete.
   `verify` re-derives every number from the snapshot and the transcript tree
   instead of believing the manifest: a manifest that lies is a detected failure.
-  Restoring is deliberately not a code path — it is "open the snapshot as a
-  store", which `SqliteStore::open` already does, and the test suite proves that
-  rather than trusting the bytes. A non-empty target is a typed refusal, never a
-  silent overwrite.
+  Restoring was left out of this module on purpose, and when it was built
+  (D9.22) it turned out to need far more than "open the snapshot as a store":
+  that is the *file* half, and the dangerous half is a live brain holding the old
+  inode. It lives in `store::restore` with its own refusals. A non-empty backup
+  target is still a typed refusal, never a silent overwrite.
 - **D9.18 The node roster row is revision-guarded, and a hello cannot undo a
   revocation.** Several writers share one row — `node.hello`, `node.heartbeat`,
   `node.event`, presence changes and revocation — and the mux spawns a task per
@@ -443,3 +445,255 @@ what it is holding back.
   and a check placed after has already written `online: true` and re-approved the
   node's capabilities. A vetoed hello writes nothing and the socket closes 4401.
   Only re-pairing, which writes a fresh row, may clear a revocation.
+- **D9.19 `codex app-server` is deleted, not built.** The variant
+  `BackendKind::CodexAppServer` shipped for two milestones as a typed
+  `Unavailable`: `chat` returned `LlmError::Unavailable` and `probe` answered
+  `ok: false` with "not implemented in this milestone". Two things were wrong
+  with keeping it. It was **selectable** — `backend_kind_label` in the CLI and
+  the Settings screen printed it, `owns_tool_loop()` claimed it ran its own
+  tools, and the registry built it into every `list` — so an owner could
+  configure a backend whose every turn refused; and it was **redundant**:
+  Codex is already reachable as `codex-acp` over ACP, which is the shape this
+  crate actually speaks, and that is what the shipped `config/swarmbot.toml`
+  uses. Building the native protocol instead would mean a second adapter to the
+  same model on a surface its own `--help` labels `[experimental]` (v0.168.0
+  generates 108 client request types, `thread/*`, `command/exec`,
+  `applyPatch`-style approvals, its own sandbox policy vocabulary) — a large
+  subsystem with no capability the ACP path lacks, and one that would need
+  re-checking against every upstream release.
+  What replaces it is a **refusal at the right time**: a config that still says
+  `kind = "codex_app_server"` now fails to deserialize, and serde's error names
+  the kinds that exist, so the operator learns at config load instead of on a
+  bot's first turn. Deleting a variant is a breaking change to the config
+  format, and that is deliberate — the alternative is a spelling that loads and
+  then lies. Tests: `the_removed_codex_app_server_kind_is_refused_at_config_load`
+  pins both halves (the value is rejected, and the message names `acp`).
+  **What this does not do:** it does not remove Codex support, and `codex-acp`
+  is still the one agent adapter whose full turn has never been driven by the
+  gate (see README, "Yang belum diverifikasi").
+- **D9.20 A turn a dropped future opened is closed by a guard, not by its caller.**
+  The runner awaits a turn two ways: directly, and through a `tokio::select!` that
+  watches for the brain cancelling — and a `select!` branch **cancels its
+  siblings**, so the turn future is *dropped* rather than awaited. A dropped
+  future runs no code after its last await point, so the turn row it had already
+  inserted stayed `Running` forever, and (once `run_turn` had reached it) its
+  delivery stayed `Running` with it. Nothing closed either one: the runner was
+  still alive, so boot recovery never saw them, and `Swarm::wait_for_idle` — which
+  believes the store on purpose (D9 known debt) — waited out its whole budget. A
+  single leaked row made a whole team look permanently busy, which surfaced as an
+  intermittent `client_contract` failure: `busy=[]`, and a turn with
+  `llm_calls: 0` that nobody owned.
+  The panic path had already been taught to close its turns; the graceful path
+  had the same hole. The first attempt fixed it at the *runner* — record the turn
+  id, close it after the loop — and that is the wrong place twice over: it misses
+  a future dropped anywhere else, and closing "the bot's open turns" in a runner
+  that is *ending* races a successor runner that may already be running one.
+  The fix is `TurnGuard`, a drop guard created in `run_turn` right after its rows
+  exist: on drop it re-reads the turn and, only if the store still calls it
+  `Running`, closes it as `Interrupted` naming the stop, and marks its deliveries
+  `Dropped`. It would rather do nothing than touch a turn the normal path already
+  closed — and it skips entirely while the thread is unwinding, so the panic path
+  keeps its own, more useful `Failed: the bot runner panicked: …`.
+  Tests: `a_runner_stopped_mid_turn_closes_its_turn_instead_of_leaving_it_running`
+  (core, mutation-checked) and `client_contract`'s whole-API walk, which failed
+  **5 times in 10** with the guard neutered and **0 times in 12** with it.
+- **D9.21 The stream half is built brain-first, and the honesty is in what stays
+  refused.** `docs/node-protocol.md` promised data streams for two milestones while
+  only the token bookkeeping existed: `mint_stream` and `StreamBroker` sat unused
+  with `tools::NodeCall` carrying no stream-bearing variant, so nothing could even
+  ask for one. The obvious way to close that is to build both halves at once and
+  wire a caller; the chosen way is narrower, because the two halves have very
+  different testing stories.
+  **Built now:** `StreamKind` (fixed by the grant), `StreamFrame`
+  (`data`/`ack`/`done`/`error`) with the caps that keep either side from buffering
+  without bound, `GET /node/stream/:id` with its own refusal code, and `StreamHub`
+  (the ticket a caller waits on). Proven over a **real WebSocket** in
+  `brain/tests/streams.rs`: a dial with a real bearer reaches a real ticket; a
+  wrong token is refused with `4405` *without burning the right one*; a socket that
+  ends without `Done` resolves as a failure, not a short file; a `Done` that
+  disagrees with what arrived is refused.
+  **Built after that:** the node's dialer (`node/src/stream.rs`) and the
+  `fs.download` handler, so the method moved from the refused table into the
+  implemented one. An intermediate commit deliberately left it refused while the
+  payload types existed but no node served them, with
+  `assert!(unimplemented(FS_DOWNLOAD).is_some())` pinning that — the rule is that
+  a method goes into `IMPLEMENTED_METHODS` when a node actually serves it, not when
+  its types exist.
+  The three decisions that were kept from the brain half:
+  * **`4405`, not `4401`.** A stream socket is not the control socket, and a node
+    that read a bad stream token as a revocation would stop redialing its control
+    socket and go silent over a typo.
+  * **the token rides the header, never the query string.** A URL is written to
+    every access log; this token is a credential.
+  * **`open` before the RPC.** A node on a fast link can dial before the brain has
+    recorded what it is waiting for. Registering after the RPC is a race that
+    fails on fast links and never on a developer's machine.
+  Two shapes were rejected: putting the grant inside `NodeCall` (it is a
+  brain-to-node instruction, not a tool call a model should be able to name), and
+  letting the dialer declare its own `StreamKind` on the upgrade (the framing is
+  the brain's decision, made when it minted the grant).
+  On the node side, the order is **resolve → gate → read → dial**, not dial
+  first: a node that dialled before deciding would spend the brain's one-time
+  token on a read it is about to refuse and leave the brain's socket waiting.
+  Proven end to end in `crates/node/tests/real_brain.rs`
+  (`a_real_node_streams_a_file_to_the_brain_over_a_data_stream`): a real node
+  child, a real brain, a real loopback WebSocket, a fixture containing a NUL and a
+  lone `0xff` so a text round trip cannot pass, the node's claimed digest compared
+  against the brain's computed one, and the node's audit line naming the bot.
+  Mutation-checked: replacing the node's dial with a no-op fails the test on the
+  ticket timeout.
+  **What is still missing is a caller.** Nothing in the brain asks for a download
+  yet — no route, no tool, no CLI command — so `fs.download` is reachable through
+  the protocol and not through the product, and every document says exactly that.
+- **D9.22 A restore refuses a live brain, and takes a way back before it deletes
+  anything.** `store::backup` had been safe for two rounds; restoring was
+  documented as "open the snapshot as a store" and never performed. Doing it
+  naively has three silent failures, and `store::restore` exists to make each of
+  them a refusal or a recorded fact:
+  * **a running brain keeps writing to the old inode.** Replacing
+    `swarmbot.sqlite` under a live process leaves its open descriptor on the
+    pre-restore file, so it continues with the old data and its next write can
+    overwrite the restored one. Nothing errors. `open_holders` therefore reads
+    `/proc/<pid>/fd`, refuses with `BrainIsRunning { pids }` — **naming the pid**,
+    because "my brain" and "some other tool" look identical from a file name —
+    and says "Stop the brain, then restore". The probe is explicitly
+    Linux-only and best effort: where `/proc` is absent it returns nothing, so the
+    documented procedure for those hosts is "stop the brain first", and the module
+    doc says that rather than implying a guarantee it cannot give.
+  * **a stale `-wal` is replayed onto the restored file.** Copying over the
+    database and leaving `swarmbot.sqlite-wal` beside it makes SQLite apply the
+    *old* pages to the *new* database at the next open: it opens, reports plausible
+    data, and is not the backup. The sidecars are removed as part of the switch,
+    and `RestoreReport.removed_wal` records it.
+  * **a restore that cannot be undone.** Before anything is replaced, the data dir
+    is backed up (`VACUUM INTO`) into a **sibling** `<data>.pre-restore-<ts>`, and
+    the report names it. A restore of the wrong snapshot then has a way back —
+    proven end to end by rolling one back in the tests.
+  The ordering is the safety: verify the backup → copy and verify *the copy* →
+  safety backup → remove sidecars → rename. Nothing destructive happens until
+  every check has passed, so a refusal provably changes nothing.
+  Proven against real processes in `crates/brain/tests/live_restore.rs`: a real
+  `swarmbot-brain` holds its database, the restore is refused with that pid in the
+  message, and the documented **stop → restore → start** procedure then serves the
+  backup's roster (a bot provisioned after the backup is gone; rolling the safety
+  copy back brings it again). Mutation-checked twice — neutering the holder probe
+  or the WAL removal makes the corresponding test fail.
+- **D9.23 Retention is by age, and the last unbounded column is now bounded.**
+  `tool_calls` stored one row per (turn, call) with **the full result text**, and
+  nothing ever removed one — the audit found it in round two as "grows without
+  limit", and it stayed that way while the live-event log and stale routine runs
+  got their own housekeeping. The port gains `prune_tool_calls(before)`; the
+  housekeeping ticker calls it with `now - TOOL_CALL_RETENTION` (7 days).
+  Three decisions worth keeping:
+  * **age, not count.** A count-based bound deletes today's rows on a busy day and
+    keeps a month of them on a quiet one; what makes a replayed call id plausible
+    is time, not volume. The comparison is strictly `<`, so a row exactly at the
+    cutoff is *kept* — both stores must agree, and the contract suite pins it.
+  * **the consequence is stated, not hidden.** A harness that replays a call id
+    older than the window re-runs the tool. That is the correct trade (the
+    alternative is unbounded growth to serve a replay nobody performs), so it is
+    named in the port's doc, in `TOOL_CALL_RETENTION`'s doc, and here.
+  * **it goes through the writer lane in `ThreadedStore`.** A prune is a write:
+    running it on a read lane would let a caller observe a half-deleted state.
+  Both stores implement it and the **shared contract suite** asserts it (delete the
+  old, keep the new, keep the boundary, idempotent on a second pass) — not each
+  implementation's own tests, because the two must stay observably identical.
+  `HousekeepingReport` gained `tool_calls_pruned`, so a ticker that silently stops
+  pruning is visible in the report rather than only in a growing file.
+  Test: `housekeeping_prunes_tool_call_records_by_age`, mutation-checked (with the
+  prune call removed it reports `tool_calls_pruned: 0` and fails).
+- **D9.24 The store leaves the runtime through a facade, not through a new
+  dependency.** The P2 debt said it plainly: `Persistence` is synchronous, so a
+  route that calls it parks a tokio worker for the whole SQLite call — and with
+  `busy_timeout = 5000`, one call that lands in the busy wait stalls every other
+  task on that worker. `ThreadedStore` fixed the *store* side (its own writer and
+  reader threads); its own docs listed the caller side as the remaining half, with
+  two ways to get the worker back: its `read_async`/`write_async` futures (only on
+  a concrete `ThreadedStore`, not `Arc<dyn Persistence>`) or a `spawn_blocking`
+  facade at the async boundary, which "needs every async call site to adopt" it.
+  **`store::AsyncStore` is that facade**, and it is the shape chosen because:
+  * it works through `Arc<dyn Persistence>`, so `MemoryStore` (every test) and
+    `ThreadedStore` (the brain) both go through the same code — a facade that only
+    wrapped the durable store would leave the tests exercising a different path
+    from production;
+  * `tokio` was **already** a workspace dependency and already in the lock file,
+    so this cost no lock rewrite and no new crate in the graph — which is the rule
+    AGENTS.md sets for an adapter crate;
+  * a panic in the closure becomes `DomainError::Internal` naming it, matching the
+    contract `ThreadedStore` keeps at its lane boundary, instead of surfacing as a
+    bare `JoinError` the API layer could not map.
+  Adopted so far in `GET /api/nodes`, `GET /api/usage` (the route that reads every
+  turn in the window), `POST /api/nodes/pairing-codes` and the node-gateway
+  lookups. **Not adopted everywhere**, and that is stated rather than implied: the
+  runner, the orchestrator and the node gateway's session loop still call the port
+  inline, because they are synchronous code paths that hold a thread by design;
+  `AsyncStore::blocking()` exists for exactly those, so reaching for it is a
+  decision a reviewer can see rather than an accident.
+  Two limits worth naming: `spawn_blocking` is a **bounded** pool, so enough
+  concurrent calls queue (correct, but it is not unlimited concurrency); and the
+  facade does not make a call faster, only keeps the awaiting task free.
+  Tests: `a_store_call_does_not_park_the_task_that_awaited_it` (a sibling task on
+  the same runtime makes progress while an 80 ms store call is in flight — a bare
+  synchronous call cannot pass it), plus the error pass-through, the panic mapping
+  and "the facade wraps, never copies" cases.
+- **D9.25 The brain terminates TLS, so `wss://` is a fact rather than a rewritable
+  string.** For several rounds the README's unverified list carried "TLS:
+  `wss://`/`https://` — the rewrite exists and is tested as a string, rustls is
+  linked, but there is no TLS brain here to dial". That was accurate and it was the
+  wrong shape of a gap: the *client* half was complete (a node rewrote its brain
+  URL and `tokio-tungstenite` dialled with rustls), so "the rewrite is correct" was
+  a claim with nothing on the other end. The brain now serves TLS.
+  **No new crates entered the lock.** `tokio-rustls` and `rustls-pemfile` were
+  already resolved transitive dependencies; naming them in
+  `[workspace.dependencies]` added two lines to the `swarmbot-brain` entry of
+  `Cargo.lock` and no packages to the graph — which is the rule AGENTS.md sets for
+  an adapter crate, and it held: `git diff Cargo.lock` is three insertions.
+  Five decisions worth keeping:
+  * **a custom `Listener`, not a second server.** `axum::serve` is generic over
+    `Listener`, so `TlsListener` is that trait over a `TcpListener` plus a
+    `TlsAcceptor`. The router, the middleware stack, the CORS layer and the
+    shutdown future are **the same code** in both modes; the alternative
+    (`axum-server`, or hyper by hand) is a second server type with its own
+    shutdown path — the same "two places to bind, two places to shut down" the
+    node gateway's socket adapter already rejected.
+  * **a failed handshake is one connection, not an outage.** The `Listener`
+    contract says an accept error must be logged and retried, and a TLS handshake
+    failure is the same event one layer up: scanners and probes hit a public
+    listener constantly. It is logged at `debug` — a warning per probe is how a
+    real warning gets ignored — and the loop continues.
+  * **paths, never contents.** `TlsConfig { cert, key }` carries `PathBuf`s, so a
+    private key cannot end up pasted into a TOML file (D2.3's rule for API keys
+    applies verbatim). The refusal names the file and what was expected, and the
+    tests assert that a bad file's *bytes* never appear in the message.
+  * **both files or neither, refused at start-up.** A cert without a key is a
+    brain that boots, answers `/api/health`, and fails every *other* machine's
+    handshake — the error would surface where the operator is not looking. The
+    refusal names both flags, and the real binary is tested for it.
+  * **the crypto provider is installed explicitly, and that was not optional.**
+    `rustls` picks a provider automatically only when exactly one of its
+    `aws-lc-rs`/`ring` features is on, and here **both** are (`reqwest` and
+    `tokio-tungstenite` each turn one on, and Cargo features are additive). So
+    `ServerConfig::builder()` **panicked** — "Could not automatically determine the
+    process-level CryptoProvider" — where a library must return an error. The fix
+    installs `aws_lc_rs` (the provider this build exposes; `ring` is compiled out)
+    and then proves it is there with a typed error rather than trusting it.
+  Node side: `--brain-ca` adds a PEM bundle to the trust anchors for a brain behind
+  a **private CA** — added to the system roots, never replacing them, so a
+  publicly-signed brain needs no configuration. A bundle that yields zero usable
+  certificates is a typed refusal naming the file, because falling back to the
+  system roots would turn "my CA is not trusted" into a handshake failure that
+  blames the brain.
+  Proven end to end with the real binaries: `crates/brain/tests/tls.rs` (a real
+  client trusting the CA gets `200` and the health body; a plaintext request is
+  **not** answered; a client with an empty root store fails the handshake; the real
+  `swarmbot-brain` refuses half a configuration) and
+  `crates/node/tests/tls_brain.rs` (the real `swarmbot-node` pairs over `https://`,
+  completes the signed upgrade and `node.hello` over `wss://`, appears online with
+  its approved capabilities, and is **refused at the handshake** when it does not
+  trust the CA). Mutation-checked: dropping the operator's CA from the connector
+  makes the node never come online, and bypassing `TlsListener` makes the client
+  handshake fail with `InvalidContentType`.
+  **Still not claimed:** certificate renewal or hot reload (the certificate is read
+  once at boot; rotating it means restarting the brain), and `wss://` against a
+  real public CA chain — the test uses a private CA it builds, which is the same
+  verification path but not the same bundle as a production one.

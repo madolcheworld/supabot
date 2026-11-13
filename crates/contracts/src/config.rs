@@ -6,6 +6,7 @@
 //! from, and the brain keeps the key in `<data>/secrets.json` (0600).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -16,6 +17,26 @@ use crate::node::{PolicyCeiling, PolicyMap, Surface};
 use crate::request::APPROVAL_EXPIRY_SECS;
 use crate::task::{MAX_RUNNING_TASKS_PER_BOT, MAX_TASK_RESTARTS};
 use crate::tool::Toolset;
+
+/// TLS termination for the brain's public listener (D9.25).
+///
+/// **Paths, never contents.** A private key is a secret; pasting one into a TOML
+/// file is the same mistake as pasting an API key there (D2.3). Files are read
+/// once at boot, and only their paths ever appear in a log line or an error.
+///
+/// The pair is deliberately not two optional fields: a certificate without its key
+/// cannot serve, so "half configured" would be a brain that boots, answers
+/// `/api/health` over plaintext, and fails every node dial — the failure would
+/// surface on the *other* machine's log. Resolution therefore refuses half a
+/// configuration at start-up and names both settings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM certificate chain, leaf first.
+    pub cert: PathBuf,
+    /// PEM private key (PKCS#8, PKCS#1 or SEC1).
+    pub key: PathBuf,
+}
 
 /// How a bot reaches a model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,13 +50,22 @@ pub enum BackendKind {
     OpenAiCompat,
     /// `claude -p` with our MCP servers, using the owner's own login.
     ClaudeCli,
-    /// `codex app-server` (JSON-RPC v2).
-    CodexAppServer,
     /// Any agent that speaks the **Agent Client Protocol** (JSON-RPC 2.0 over
     /// stdio): `opencode acp`, `claude-code-acp` (Claude Code), `codex-acp`
     /// (Codex), and whatever speaks ACP next. The agent process to spawn comes
     /// from `options.command` + `options.args`; the protocol is the same for
     /// all of them, so one adapter covers every ACP agent.
+    ///
+    /// **Codex is configured here, not through a kind of its own.** A
+    /// `CodexAppServer` variant for `codex app-server`'s native JSON-RPC existed
+    /// and was removed (D9.19): it was never implemented — it was a typed
+    /// `Unavailable` that still showed up as a provider an owner could select —
+    /// and `codex-acp` reaches the same model through a protocol this crate
+    /// already speaks. Building the native one would have meant two adapters to
+    /// one model, the second on a surface whose own `--help` calls it
+    /// `[experimental]`. A config that still says `kind = "codex_app_server"`
+    /// now fails to load with serde naming the kinds that exist, which is a
+    /// refusal at config time rather than a turn that dies later.
     Acp,
     /// A deterministic scripted backend for tests and offline demos.
     Fake,
@@ -47,7 +77,7 @@ impl BackendKind {
     /// tools (under its own sandbox and its own permission prompts, which our
     /// ACP client answers per `options.permission_mode`).
     pub fn owns_tool_loop(self) -> bool {
-        matches!(self, Self::ClaudeCli | Self::CodexAppServer | Self::Acp)
+        matches!(self, Self::ClaudeCli | Self::Acp)
     }
 }
 
@@ -157,7 +187,7 @@ impl BackendSpec {
                     )));
                 }
             }
-            BackendKind::ClaudeCli | BackendKind::CodexAppServer | BackendKind::Fake => {}
+            BackendKind::ClaudeCli | BackendKind::Fake => {}
         }
         Ok(())
     }
@@ -329,6 +359,10 @@ pub struct BrainConfig {
     pub data_dir: String,
     /// Public listener: REST, live WebSocket, node gateway.
     pub public_addr: String,
+    /// TLS termination for the public listener. `None` (the default) serves
+    /// plaintext; see [`TlsConfig`] for why both files or neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsConfig>,
     /// Internal listener: MCP gateway. `None` disables it.
     pub internal_addr: Option<String>,
     /// Login URL printed at first boot.
@@ -347,6 +381,7 @@ impl Default for BrainConfig {
         Self {
             data_dir: "data".into(),
             public_addr: "127.0.0.1:8787".into(),
+            tls: None,
             internal_addr: Some("127.0.0.1:0".into()),
             public_origin: None,
             default_backend: "fake".into(),
@@ -572,10 +607,27 @@ mod tests {
     #[test]
     fn harness_backends_own_their_tool_loop() {
         assert!(BackendKind::ClaudeCli.owns_tool_loop());
-        assert!(BackendKind::CodexAppServer.owns_tool_loop());
         assert!(BackendKind::Acp.owns_tool_loop());
         assert!(!BackendKind::OpenAiCompat.owns_tool_loop());
         assert!(!BackendKind::Fake.owns_tool_loop());
+    }
+
+    #[test]
+    fn the_removed_codex_app_server_kind_is_refused_at_config_load() {
+        // D9.19: the variant is gone, so an old config must fail *here*, naming
+        // the kinds that exist — not load and then refuse the first turn with a
+        // message about a backend the owner cannot see in any menu.
+        let err = serde_json::from_value::<BackendSpec>(serde_json::json!({
+            "id": "codex",
+            "kind": "codex_app_server",
+        }))
+        .expect_err("the removed kind must not deserialize");
+        let message = err.to_string();
+        assert!(message.contains("codex_app_server"), "{message}");
+        assert!(
+            message.contains("acp"),
+            "the error names the kinds that exist: {message}"
+        );
     }
 
     #[test]

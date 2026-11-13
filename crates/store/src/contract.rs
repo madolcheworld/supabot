@@ -1429,6 +1429,56 @@ pub fn contract_tool_calls<S: Persistence>(store: &S) -> anyhow::Result<()> {
         Some(rerun),
         "re-recording a call replaces its row instead of failing"
     );
+
+    // Pruning is by age: what is older goes, what is newer stays, and a row
+    // exactly at the boundary is *kept* (the comparison is strictly `<`), which
+    // both stores must agree on or one of them would quietly drop a row the
+    // other keeps.
+    let old = ToolCallRecord {
+        turn_id: TurnId::new(),
+        call_id: ToolCallId::new(),
+        created_at: Utc::now() - chrono::Duration::hours(2),
+        ..record.clone()
+    };
+    store.insert_tool_call(&old)?;
+    let fresh = ToolCallRecord {
+        turn_id: TurnId::new(),
+        call_id: ToolCallId::new(),
+        created_at: Utc::now(),
+        ..record.clone()
+    };
+    store.insert_tool_call(&fresh)?;
+
+    let boundary = Utc::now() - chrono::Duration::hours(1);
+    let removed = store.prune_tool_calls(boundary)?;
+    ensure_eq!(
+        removed,
+        1,
+        "exactly the row older than the cutoff was pruned (the two fresh rows stay)"
+    );
+    ensure_that!(
+        store.find_tool_call(&old.turn_id, &old.call_id)?.is_none(),
+        "a pruned record is gone, not merely hidden"
+    );
+    ensure_that!(
+        store
+            .find_tool_call(&fresh.turn_id, &fresh.call_id)?
+            .is_some(),
+        "a record created after the cutoff survives"
+    );
+    // The rows from earlier in this contract run are newer than the cutoff, so
+    // they must still be there: a prune is not a truncate.
+    ensure_that!(
+        store.find_tool_call(&turn, &call)?.is_some(),
+        "pruning by age never touches a row inside the window"
+    );
+    // A second pass with the same cutoff removes nothing: the operation is
+    // idempotent, so a ticker that runs twice cannot double-report.
+    ensure_eq!(
+        store.prune_tool_calls(boundary)?,
+        0,
+        "a second prune at the same cutoff is a no-op"
+    );
     Ok(())
 }
 

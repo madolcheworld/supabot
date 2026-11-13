@@ -29,7 +29,11 @@ use crate::state::AppState;
 
 /// `GET /api/nodes`
 pub async fn list(State(state): State<AppState>) -> ApiResult<Json<Vec<NodeInfo>>> {
-    Ok(Json(state.swarm.store.list_nodes()?))
+    // Through the async facade: a route runs on a runtime worker, and the sync
+    // port would park that worker for the whole SQLite call — a contended store
+    // would then stall every other request sharing it.
+    let nodes = state.async_store().read(|store| store.list_nodes()).await?;
+    Ok(Json(nodes))
 }
 
 /// `POST /api/nodes/pairing-codes`
@@ -50,7 +54,11 @@ pub async fn create_pairing_code(State(state): State<AppState>) -> ApiResult<Jso
         used: false,
         node_id: None,
     };
-    state.swarm.store.insert_pairing(&record)?;
+    let pairing = record.clone();
+    state
+        .async_store()
+        .write(move |store| store.insert_pairing(&pairing))
+        .await?;
     info!(
         expires_at = %record.expires_at,
         "a node pairing code was minted (shown once, stored as a hash)"
@@ -83,7 +91,12 @@ pub async fn revoke(
             "the local node cannot be revoked: it runs inside this process",
         ));
     }
-    let Some(node) = state.swarm.store.get_node(&id)? else {
+    let wanted = id.clone();
+    let Some(node) = state
+        .async_store()
+        .read(move |store| store.get_node(&wanted))
+        .await?
+    else {
         return Err(ApiError::from(DomainError::not_found("node", &id)));
     };
     if node.revoked {

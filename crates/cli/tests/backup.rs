@@ -13,6 +13,11 @@
 //! * `backup create` refuses `--brain`. The database lives on the daemon's
 //!   machine; this CLI cannot reach it, and backing up a local directory that
 //!   merely shares a path would be a backup of the wrong thing.
+//! * `backup restore` **replaces files**, so the refusals are the interesting
+//!   part: a backup that does not verify is refused without touching anything, a
+//!   data dir whose database another process holds open is refused (a running
+//!   brain keeps writing to the old inode), `--brain` is refused, and a restore
+//!   always leaves a safety copy that can be restored back.
 //!
 //! Every test builds its own `TempDir` data dir by running `swarmbot demo`
 //! (offline, in-process, no network) and asserts on the real process's status and
@@ -326,5 +331,221 @@ fn usage_prints_the_report_and_says_when_nothing_was_reported() {
         stderr_of(&future).contains("in the future"),
         "{}",
         stderr_of(&future)
+    );
+}
+
+#[test]
+fn a_restore_replaces_the_data_dir_and_a_second_restore_rolls_it_back() {
+    let dir = TempDir::new("restore");
+    let data = a_data_dir(dir.path());
+    let out = dir.path().join("backup");
+
+    // Back up the demo data, then *change* the data dir: adding a bot before the
+    // restore is what makes "the backup's roster came back" a real assertion
+    // rather than "the same bytes are still there".
+    assert_eq!(
+        run(&[
+            "--data-dir",
+            data.to_str().expect("utf-8 path"),
+            "backup",
+            "create",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .status
+        .code(),
+        Some(0)
+    );
+    let before = run(&[
+        "--data-dir",
+        data.to_str().expect("utf-8 path"),
+        "bots",
+        "ls",
+    ]);
+    let roster_before = stdout_of(&before);
+    assert_eq!(before.status.code(), Some(0), "{roster_before}");
+
+    // Provisioning a second team is how a bot appears in a data dir through the
+    // product's own path (there is no `bots create`). The run's *turn* may fail
+    // — the demo team and this one disagree about backends — and that is
+    // irrelevant here: what matters is that the roster gained a bot.
+    let team = dir.path().join("extra-team.toml");
+    std::fs::write(
+        &team,
+        "[[bots]]\nname = \"extra\"\nlabel = \"Extra\"\ninstructions = \"you are extra\"\n",
+    )
+    .expect("the team file");
+    let created = run(&[
+        "--data-dir",
+        data.to_str().expect("utf-8 path"),
+        "run",
+        "hi",
+        "--team",
+        team.to_str().expect("utf-8 path"),
+        "--backend",
+        "fake",
+    ]);
+    assert_eq!(
+        created.status.code(),
+        Some(0),
+        "the second team is provisioned: {}{}",
+        stdout_of(&created),
+        stderr_of(&created)
+    );
+    let changed = stdout_of(&run(&[
+        "--data-dir",
+        data.to_str().expect("utf-8 path"),
+        "bots",
+        "ls",
+    ]));
+    assert!(
+        changed.contains("extra"),
+        "the added bot is there: {changed}"
+    );
+
+    // The restore: it must report where the previous data dir went.
+    let restored = run(&[
+        "--data-dir",
+        data.to_str().expect("utf-8 path"),
+        "backup",
+        "restore",
+        out.to_str().expect("utf-8 path"),
+    ]);
+    let stdout = stdout_of(&restored);
+    assert_eq!(
+        restored.status.code(),
+        Some(0),
+        "backup restore succeeds: {stdout}{}",
+        stderr_of(&restored)
+    );
+    assert!(
+        stdout.contains("pre-restore-"),
+        "the command names the safety copy it took: {stdout}"
+    );
+
+    // The restored data dir is the backup's, and the bot added afterwards is
+    // gone — that is what restoring *means*, and it is the assertion a command
+    // that silently did nothing would fail.
+    let after = stdout_of(&run(&[
+        "--data-dir",
+        data.to_str().expect("utf-8 path"),
+        "bots",
+        "ls",
+    ]));
+    assert!(
+        !after.contains("extra"),
+        "the post-backup bot is gone after the restore: {after}"
+    );
+    assert_eq!(
+        after.lines().filter(|line| !line.trim().is_empty()).count(),
+        roster_before
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+        "the roster is the backup's:\n{after}"
+    );
+
+    // And the safety copy puts it back: a restore with no way back is not one
+    // this build performs.
+    let safety = stdout_of(&restored)
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("the previous data dir is at ")
+                .and_then(|rest| rest.split(" —").next())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| panic!("the restore named its safety copy: {stdout}"));
+    let rolled_back = run(&[
+        "--data-dir",
+        data.to_str().expect("utf-8 path"),
+        "backup",
+        "restore",
+        &safety,
+    ]);
+    assert_eq!(
+        rolled_back.status.code(),
+        Some(0),
+        "the safety copy restores back: {}{}",
+        stdout_of(&rolled_back),
+        stderr_of(&rolled_back)
+    );
+    let back = stdout_of(&run(&[
+        "--data-dir",
+        data.to_str().expect("utf-8 path"),
+        "bots",
+        "ls",
+    ]));
+    assert!(
+        back.contains("extra"),
+        "the rollback brought the added bot back: {back}"
+    );
+}
+
+#[test]
+fn a_restore_refuses_brain_and_a_bad_backup_without_touching_the_data_dir() {
+    let dir = TempDir::new("restore-refuse");
+    let data = a_data_dir(dir.path());
+    let out = dir.path().join("backup");
+    assert_eq!(
+        run(&[
+            "--data-dir",
+            data.to_str().expect("utf-8 path"),
+            "backup",
+            "create",
+            "--out",
+            out.to_str().expect("utf-8 path"),
+        ])
+        .status
+        .code(),
+        Some(0)
+    );
+
+    // `--brain` is refused: the data dir lives on the daemon's machine.
+    let remote = run(&[
+        "--brain",
+        "http://127.0.0.1:1",
+        "backup",
+        "restore",
+        out.to_str().expect("utf-8 path"),
+    ]);
+    assert_ne!(remote.status.code(), Some(0), "a remote restore is refused");
+    assert!(
+        stderr_of(&remote).contains("--brain"),
+        "the refusal explains why: {}",
+        stderr_of(&remote)
+    );
+
+    // A backup whose manifest lies is refused, and *nothing* changes: the whole
+    // point of checking before replacing.
+    let snapshot_before = std::fs::read(data.join("swarmbot.sqlite")).expect("read the db");
+    let manifest_path = out.join("MANIFEST.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("read the manifest"))
+            .expect("a manifest");
+    manifest["tables"]["bots"] = serde_json::json!(999);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("encode"),
+    )
+    .expect("write the manifest");
+
+    let refused = run(&[
+        "--data-dir",
+        data.to_str().expect("utf-8 path"),
+        "backup",
+        "restore",
+        out.to_str().expect("utf-8 path"),
+    ]);
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "a manifest that disagrees with the snapshot is refused"
+    );
+    let snapshot_after = std::fs::read(data.join("swarmbot.sqlite")).expect("read the db");
+    assert_eq!(
+        snapshot_before, snapshot_after,
+        "a refused restore does not touch the data dir"
     );
 }

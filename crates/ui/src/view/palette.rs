@@ -62,6 +62,35 @@ pub struct Palette {
     _observe: Subscription,
 }
 
+/// The REST fetch a screen needs when the palette opens it.
+///
+/// Both the keyboard jump and the row click open screens, so the fetch lives in
+/// one place: a screen that loads on one path and not the other is a bug that
+/// shows up in only one of them.
+fn fetch_for(screen: Screen, commands: &Sender<Command>, usage_hours: i64) {
+    match screen {
+        Screen::Conversation => {}
+        Screen::Routines => {
+            let _ = commands.send(Command::FetchRoutines);
+        }
+        Screen::Nodes => {
+            let _ = commands.send(Command::FetchNodes);
+        }
+        Screen::Settings => {
+            let _ = commands.send(Command::FetchSettings);
+            let _ = commands.send(Command::FetchBackends);
+        }
+        Screen::Usage => {
+            let _ = commands.send(Command::FetchUsage {
+                since: Some(crate::view::usage::since_for(
+                    usage_hours,
+                    chrono::Utc::now(),
+                )),
+            });
+        }
+    }
+}
+
 impl Palette {
     pub fn new(state: Entity<AppState>, commands: Sender<Command>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| TextInput::new("Jump to a bot, conversation or task…", cx));
@@ -147,6 +176,11 @@ impl Palette {
             action: PaletteAction::OpenScreen(Screen::Nodes),
         });
         items.push(PaletteItem {
+            title: "Usage".to_string(),
+            subtitle: "screen · what the backends reported the team spent".to_string(),
+            action: PaletteAction::OpenScreen(Screen::Usage),
+        });
+        items.push(PaletteItem {
             title: "Settings".to_string(),
             subtitle: "screen · brain configuration & backends".to_string(),
             action: PaletteAction::OpenScreen(Screen::Settings),
@@ -191,13 +225,8 @@ impl Palette {
             s.palette_open = false;
             cx.notify();
         });
-        if matches!(action, PaletteAction::OpenScreen(Screen::Routines)) {
-            let _ = self.commands.send(Command::FetchRoutines);
-        } else if matches!(action, PaletteAction::OpenScreen(Screen::Nodes)) {
-            let _ = self.commands.send(Command::FetchNodes);
-        } else if matches!(action, PaletteAction::OpenScreen(Screen::Settings)) {
-            let _ = self.commands.send(Command::FetchSettings);
-            let _ = self.commands.send(Command::FetchBackends);
+        if let PaletteAction::OpenScreen(screen) = action {
+            fetch_for(screen, &self.commands, self.state.read(cx).usage_hours);
         }
     }
 
@@ -280,13 +309,8 @@ impl Palette {
                     s.palette_open = false;
                     cx.notify();
                 });
-                if matches!(action, PaletteAction::OpenScreen(Screen::Routines)) {
-                    let _ = commands.send(Command::FetchRoutines);
-                } else if matches!(action, PaletteAction::OpenScreen(Screen::Nodes)) {
-                    let _ = commands.send(Command::FetchNodes);
-                } else if matches!(action, PaletteAction::OpenScreen(Screen::Settings)) {
-                    let _ = commands.send(Command::FetchSettings);
-                    let _ = commands.send(Command::FetchBackends);
+                if let PaletteAction::OpenScreen(screen) = action {
+                    fetch_for(screen, &commands, state.read(cx).usage_hours);
                 }
             })
             .into_any_element()

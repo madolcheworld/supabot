@@ -25,6 +25,7 @@
 pub mod executor;
 pub mod session;
 pub mod socket;
+pub mod streams;
 pub mod wire;
 
 use std::collections::{HashMap, VecDeque};
@@ -41,6 +42,7 @@ use swarmbot_node_protocol::auth::ReplayCache;
 use swarmbot_node_protocol::mux::{Peer, Socket};
 
 use self::socket::GatewaySocket;
+use self::streams::StreamHub;
 
 /// The mux peer driving one node's control socket.
 pub type NodePeer = Peer<GatewaySocket>;
@@ -113,6 +115,11 @@ pub struct NodeGateway<S: Socket = GatewaySocket> {
     nodes: RwLock<HashMap<NodeId, Connected<S>>>,
     generations: AtomicU64,
     decisions: Mutex<VecDeque<RecordedDecision>>,
+    /// The data-stream half (§8): grants waiting for a dial, and the tickets
+    /// waiting for bytes. It lives on the gateway because it is the same
+    /// lifetime and the same origin as the control sockets — one brain, one
+    /// set of streams.
+    streams: StreamHub,
 }
 
 impl<S: Socket> NodeGateway<S> {
@@ -123,11 +130,17 @@ impl<S: Socket> NodeGateway<S> {
             nodes: RwLock::new(HashMap::new()),
             generations: AtomicU64::new(0),
             decisions: Mutex::new(VecDeque::new()),
+            streams: StreamHub::new(),
         })
     }
 
     pub fn origin(&self) -> &str {
         &self.origin
+    }
+
+    /// The data-stream registry (§8).
+    pub fn streams(&self) -> &StreamHub {
+        &self.streams
     }
 
     /// The nonce cache, shared by every dial: a nonce replayed on a second

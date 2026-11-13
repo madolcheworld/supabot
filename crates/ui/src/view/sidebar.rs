@@ -455,9 +455,14 @@ fn footer(_s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -
     let state_settings = state.clone();
     let state_nodes = state.clone();
     let state_routines = state.clone();
+    let state_usage = state.clone();
     let commands_settings = commands.clone();
     let commands_nodes = commands.clone();
     let commands_routines = commands.clone();
+    let commands_usage = commands.clone();
+    // The window the usage screen last asked for, read here so the nav button
+    // asks the same question the screen is showing.
+    let usage_hours = _s.usage_hours;
 
     div()
         .flex_none()
@@ -565,7 +570,21 @@ fn footer(_s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -
                             let _ = commands_settings.send(Command::FetchSettings);
                             let _ = commands_settings.send(Command::FetchBackends);
                         }),
-                ),
+                )
+                .child(bits::button("Usage", Tone::Ghost).id("nav-usage").on_click(
+                    move |_, _, cx: &mut gpui::App| {
+                        state_usage.update(cx, |st, cx| {
+                            st.screen = Screen::Usage;
+                            cx.notify();
+                        });
+                        let _ = commands_usage.send(Command::FetchUsage {
+                            since: Some(crate::view::usage::since_for(
+                                usage_hours,
+                                chrono::Utc::now(),
+                            )),
+                        });
+                    },
+                )),
         )
 }
 

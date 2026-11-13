@@ -31,8 +31,16 @@ scripts/check.sh --fast    # the same, without swarmbot-ui (its build is minutes
 `.cargo-home` inside the checkout (a sandbox cannot write to `~/.cargo`), sets
 `LIBCLANG_PATH` (gpui's `bindgen`; there is `libclang.so.22.1` but no unversioned
 symlink), builds the `libxkbcommon-x11.so` link shim and exports `LIBRARY_PATH`,
-and pins `VK_ICD_FILENAMES` to llvmpipe. Without it a `cargo build -p swarmbot-ui`
-fails in three different ways.
+and pins `VK_ICD_FILENAMES` to llvmpipe **when that ICD exists**. Without it a
+`cargo build -p swarmbot-ui` fails in three different ways.
+
+As of 2026-11-13 the llvmpipe Vulkan ICD is **not** installed on this machine
+(only `nvidia_icd.json`, and there is no `/dev/nvidia0`), so `env.sh` now prints
+that on stderr and `swarmbot-ui` panics with `Unable to init GPU context:
+NoSupportedDeviceFound`. That is a missing driver, not a code bug: install the
+distro's Mesa software-Vulkan package (`vulkan-swrast` on Arch). `cargo build`,
+`cargo test` and the whole gate still pass without it — only opening a window
+fails.
 
 Cargo builds share `./target`. `Blocking waiting for file lock on build directory`
 is other people working, not a hang: wait it out. Do not invent a second target
@@ -141,14 +149,14 @@ rewrite history unless the owner asks.
 | `contracts` | every domain type, the repository ports, the live-event shapes | `src/lib.rs` (module map), `src/repo.rs` (the ports) |
 | `llm` | `LlmBackend` + adapters (OpenAI-compatible, **ACP agents** — opencode/Claude Code/Codex over the Agent Client Protocol, Fake, Claude CLI skeleton), `BackendRegistry` | `src/backend.rs`, `src/openai.rs`, `src/acp/mod.rs` |
 | `tools` | `ToolRegistry`, the seven handlers, `PathPolicy`, `PolicyEngine`, `AuditLog`, `LocalExecutor` | `src/lib.rs`, `src/handler.rs` (the ports) |
-| `store` | `SqliteStore`, `MemoryStore`, `JsonlMirror`, the shared contract suite | `src/lib.rs`, `src/contract.rs` |
+| `store` | `SqliteStore`, `MemoryStore`, `JsonlMirror`, the shared contract suite, backup/restore, and `AsyncStore` (the async facade) | `src/lib.rs`, `src/contract.rs`, `src/async_store.rs` |
 | `core` | runners, orchestrator, routing, messaging, tasks, approvals, transcript, live hub, instructions, composition | `src/lib.rs`, `src/runners.rs`, `src/swarm.rs` |
 | `client` | the blocking REST + live-WS client shared by CLI and UI | `src/lib.rs` |
-| `brain` | composition root: axum REST, `/ws/live`, owner auth, telemetry, and the node gateway (`/node/pair`, the signed `/node` upgrade, `NodeDispatcher`) | `src/lib.rs`, `src/server.rs` (the route table), `src/routes/`, `src/gateway/` |
+| `brain` | composition root: axum REST (plaintext or TLS), `/ws/live`, owner auth, telemetry, and the node gateway (`/node/pair`, the signed `/node` upgrade, `NodeDispatcher`) | `src/lib.rs`, `src/server.rs` (the route table), `src/routes/`, `src/gateway/` |
 | `cli` | `swarmbot`: demo, run, chat, bots, transcript, tasks, nodes, config, shutdown — embedded *and* `--brain` | `src/main.rs` (commands), `src/session.rs` (the `Session` port both modes implement), `src/remote.rs` |
 | `ui` | `swarmbot-ui`: the GPUI desktop app | `src/lib.rs` (module map), `src/reducer.rs` (where the correctness lives), [`docs/ui.md`](docs/ui.md) |
-| `node-protocol` | the wire: mux, pairing, signed upgrade, typed errors, stream tokens | `src/lib.rs` (module map), [`docs/node-protocol.md`](docs/node-protocol.md) |
-| `node` | `swarmbot-node`: the daemon that executes under its own policy | `src/lib.rs`, `src/handlers.rs` (the `rpc` ↔ `NodeCall` bridge), `src/shell.rs`, `tests/real_brain.rs` (the end-to-end proof) |
+| `node-protocol` | the wire: mux, pairing, signed upgrade, typed errors, stream tokens **and framing**, the shared rustls provider helper | `src/lib.rs` (module map), [`docs/node-protocol.md`](docs/node-protocol.md) |
+| `node` | `swarmbot-node`: the daemon that executes under its own policy, streams a file over a data stream, and speaks `wss://` | `src/lib.rs`, `src/handlers.rs` (the `rpc` ↔ `NodeCall` bridge), `src/shell.rs`, `src/stream.rs`, `tests/real_brain.rs` (the end-to-end proof) |
 | `mcp` | the tool registry as an MCP server (stdio + streamable HTTP) | `src/lib.rs`, `src/transport.rs` |
 
 ## Known debt
@@ -212,6 +220,45 @@ them.
   `a_hello_for_a_revoked_node_does_not_unrevoke_it` — the last asserts the
   revision did not move, i.e. a refused hello writes nothing at all. Verified
   48/48 green under 6× parallel load; the same harness failed 4/30 before.
+* **A turn was left `Running` whenever a runner was *stopped* rather than
+  finishing its turn** — fixed in D9.20, recorded because the shape recurs. The
+  runner watches for shutdown with `tokio::select!`, and a `select!` branch
+  cancels its siblings, so the turn future is dropped rather than awaited; no
+  code after its last await point ran, and the row stayed `Running` forever with
+  nobody to close it (the runner was still alive, so boot recovery never saw
+  it). `wait_for_idle` believes the store on purpose, so one leaked row made a
+  whole team look permanently busy: an intermittent `client_contract` failure
+  with `busy=[]` and a `llm_calls: 0` turn. The repair is a drop guard
+  (`TurnGuard`) created where the rows are written, not a cleanup in the caller
+  — a caller can only cover the exit it knows about. **If you add an await point
+  after a row is inserted, put the settle in a guard.** Two lessons worth
+  keeping: `settle()` now prints the work report *before and after* the wait,
+  which is what distinguished "still running" from "leaked"; and a mutation check
+  is not optional here — with the guard neutered the test failed 5 times in 10,
+  and the first, wrong fix passed the unit test while leaving the real path
+  broken.
+* **A test that restores a source file from a temp copy will silently keep the
+  mutation.** Twice in one session a mutation check "restored" a file from
+  `/tmp/…bak`, and the restore went to a path that no longer existed (each `bash`
+  call is a fresh sandbox with its own temp area). The mutation stayed, the unit
+  test kept passing, and only a later full gate showed the file was wrong. Rules
+  that would have prevented it: keep the backup **inside the workspace**
+  (`.scratch/`, deleted afterwards), and after restoring, assert the fix is
+  present with a `grep` before believing the result. The lesson is the same one
+  the debt entries above record — **verify the state, not the intention** — and it
+  applies to the agent's own edits, not just to the code under test.
+* **A crypto provider must be installed before *any* rustls config is built, and
+  a test that passes alone can hide that.** `rustls` picks a provider from crate
+  features only when exactly one of `aws-lc-rs`/`ring` is enabled; here both are
+  (two dependencies enable one each, and Cargo features add), so
+  `ClientConfig::builder()` **panics** rather than returning an error. The brain's
+  listener got the fix first (D9.25); the node's `--brain-ca` connector did not, and
+  it passed when run on its own — a standalone test run had already installed a
+  provider earlier in the same process. **The full gate caught it, not the focused
+  test.** Two rules follow: the helper lives in **one** place
+  (`node_protocol::ensure_crypto_provider`, called by both endpoints) so copies
+  cannot drift, and a TLS test is not proven until it has passed as part of the
+  whole suite, in a fresh process.
 * **The embedded CLI cannot reach a remote node** — not a missing wire but a
   property of the mode: a node dials the brain's gateway, and `swarmbot` in-process
   has no listener, so nothing can pair with it. A bot configured against a foreign
@@ -221,7 +268,7 @@ them.
 ## State of the tree
 
 Check before you assume — it moves while people work. **All twelve crates are
-built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.288
+built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.353
 passed, 0 failed, 4 ignored** — two live tests, behind `PROTO_LIVE_LLM` and
 `PROTO_LIVE_ACP`, and two doctests in `store/src/threaded.rs` marked `ignore`
 because a doctest has no runtime to await on): `contracts`,
@@ -231,7 +278,8 @@ because a doctest has no runtime to await on): `contracts`,
 The brain's **node gateway is real**: `POST /node/pair` redeems a code and
 `GET /node` serves the signed control socket (`src/gateway/`).
 **`crates/node/tests/real_brain.rs` pins the whole of M6 against the real
-binaries** (4 tests, ~0.5 s, always run): an in-process brain + a spawned
+binaries** (5 tests, ~0.5 s, always run; the fifth is the `fs.download` data
+stream of D9.21): an in-process brain + a spawned
 `swarmbot-node` child pair with a minted code, a bot bound to that node reads
 `marker.txt` and runs `cat marker.txt` through it — asserted by planting
 "from the node" in the node's root and a "from the brain" decoy in the brain's
@@ -239,8 +287,11 @@ workspace, so a silent local fallback cannot pass; the node's own
 `--ceiling shell=never` refuses what the brain allowed (`this node never allows
 …`, nothing runs on either machine); and `DELETE /api/nodes/{id}` closes with
 **4401**, the child exits by itself, and a redial is refused before any upgrade.
-Still genuinely unverified: `wss://`/TLS, and a remote tool call from a *bot turn
-in two separate OS processes driven by a real model* (the fake backend's script
+`crates/node/tests/tls_brain.rs` adds 2 more: the real node pairs over `https://`,
+completes the signed upgrade and `node.hello` over `wss://` (D9.25), and a node
+without `--brain-ca` is refused at the handshake. Still genuinely unverified: a
+remote tool call from a *bot turn in two separate OS processes driven by a real
+model* (the fake backend's script
 lives in-process, so the test drives the brain in-process).
 
 `llm::ClaudeCli::chat` is implemented: it spawns `claude -p` with a stream-json

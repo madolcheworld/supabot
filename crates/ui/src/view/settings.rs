@@ -654,7 +654,6 @@ pub(crate) fn backend_kind_label(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::OpenAiCompat => "openai-compat",
         BackendKind::ClaudeCli => "claude-cli",
-        BackendKind::CodexAppServer => "codex-app-server",
         BackendKind::Acp => "acp",
         BackendKind::Fake => "fake",
     }

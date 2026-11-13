@@ -1550,6 +1550,19 @@ impl ToolCallRepo for SqliteStore {
         .map_err(sql_err)?;
         Ok(())
     }
+
+    fn prune_tool_calls(&self, before: DateTime<Utc>) -> Result<u64, DomainError> {
+        let conn = self.conn()?;
+        // `created_at` is the store's fixed-width RFC 3339, so a string compare
+        // is a time compare — the same invariant that lets `ORDER BY` sort it.
+        let removed = conn
+            .execute(
+                "DELETE FROM tool_calls WHERE created_at < ?1",
+                params![ts(&before)],
+            )
+            .map_err(sql_err)?;
+        Ok(removed as u64)
+    }
 }
 
 impl EventLog for SqliteStore {

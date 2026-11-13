@@ -152,12 +152,16 @@ pada `ctx.cancel` di dalam `ask()`.
 
 ## 4. P2 — akumulasi yang perlu dijaga
 
-* **Store sinkron di dalam async.** `Mutex<Connection>` + `busy_timeout=5000`
-  (`store/src/sqlite.rs:260`), dipanggil inline dari task tokio. Satu penulis
-  terkontensi memarkir worker sampai 5 detik dan menyerialkan seluruh akses DB.
-  Ini utang arsitektural terbesar yang tersisa.
-* **Pertumbuhan tanpa batas**: `tool_calls` (satu baris per panggilan, teks hasil
-  penuh, tanpa prune), `routine_runs`, `cards` di UI, dan `entries` di UI yang
+* ~~**Store sinkron di dalam async.**~~ — **separuh ditutup (D9.24).** Sisi store
+  sudah diperbaiki `ThreadedStore` (writer + reader thread sendiri); sisi pemanggil
+  sekarang punya `store::AsyncStore`, facade `spawn_blocking` yang dipakai di empat
+  route brain. **Sisa:** runner, orchestrator dan loop sesi node gateway masih
+  memanggil port inline — jalur sinkron yang memang memegang thread, dengan
+  `AsyncStore::blocking()` sebagai jalan yang terlihat saat review.
+* **Pertumbuhan tanpa batas**: ~~`tool_calls` (satu baris per panggilan, teks hasil
+  penuh, tanpa prune)~~ — **ditutup (D9.23)**: `prune_tool_calls` berdasarkan umur
+  dan dipanggil ticker housekeeping; `routine_runs` (punya `reap_stale_runs`),
+  `cards` di UI, dan `entries` di UI yang
   di-*re-sort* seluruhnya per entry baru (`ui/src/state.rs:707`) di main thread.
 * **Stream terpotong dianggap jawaban lengkap** (`llm/src/openai.rs:639-642`): EOF
   tanpa `[DONE]` dan tanpa `finish_reason` tetap `Ok`, lalu ditulis ke transkrip.
@@ -534,3 +538,154 @@ mengubah "transkrip kosong" menjadi "turn masih Running, 0 llm call".
   untuk default 24 jam, tidak dibuktikan untuk jendela sangat panjang.
 * **TLS, dua-proses-dengan-model-nyata, UI di GPU nyata, `codex app-server`, data
   stream** — semuanya tetap seperti di §8: belum.
+
+---
+
+## 10. Tindak lanjut — putaran ketiga (2026-11-13)
+
+Dua butir di atas sudah bergerak, dan dicatat di sini supaya §9 tetap bisa dibaca
+sebagai potret keadaan saat itu, bukan sebagai daftar hidup:
+
+* **Panel usage di UI: selesai.** Layar `view/usage.rs` membaca `GET /api/usage`
+  untuk jendela 24 jam / 7 hari / 30 hari, menampilkan total, tabel per bot
+  (pengeluaran terbesar lebih dulu), dan **jumlah turn** di samping setiap nol.
+  Tiga keadaan dijaga terpisah: belum dimuat, gagal (dengan alasan verbatim dan
+  Retry), dan sebuah laporan — karena "fetch gagal" dan "tidak ada turn" sama-sama
+  nol dan hanya salah satunya benar. Yang tetap tidak terverifikasi: angka dari
+  backend sungguhan (semua angka di gate berasal dari `FakeBackend`), dan piksel
+  layarnya, karena ICD Vulkan software di mesin ini hilang (lihat
+  [`ui.md`](ui.md) §2 dan §10).
+* **`codex app-server`: dihapus, bukan dibangun** (D9.19). Variannya hanya pernah
+  ada sebagai `Unavailable` yang tetap bisa dipilih pemilik, dan Codex sudah
+  terjangkau sebagai `codex-acp` lewat adapter ACP. Config lama yang memakai
+  `kind = "codex_app_server"` sekarang ditolak saat load, dan serde menyebut kind
+  yang ada. Jadi baris "tidak diimplementasikan, dan tidak ada klaim sebaliknya"
+  di §9 berubah menjadi "tidak ada lagi permukaan yang mengklaimnya".
+
+---
+
+## 11. Tindak lanjut — putaran keempat (2026-11-13)
+
+* **Data stream `/node/stream/:id`: sekarang berfungsi end-to-end, tanpa
+  pemanggil.** Separuh brain (token, `StreamKind`, `StreamFrame`, route dengan kode
+  tutup `4405`, `StreamHub` dengan ticket/timeout/cap) dan separuh node
+  (`node/src/stream.rs`: dial keluar, chunk ≤ 1 MiB, backpressure lewat ack
+  kumulatif, terminator `{sha256, size}`) keduanya dibangun. Buktinya bukan unit
+  test: `crates/node/tests/real_brain.rs` menjalankan **binary node sungguhan**
+  melawan **brain sungguhan** lewat WebSocket loopback, dengan fixture berisi NUL
+  dan `0xff` (supaya transfer yang diam-diam decode teks akan gagal), lalu
+  membandingkan digest yang diklaim node di jawaban RPC-nya dengan digest yang
+  dihitung brain atas byte yang tiba, dan memeriksa baris audit node menyebut bot
+  yang meminta. Mutation-check: mengganti dial node dengan no-op membuat tes itu
+  gagal pada timeout ticket.
+* **Yang tetap tidak ada: pemanggil.** Tidak ada route, tool, atau perintah CLI
+  yang meminta `fs.download`, jadi fiturnya terjangkau lewat protokol dan belum
+  lewat produk. Semua dokumen (README, `node-protocol.md` §8, D9.21) menyatakan
+  itu, dan `pty.open` tetap di tabel refusal.
+* **Keputusan yang perlu diingat:** `4405` dipakai untuk penolakan dial stream
+  supaya token yang salah tidak pernah terbaca sebagai pencabutan node (`4401`);
+  token dikirim di header, bukan query string; `open` dipanggil **sebelum** RPC
+  supaya dial cepat tidak kalah balapan; dan di node urutannya
+  **resolve → gate → read → dial**, supaya penolakan tidak membakar token brain.
+
+---
+
+## 12. Tindak lanjut — putaran kelima (2026-11-13)
+
+* **Restore ke brain yang hidup: selesai (D9.22).** Dua putaran tercatat sebagai
+  "tidak diuji", dan sekarang dibuktikan terhadap proses sungguhan di
+  `crates/brain/tests/live_restore.rs`:
+  * **menolak** saat `swarmbot-brain` sungguhan masih memegang database — probe
+    membaca `/proc/<pid>/fd`, pesannya menyebut **pid** itu dan berkata "Stop the
+    brain, then restore";
+  * prosedur **stop → restore → start** menyajikan roster backup: bot yang
+    diprovisikan *setelah* backup hilang, dan me-rollback salinan `pre-restore`
+    memunculkannya kembali.
+  Mutation-check dua kali: mematikan probe holder, atau menghapus pembersihan
+  `-wal`, membuat tes yang bersangkutan gagal (yang kedua memperlihatkan
+  `removed_wal: false` dan baris "the stale WAL was named and removed").
+* **Tiga kegagalan senyap yang dicegah:** brain hidup menulis ke inode lama dan
+  bisa menimpa hasil restore; `-wal` basi diputar ulang ke database baru (terbuka,
+  datanya masuk akal, dan bukan backup-nya); dan restore tanpa jalan kembali.
+  Yang terakhir karena itu setiap restore menulis `<data>.pre-restore-<ts>` lebih
+  dulu, dan melaporkan di mana.
+* **Yang tetap tidak ada:** restore **jarak jauh** — `--brain` ditolak, karena
+  databasenya ada di mesin daemon; dan probe holder bersifat Linux-only, yang
+  dinyatakan di doc modul (di host tanpa `/proc` prosedurnya "hentikan brain
+  dulu", bukan jaminan).
+
+---
+
+## 13. Tindak lanjut — putaran keenam (2026-11-13)
+
+* **Retensi `tool_calls`: selesai (D9.23).** Butir "pertumbuhan tanpa batas" di §4
+  menyebut `tool_calls` sebagai kolom terakhir yang tidak pernah dipangkas — satu
+  baris per (turn, call) dengan **teks hasil penuh**. Port mendapat
+  `prune_tool_calls(before)`, ticker housekeeping memanggilnya dengan
+  `now - TOOL_CALL_RETENTION` (7 hari), dan **contract suite bersama** yang
+  menguji kedua store (hapus yang lama, pertahankan yang baru, pertahankan yang
+  tepat di batas, idempoten pada pass kedua) — bukan tes masing-masing
+  implementasi.
+* **Kenapa berdasarkan umur, bukan jumlah:** batas berbasis jumlah akan menghapus
+  baris hari ini di hari sibuk dan menyimpan sebulan baris di hari sepi, sementara
+  yang membuat replay sebuah call id masuk akal adalah waktu. Konsekuensinya
+  dinyatakan di doc port, di `TOOL_CALL_RETENTION`, dan di D9.23: replay call yang
+  lebih tua dari jendela akan menjalankan tool-nya lagi.
+* **Yang belum:** kartu (`cards`) dan `entries` di UI masih tumbuh di memori
+  sepanjang sesi aplikasi — itu batas UI, bukan penyimpanan, dan memerlukan
+  kebijakan scrollback yang belum ada. `routine_runs` sudah punya `reap_stale_runs`;
+  `events_log` sudah punya ring.
+
+---
+
+## 14. Tindak lanjut — putaran ketujuh (2026-11-13)
+
+* **Store keluar dari reactor: separuh, dan separuh itu dinyatakan (D9.24).**
+  P2 di §4 menyebut "store sinkron di dalam async" sebagai utang arsitektural
+  terbesar. `ThreadedStore` sudah memperbaiki sisi store (writer + reader thread
+  sendiri); sisi **pemanggil** sebelumnya hanya punya dua jalan yang tidak
+  tersambung. Sekarang ada `store::AsyncStore`: facade yang menjalankan panggilan
+  port di `spawn_blocking`, sehingga task yang menunggu tetap bisa menjalankan
+  pekerjaan lain. Dipakai di `GET /api/nodes`, `GET /api/usage`,
+  `POST /api/nodes/pairing-codes`, dan lookup node gateway.
+* **Kenapa lewat facade, bukan dependensi baru:** `tokio` sudah ada di
+  `[workspace.dependencies]` dan sudah ada di lock, jadi tidak ada lock rewrite
+  (aturan AGENTS.md). Facade bekerja lewat `Arc<dyn Persistence>`, jadi
+  `MemoryStore` di seluruh tes dan `ThreadedStore` di brain melewati kode yang
+  sama — kalau hanya membungkus store durable, tes akan menguji jalur yang berbeda
+  dari produksi.
+* **Yang belum dipindahkan, dan itu dikatakan:** runner, orchestrator, dan loop
+  sesi node gateway masih memanggil port inline — mereka jalur sinkron yang memang
+  memegang thread. `AsyncStore::blocking()` ada untuk mereka, jadi memakainya
+  adalah keputusan yang terlihat saat review, bukan kecelakaan. Batas lain:
+  `spawn_blocking` adalah pool **terbatas**, jadi banyak panggilan bersamaan akan
+  mengantre — benar, tapi bukan konkurensi tanpa batas.
+
+---
+
+## 15. Tindak lanjut — putaran kedelapan (2026-11-13)
+
+* **TLS: selesai (D9.25).** Butir "TLS: `wss://` … tidak ada brain TLS untuk
+  didial" di README sudah benar selama beberapa putaran, dan bentuk celahnya salah:
+  separuh **klien** sudah lengkap, jadi "rewrite-nya benar" adalah klaim tanpa
+  lawan bicara. Sekarang brain men-terminate TLS lewat `TlsListener` di atas
+  `axum::serve` — router, middleware, CORS dan jalur shutdown yang sama, tanpa
+  server kedua.
+* **Tidak ada crate baru di lock.** `tokio-rustls` dan `rustls-pemfile` sudah
+  menjadi dependensi transitif; menyebutkannya menambah **tiga baris** di
+  `Cargo.lock` dan nol paket di graf.
+* **Temuan yang tidak terduga:** `ServerConfig::builder()` **panic** di sini, bukan
+  mengembalikan error, karena `rustls` hanya memilih provider otomatis bila tepat
+  satu fitur `aws-lc-rs`/`ring` aktif — dan di workspace ini keduanya aktif
+  (`reqwest` dan `tokio-tungstenite` masing-masing menyalakan satu, fitur Cargo
+  bersifat aditif). Perbaikannya memasang provider secara eksplisit lalu
+  membuktikannya dengan error bertipe. Komentar pertama saya di kode itu salah dan
+  sudah dikoreksi.
+* **Terbukti dengan binary sungguhan**, bukan hanya unit test: node sungguhan pair
+  lewat `https://`, menyelesaikan signed upgrade + `node.hello` lewat `wss://`, dan
+  muncul online dengan capability disetujui. Node tanpa CA **ditolak di handshake**;
+  permintaan plaintext ke port TLS **tidak dijawab**; klien tanpa root store gagal
+  handshake. Mutation-check dua arah: menghapus CA dari connector membuat node tidak
+  pernah online, dan melewati `TlsListener` membuat handshake klien gagal.
+* **Yang tetap tidak diklaim:** renewal/hot reload sertifikat (dibaca sekali saat
+  boot), dan `wss://` terhadap rantai CA publik.

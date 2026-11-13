@@ -337,6 +337,42 @@ fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) {
                 s.routines = vec![r];
                 s.routine_creator_open = true;
             }
+            if cfg.screen == state::Screen::Usage {
+                // Fabricate what `GET /api/usage` would have delivered, so the
+                // screen renders real rows instead of its "not loaded yet"
+                // state. Two bots, one of them with no reported tokens — the
+                // shape that makes the honest caption do work.
+                let mut lead = swarmbot_contracts::Turn::start(
+                    swarmbot_contracts::BotId::from_suffix("lead"),
+                    swarmbot_contracts::ConversationId::from_suffix("dm-lead"),
+                    swarmbot_contracts::TurnInitiator::Owner,
+                    None,
+                    None,
+                );
+                lead.usage = swarmbot_contracts::turn::Usage {
+                    input_tokens: 12_480,
+                    output_tokens: 3_120,
+                    llm_calls: 4,
+                    tool_calls: 6,
+                };
+                let mut scout = swarmbot_contracts::Turn::start(
+                    swarmbot_contracts::BotId::from_suffix("scout"),
+                    swarmbot_contracts::ConversationId::from_suffix("dm-scout"),
+                    swarmbot_contracts::TurnInitiator::Bot {
+                        bot_id: swarmbot_contracts::BotId::from_suffix("lead"),
+                    },
+                    None,
+                    None,
+                );
+                scout.usage = swarmbot_contracts::turn::Usage::default();
+                let now = chrono::Utc::now();
+                s.usage = Some(Ok(swarmbot_contracts::turn::UsageReport::from_turns(
+                    now - chrono::Duration::hours(s.usage_hours),
+                    now,
+                    &[lead, scout],
+                    |_| Some("lead".to_string()),
+                )));
+            }
             // Fold one fabricated command *failure* through the real reducer.
             // The top bar is only rendered when it has news (see
             // `view::top_bar_model`), so without a toast the selftest would

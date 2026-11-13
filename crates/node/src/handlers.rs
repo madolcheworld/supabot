@@ -73,9 +73,9 @@ use tokio_util::sync::CancellationToken;
 
 use swarmbot_node_protocol::mux::{BoxFuture, Peer, Socket};
 use swarmbot_node_protocol::rpc::{
-    self, ApprovalAnswer, Encoding, FsEdit, FsGlob, FsGrep, FsList, FsMkdir, FsMove, FsRead,
-    FsRemove, FsStat, FsWrite, GrepOutputMode, HelloParams, NodeHello, RequestApproval, ShellExec,
-    decode_params,
+    self, ApprovalAnswer, Encoding, FsDownload, FsDownloadResult, FsEdit, FsGlob, FsGrep, FsList,
+    FsMkdir, FsMove, FsRead, FsRemove, FsStat, FsWrite, GrepOutputMode, HelloParams, NodeHello,
+    RequestApproval, ShellExec, decode_params,
 };
 use swarmbot_node_protocol::wire::TypedError;
 use swarmbot_node_protocol::{
@@ -543,6 +543,9 @@ impl NodeHandler {
                 })?;
                 self.shell(method, params, sink).await
             }
+            // A download is not a `NodeCall`: the bytes ride a data stream, not
+            // the control socket, so it has its own path (§8).
+            rpc::FS_DOWNLOAD => self.download(method, params).await,
             rpc::FS_READ
             | rpc::FS_WRITE
             | rpc::FS_EDIT
@@ -688,6 +691,172 @@ impl NodeHandler {
                 Err(translate(method, &target, &error))
             }
         }
+    }
+
+    /// `fs.download` (§5.1 + §8): read one file under this node's own policy,
+    /// then send its bytes over the data stream the brain minted for it.
+    ///
+    /// The order is deliberate: **the policy decision comes first, the dial
+    /// second.** A node that dialled first and checked the path afterwards would
+    /// have opened a stream (and spent the brain's one-time token) for a read it
+    /// is about to refuse — and the brain's socket task would be waiting on a
+    /// transfer that never comes.
+    ///
+    /// The RPC answers only after the bytes have been **sent**, with what was
+    /// sent. Answering earlier would be a claim about a transfer still in flight;
+    /// the whole point of `{size, sha256}` in the answer is that the brain can
+    /// compare it against what actually arrived.
+    async fn download(&self, method: &str, params: Value) -> Result<Value, TypedError> {
+        let started = Instant::now();
+        let payload: FsDownload = decode_params(method, params)?;
+        let inv = payload.inv.clone();
+        let target = payload.path.clone();
+        let tool = TOOL_READ_FILE;
+        let surface = Surface::ReadFile;
+        let _active = self.enter();
+
+        // Resolving is the path policy: outside the roots, or inside the deny
+        // list, is a denial no approval can waive.
+        let resolved = match self.resolve(&payload.path, false) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.audit(
+                    &inv,
+                    tool,
+                    surface,
+                    &target,
+                    AuditDecision::Refuse,
+                    AuditOutcome::Error,
+                    started,
+                    0,
+                );
+                return Err(translate(method, &target, &error));
+            }
+        };
+
+        // The gate decides on a read, exactly as `fs.read` would: a download is
+        // not a new permission surface, it is a different transport for the same
+        // permission.
+        let call = NodeCall::FsRead {
+            path: payload.path.clone(),
+            offset: None,
+            limit: None,
+            encoding: None,
+        };
+        let gate = self
+            .gate(&inv, method, surface, true, &target, &call)
+            .await?;
+        let audit_decision = gate.audit_decision();
+        if gate.blocked() {
+            self.audit(
+                &inv,
+                tool,
+                surface,
+                &target,
+                audit_decision,
+                AuditOutcome::Error,
+                started,
+                0,
+            );
+            return Err(TypedError::policy_refused(
+                method,
+                gate.denial_reason(&target, surface),
+                false,
+            ));
+        }
+
+        // The brain's one-time grant is spent by the dial below; from here on a
+        // failure has to be reported *to the brain over the socket as well*, or
+        // its ticket would wait out the timeout. `stream::send_file` closes, and
+        // the brain treats a socket that ends without `Done` as a failure.
+        let bytes = match std::fs::read(&resolved) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.audit(
+                    &inv,
+                    tool,
+                    surface,
+                    &target,
+                    audit_decision,
+                    AuditOutcome::Error,
+                    started,
+                    0,
+                );
+                return Err(TypedError::fs_error(
+                    method,
+                    target,
+                    errno_code(&error.to_string()),
+                    format!("cannot read {}: {error}", resolved.display()),
+                ));
+            }
+        };
+
+        // The URL is derived from the brain this node paired with, never from a
+        // payload: a node pointed at an address inside a frame could be aimed at
+        // a third machine.
+        let brain = self
+            .runtime
+            .config
+            .brain_url
+            .clone()
+            .unwrap_or_else(|| self.runtime.identity.brain_origin().to_string());
+        let url = match crate::stream::stream_url(&brain, &payload.stream_id) {
+            Ok(url) => url,
+            Err(error) => {
+                self.audit(
+                    &inv,
+                    tool,
+                    surface,
+                    &target,
+                    audit_decision,
+                    AuditOutcome::Error,
+                    started,
+                    0,
+                );
+                return Err(TypedError::policy_refused(method, error.to_string(), false));
+            }
+        };
+        let sent = match crate::stream::send_file(&url, &payload.stream_token, &bytes).await {
+            Ok(sent) => sent,
+            Err(error) => {
+                tracing::warn!(
+                    stream = %payload.stream_id,
+                    error = %error,
+                    "a data stream could not be completed"
+                );
+                self.audit(
+                    &inv,
+                    tool,
+                    surface,
+                    &target,
+                    audit_decision,
+                    AuditOutcome::Error,
+                    started,
+                    0,
+                );
+                return Err(TypedError::policy_refused(
+                    method,
+                    format!("the stream to the brain failed: {error}"),
+                    true,
+                ));
+            }
+        };
+
+        self.audit(
+            &inv,
+            tool,
+            surface,
+            &target,
+            audit_decision,
+            AuditOutcome::Ok,
+            started,
+            sent.size as usize,
+        );
+        serde_json::to_value(FsDownloadResult {
+            size: sent.size,
+            sha256: sent.sha256,
+        })
+        .map_err(|error| TypedError::policy_refused(method, error.to_string(), false))
     }
 
     /// The streaming `shell.exec`.

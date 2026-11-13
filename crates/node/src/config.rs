@@ -131,6 +131,9 @@ struct ConfigFile {
     /// derived from it, and `http(s)` is what pairing posts to.
     #[serde(default)]
     brain_url: Option<String>,
+    /// PEM bundle of extra roots to trust for a `wss://`/`https://` brain.
+    #[serde(default)]
+    brain_ca: Option<PathBuf>,
     #[serde(default)]
     heartbeat_secs: Option<u64>,
     /// `false` withdraws the `shell@1` capability entirely.
@@ -168,6 +171,14 @@ pub struct NodeConfig {
     pub label: String,
     /// Where the brain is, as typed (`ws://`, `wss://`, `http://` or `https://`).
     pub brain_url: Option<String>,
+    /// Extra PEM roots to trust when the brain is reached over `wss://`/`https://`.
+    ///
+    /// Needed for a brain behind a **private CA** — the case this project's own
+    /// TLS test exercises (D9.25). The system roots are always trusted as well, so
+    /// a publicly-signed brain needs nothing here; this only *adds* anchors, it
+    /// can never remove them, and it is a path rather than inline PEM because a
+    /// certificate bundle is a file an operator already has.
+    pub brain_ca: Option<PathBuf>,
     pub roots: Vec<NodeRoot>,
     /// Extra deny entries on top of the tools crate's default list.
     pub deny: Vec<PathBuf>,
@@ -187,6 +198,7 @@ impl Default for NodeConfig {
         Self {
             label: hostname(),
             brain_url: None,
+            brain_ca: None,
             roots: default_roots(&data_dir),
             deny: Vec::new(),
             ceilings: default_ceilings(),
@@ -244,6 +256,7 @@ impl NodeConfig {
         NodeConfig {
             label: hostname(),
             brain_url: None,
+            brain_ca: None,
             roots: default_roots(&data_dir),
             deny: Vec::new(),
             ceilings: default_ceilings(),
@@ -276,6 +289,9 @@ impl NodeConfig {
         }
         if let Some(url) = file.brain_url {
             config.brain_url = Some(url);
+        }
+        if let Some(ca) = file.brain_ca {
+            config.brain_ca = Some(ca);
         }
         if let Some(secs) = file.heartbeat_secs {
             config.heartbeat_secs = secs.max(1);
@@ -314,6 +330,7 @@ impl NodeConfig {
         let file = ConfigFile {
             label: Some(self.label.clone()),
             brain_url: self.brain_url.clone(),
+            brain_ca: self.brain_ca.clone(),
             heartbeat_secs: Some(self.heartbeat_secs),
             shell: Some(self.shell_enabled),
             auto_approve_read_only: Some(self.auto_approve_read_only),

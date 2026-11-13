@@ -129,6 +129,16 @@ pub struct Cli {
     #[arg(long, value_name = "HOST:PORT", env = "SWARMBOT_INTERNAL_ADDR")]
     pub internal_addr: Option<String>,
 
+    /// Serve the public listener over TLS: PEM certificate chain, leaf first.
+    /// Needs `--tls-key`; together they turn `http://` into `https://` and
+    /// `ws://` into `wss://` for every client (D9.25).
+    #[arg(long, value_name = "FILE", env = "SWARMBOT_TLS_CERT")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// Serve the public listener over TLS: PEM private key. Needs `--tls-cert`.
+    #[arg(long, value_name = "FILE", env = "SWARMBOT_TLS_KEY")]
+    pub tls_key: Option<PathBuf>,
+
     /// Origin used for the one-time login URL and the WebSocket Origin allow-list.
     #[arg(long, value_name = "ORIGIN", env = "SWARMBOT_PUBLIC_ORIGIN")]
     pub public_origin: Option<String>,
@@ -281,6 +291,25 @@ impl Resolved {
         }
         if let Some(internal) = &cli.internal_addr {
             config.internal_addr = (!internal.trim().is_empty()).then(|| internal.clone());
+        }
+        // TLS: the flags win over the file, and half a pair is refused here rather
+        // than at the first handshake — a brain that boots and then fails every
+        // node dial puts the error on the wrong machine.
+        if cli.tls_cert.is_some() || cli.tls_key.is_some() {
+            config.tls = Some(swarmbot_contracts::config::TlsConfig {
+                cert: cli.tls_cert.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`--tls-key` was given without `--tls-cert`: TLS needs both. Pass the \
+                         certificate with `--tls-cert`, or drop `--tls-key` to serve plaintext"
+                    )
+                })?,
+                key: cli.tls_key.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`--tls-cert` was given without `--tls-key`: TLS needs both. Pass the \
+                         private key with `--tls-key`, or drop `--tls-cert` to serve plaintext"
+                    )
+                })?,
+            });
         }
         if let Some(origin) = &cli.public_origin {
             config.public_origin = Some(origin.trim_end_matches('/').to_string());

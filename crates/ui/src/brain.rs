@@ -19,7 +19,7 @@ use swarmbot_client::{
 };
 use swarmbot_contracts::{
     Bot, BotId, Conversation, ConversationId, Decision, EntryId, NodeId, NodeInfo, RequestId,
-    Routine, RoutineId, RoutineRun, RuntimeRequest, Settings, Task, TaskId,
+    Routine, RoutineId, RoutineRun, RuntimeRequest, Settings, Task, TaskId, UsageReport,
 };
 
 /// The REST surface the UI uses. Object-safe and `Send + Sync` so the worker
@@ -81,6 +81,9 @@ pub trait Brain: Send + Sync {
         id: &RoutineId,
         limit: Option<u32>,
     ) -> Result<Vec<RoutineRun>, ClientError>;
+    /// `GET /api/usage` — what the backends reported the team spent in a
+    /// window. `since` is RFC 3339 text; `None` asks for the brain's default.
+    fn usage(&self, since: Option<&str>) -> Result<UsageReport, ClientError>;
     fn shutdown(&self) -> Result<(), ClientError>;
 }
 
@@ -213,6 +216,9 @@ impl Brain for ClientBrain {
         limit: Option<u32>,
     ) -> Result<Vec<RoutineRun>, ClientError> {
         self.client.routine_runs(id, limit)
+    }
+    fn usage(&self, since: Option<&str>) -> Result<UsageReport, ClientError> {
+        self.client.usage(since)
     }
     fn shutdown(&self) -> Result<(), ClientError> {
         self.client.shutdown()
@@ -553,6 +559,15 @@ pub mod scripted {
         ) -> Result<Vec<RoutineRun>, ClientError> {
             self.record("routine_runs", id.to_string());
             self.maybe_fail(Vec::new())
+        }
+        fn usage(&self, since: Option<&str>) -> Result<UsageReport, ClientError> {
+            self.record("usage", since.unwrap_or("<default>").to_string());
+            self.maybe_fail(UsageReport::from_turns(
+                chrono::Utc::now(),
+                chrono::Utc::now(),
+                &[],
+                |_| None,
+            ))
         }
         fn shutdown(&self) -> Result<(), ClientError> {
             self.record("shutdown", "");

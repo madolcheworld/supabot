@@ -16,6 +16,11 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+# For `tokio::task::spawn_blocking`, which is what lets an async caller await a
+# port call instead of parking its own worker on it (`crate::async_store`).
+# Already a workspace dependency and already in the lock file, so no lock rewrite.
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util", "time"] }

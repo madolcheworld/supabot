@@ -53,6 +53,7 @@ use crate::session::{Session, origin_tag};
 use crate::settings::SettingsHandle;
 use crate::swarm::{McpProviderSlot, McpTurnRegistration, McpTurnRequest};
 use crate::transcript::Transcript;
+use swarmbot_store::AsyncStore;
 
 /// How often a streaming reply is written to the transcript. Every delta would
 /// be a write per character; a model that stops mid-word is still readable.
@@ -158,6 +159,85 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// Closes a turn this future opened, if the future is dropped instead of run
+/// to the end.
+///
+/// The runner awaits a turn two ways: normally, and through a `select!` that
+/// **drops** the turn future when the brain cancels or a `Shutdown` command
+/// arrives (a `select!` branch cancels its siblings). A dropped future runs no
+/// code after its last await point, so without this guard the turn row stayed
+/// `Running` in the store forever, the delivery stayed `Running` with it, and
+/// `wait_for_idle` — which believes the store on purpose — waited out its whole
+/// budget for work nobody owned. A whole team then looked permanently busy, and
+/// a test's `settle()` failed with `busy=[]` and a `Running` turn it had to
+/// already know existed.
+///
+/// It settles the state it can see, and only then: if the store already holds a
+/// terminal turn, the normal path won, and touching anything here would turn a
+/// success into an interruption. Best effort by design — failing to record a
+/// shutdown must not mask it — so errors are logged loudly and boot recovery
+/// settles the row on the next start.
+struct TurnGuard {
+    store: Arc<dyn Persistence>,
+    bot_id: BotId,
+    turn_id: TurnId,
+    deliveries: Vec<Delivery>,
+    finished: bool,
+}
+
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // A panic is not a shutdown, and `settle_turns_of_a_panicking_runner`
+        // is the one place that names it: it closes every open turn of the bot
+        // as `Failed` with the panic message. Writing `Interrupted` here first
+        // would take that name away — the row would say the runner stopped,
+        // which is true but hides the reason the operator needs.
+        if std::thread::panicking() {
+            return;
+        }
+        let now = chrono::Utc::now();
+        match self.store.get_turn(&self.turn_id) {
+            Ok(Some(mut turn)) if !turn.status.is_terminal() => {
+                turn.interrupt(now, "the bot runner dropped this turn before it finished");
+                if let Err(error) = self.store.update_turn(&turn) {
+                    tracing::error!(
+                        bot = %self.bot_id,
+                        turn = %self.turn_id,
+                        %error,
+                        "cannot close a turn whose future was dropped; it stays open until the next boot"
+                    );
+                    return;
+                }
+            }
+            Ok(_) => return, // the turn never landed, or the normal path closed it
+            Err(error) => {
+                tracing::error!(
+                    bot = %self.bot_id,
+                    turn = %self.turn_id,
+                    %error,
+                    "cannot read a dropped turn; it stays open until the next boot"
+                );
+                return;
+            }
+        }
+        for delivery in &self.deliveries {
+            let mut record = delivery.clone();
+            record.mark_dropped(now);
+            if let Err(error) = self.store.update_delivery(&record) {
+                tracing::error!(
+                    bot = %self.bot_id,
+                    delivery = %delivery.id,
+                    %error,
+                    "cannot mark a dropped delivery; it stays running until the next boot"
+                );
+            }
+        }
+    }
+}
+
 /// Clears the "working" roster on the way out of `run_turn`, whatever the way
 /// out was.
 ///
@@ -165,7 +245,8 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 /// error, and a dropped future when the brain cancels the turn — and only one
 /// of them used to reach the explicit clear. The others left `busy` set, so the
 /// roster claimed a bot was working when it was not, and `Swarm::shutdown`
-/// waited on a runner that had already stopped.
+/// waited on a runner that had already stopped. The **store** rows those paths
+/// leave behind are `TurnGuard`'s job, one step further down.
 struct BusyGuard(Arc<SharedState>);
 
 impl Drop for BusyGuard {
@@ -800,16 +881,25 @@ async fn run_turn(
     };
     let conversation_id = first.conversation_id.clone();
     let store = Arc::clone(&env.store);
+    // `run_turn` is **async**, so its store calls must not park the worker this
+    // task is on: the facade hands each call to `spawn_blocking` (D9.24), and the
+    // turn's own setup — four reads and one insert that can each land in SQLite's
+    // busy wait — then costs the runtime nothing while it waits.
+    let db = AsyncStore::new(Arc::clone(&store));
 
-    let bot = store
-        .get_bot(&bot_id)?
+    let lookup = bot_id.clone();
+    let bot = db
+        .read(move |store| store.get_bot(&lookup))
+        .await?
         .ok_or_else(|| swarmbot_contracts::not_found::bot(&bot_id))?;
-    let conversation = store
-        .get_conversation(&conversation_id)?
+    let lookup = conversation_id.clone();
+    let conversation = db
+        .read(move |store| store.get_conversation(&lookup))
+        .await?
         .ok_or_else(|| swarmbot_contracts::not_found::conversation(&conversation_id))?;
     let settings = env.settings.get();
-    let task = match first.task_id.as_ref() {
-        Some(id) => store.get_task(id)?,
+    let task = match first.task_id.clone() {
+        Some(id) => db.read(move |store| store.get_task(&id)).await?,
         None => None,
     };
 
@@ -820,7 +910,8 @@ async fn run_turn(
         Some(first.id.clone()),
         first.task_id.clone(),
     );
-    store.insert_turn(&turn)?;
+    let inserted = turn.clone();
+    db.write(move |store| store.insert_turn(&inserted)).await?;
 
     let turn_cancel = CancellationToken::new();
     {
@@ -849,8 +940,22 @@ async fn run_turn(
     for delivery in &deliveries {
         let mut record = delivery.clone();
         record.mark_running(chrono::Utc::now());
-        let _ = store.update_delivery(&record);
+        // A failed mark is not fatal — the turn still runs — but it must not be
+        // an inline blocking write either, so it goes through the facade and the
+        // error is dropped exactly as before.
+        let _ = db.write(move |store| store.update_delivery(&record)).await;
     }
+
+    // From here on, the turn and its deliveries exist in the store. If this
+    // future is **dropped** rather than awaited to the end, nothing below runs
+    // — and the row stays `Running` for good.
+    let mut settle = TurnGuard {
+        store: Arc::clone(&store),
+        bot_id: bot_id.clone(),
+        turn_id: turn.id.clone(),
+        deliveries: deliveries.clone(),
+        finished: false,
+    };
 
     let mut consumed_steers = Vec::new();
     let executed = execute_turn(
@@ -912,14 +1017,18 @@ async fn run_turn(
         Ok((_, turn)) => turn.clone(),
         Err(_) => turn.clone(),
     };
-    store.update_turn(&finished_turn)?;
+    let settled = finished_turn.clone();
+    db.write(move |store| store.update_turn(&settled)).await?;
     env.hub.publish(Change::Turn(finished_turn));
 
     for delivery in deliveries.iter().chain(consumed_steers.iter()) {
         let mut record = delivery.clone();
         record.mark_done(chrono::Utc::now());
-        let _ = store.update_delivery(&record);
+        let _ = db.write(move |store| store.update_delivery(&record)).await;
     }
+    // The turn and its deliveries are written. Everything from here on is
+    // bookkeeping that does not need a settle if it is cut short.
+    settle.finished = true;
 
     // A routine's run row has to be closed here, or every run the API lists
     // stays `Running` forever — a permanent lie and a table that grows one dead
@@ -2580,6 +2689,82 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), swarm.shutdown())
             .await
             .expect("shutdown must finish after a turn was cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_runner_stopped_mid_turn_closes_its_turn_instead_of_leaving_it_running() {
+        // A `RunnerHandle::shutdown` (or `/api/shutdown`, or a dropped command
+        // channel) drops the `run_turn` future through the runner's `select!`,
+        // so the turn it had already inserted stayed `Running` forever. That is
+        // the same lie the panic path was fixed for, one path over: the
+        // transcript says work is in flight, and `wait_for_idle` waits out its
+        // whole budget. A durable brain that shuts down and comes back would
+        // also see it as a turn it never finished.
+        let (swarm, _dir) = test_swarm();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(HoldBackend {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+        swarm.backends.register(
+            "hold",
+            Arc::clone(&backend) as Arc<dyn swarmbot_llm::LlmBackend>,
+        );
+
+        let mut lead = swarm.bots.by_name("lead").unwrap();
+        lead.backend = "hold".to_string();
+        swarm.bots.update(&lead).unwrap();
+        swarm.ensure_runners().unwrap();
+
+        swarm
+            .send(&lead.direct_conversation_id, "block forever")
+            .unwrap();
+        started.notified().await;
+
+        let running = swarm.store.running_turns().expect("turns read");
+        assert_eq!(
+            running.iter().filter(|turn| turn.bot_id == lead.id).count(),
+            1,
+            "the turn is in flight before the runner stops: {running:?}"
+        );
+
+        let handle = swarm.runners.get(&lead.id).expect("runner");
+        handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), handle.joined())
+            .await
+            .expect("joined() must return after the runner has ended");
+        release.notify_one();
+
+        let still_running = swarm.store.running_turns().expect("turns read");
+        assert!(
+            !still_running.iter().any(|turn| turn.bot_id == lead.id),
+            "a runner that stops mid-turn must close the turn it owned: {still_running:?}"
+        );
+
+        let turns = swarm
+            .store
+            .turns_in(&lead.direct_conversation_id, 10)
+            .expect("turns read");
+        let abandoned = turns
+            .iter()
+            .find(|turn| turn.status == TurnStatus::Interrupted)
+            .unwrap_or_else(|| panic!("the turn was settled, not left open: {turns:?}"));
+        assert!(
+            abandoned
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("runner dropped this turn")),
+            "the reason names the stop instead of looking like a backend error: {:?}",
+            abandoned.error
+        );
+
+        // And the swarm reports idle, which is what `run --wait`, `settle()` and
+        // a restart's boot check all depend on.
+        assert!(
+            swarm.wait_for_idle(Duration::from_secs(5)).await,
+            "a stopped runner's swarm goes idle instead of waiting out the budget"
+        );
     }
 
     #[tokio::test]

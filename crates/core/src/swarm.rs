@@ -129,11 +129,30 @@ pub const EVENT_LOG_KEEP: u64 = 20_000;
 /// deleted bot; no turn legitimately runs for six hours.
 pub const ROUTINE_RUN_STALE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 
+/// How long a tool-call idempotency row is kept.
+///
+/// The row exists so a harness that replays a call id after a resume gets the
+/// stored answer instead of running the tool twice. That replay is plausible for
+/// hours and implausible for a month, and the row carries the **full result
+/// text** — so this is the last unbounded column in the schema until it is
+/// pruned by age. A week is the compromise: long enough to cover an overnight
+/// restart, short enough that a busy data dir stops growing a row per tool call
+/// forever.
+///
+/// One consequence, stated rather than glossed: a replay of a call older than
+/// this window re-runs the tool. That is the correct trade — the alternative is a
+/// database that grows without bound to serve a replay nobody performs — but it
+/// is a behaviour, not an accident, so it is named here and in the port's doc.
+pub const TOOL_CALL_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// What one housekeeping pass did, so a test (and the log) can see it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HousekeepingReport {
     pub events_dropped: u64,
     pub routine_runs_reaped: usize,
+    /// Tool-call idempotency rows older than [`TOOL_CALL_RETENTION`] that were
+    /// deleted this pass.
+    pub tool_calls_pruned: u64,
 }
 
 pub struct Swarm {
@@ -480,9 +499,32 @@ impl Swarm {
         self.housekeep(EVENT_LOG_KEEP)
     }
 
+    /// One pass with explicit limits, for a test that cannot wait out a week.
+    ///
+    /// The two bounds move together in production (`housekeep`), and are separate
+    /// arguments here so a test can prune a minute-old row without publishing
+    /// twenty thousand events or waiting seven days.
+    pub fn housekeep_with(
+        &self,
+        keep: u64,
+        tool_calls_before: chrono::DateTime<chrono::Utc>,
+    ) -> HousekeepingReport {
+        self.housekeep_at(keep, tool_calls_before)
+    }
+
     /// One pass with an explicit ring size, so a test can prove the bound
     /// without publishing twenty thousand events first.
     pub fn housekeep(&self, keep: u64) -> HousekeepingReport {
+        self.housekeep_at(keep, chrono::Utc::now() - TOOL_CALL_RETENTION)
+    }
+
+    /// [`housekeep`] with an explicit cutoff, so a test can pin the boundary
+    /// rather than race a clock.
+    fn housekeep_at(
+        &self,
+        keep: u64,
+        tool_calls_before: chrono::DateTime<chrono::Utc>,
+    ) -> HousekeepingReport {
         let mut report = HousekeepingReport::default();
         match self.hub.truncate_log(keep) {
             Ok(dropped) => report.events_dropped = dropped,
@@ -494,6 +536,10 @@ impl Swarm {
         {
             Ok(reaped) => report.routine_runs_reaped = reaped,
             Err(err) => warn!(error = %err, "cannot reap stale routine runs"),
+        }
+        match self.store.prune_tool_calls(tool_calls_before) {
+            Ok(pruned) => report.tool_calls_pruned = pruned,
+            Err(err) => warn!(error = %err, "cannot prune old tool-call records"),
         }
         report
     }
@@ -635,6 +681,74 @@ mod tests {
         .expect("swarm");
         swarm.provision_team().expect("provision");
         (swarm, dir)
+    }
+
+    #[tokio::test]
+    async fn housekeeping_prunes_tool_call_records_by_age() {
+        // `tool_calls` held one row per (turn, call) with the **full result
+        // text**, and nothing ever removed one — the last unbounded column in the
+        // schema. The bound has to be by age, not count: a count would delete
+        // today's rows on a busy day and keep a month of them on a quiet one,
+        // while what makes a replayed call id plausible is time.
+        use swarmbot_contracts::{NodeId, ToolCallId, ToolCallRecord, TurnId};
+
+        let (swarm, _dir) = test_swarm();
+        let stale = ToolCallRecord {
+            turn_id: TurnId::new(),
+            call_id: ToolCallId::new(),
+            tool: "shell".into(),
+            args: serde_json::json!({"command": "ls"}),
+            result_text: "a month-old result".into(),
+            is_error: false,
+            node_id: Some(NodeId::local()),
+            created_at: chrono::Utc::now() - chrono::Duration::days(30),
+        };
+        let fresh = ToolCallRecord {
+            turn_id: TurnId::new(),
+            call_id: ToolCallId::new(),
+            created_at: chrono::Utc::now(),
+            ..stale.clone()
+        };
+        swarm.store.insert_tool_call(&stale).expect("stale record");
+        swarm.store.insert_tool_call(&fresh).expect("fresh record");
+        assert!(
+            swarm
+                .store
+                .find_tool_call(&stale.turn_id, &stale.call_id)
+                .expect("read")
+                .is_some(),
+            "the stale row is there before housekeeping"
+        );
+
+        // One pass at the production retention: the month-old row goes, the
+        // fresh one stays. The cutoff is `now - TOOL_CALL_RETENTION`, so a test
+        // cannot race a clock.
+        let report = swarm.housekeep_once();
+        assert!(
+            report.tool_calls_pruned >= 1,
+            "the stale record was pruned: {report:?}"
+        );
+        assert!(
+            swarm
+                .store
+                .find_tool_call(&stale.turn_id, &stale.call_id)
+                .expect("read")
+                .is_none(),
+            "a pruned record is really gone"
+        );
+        assert!(
+            swarm
+                .store
+                .find_tool_call(&fresh.turn_id, &fresh.call_id)
+                .expect("read")
+                .is_some(),
+            "a record inside the retention window survives — a prune is not a truncate"
+        );
+
+        // A second pass removes nothing, so a ticker that fires twice cannot
+        // keep reporting work.
+        let again = swarm.housekeep_once();
+        assert_eq!(again.tool_calls_pruned, 0, "the prune is idempotent");
     }
 
     #[tokio::test]

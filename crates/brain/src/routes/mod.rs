@@ -48,6 +48,7 @@ pub mod routines;
 pub mod rules;
 pub mod session;
 pub mod settings;
+pub mod streams;
 pub mod tasks;
 pub mod usage;
 
@@ -123,7 +124,11 @@ pub fn router(state: AppState) -> Router {
     let open = Router::new()
         .route("/api/session", post(session::create))
         .route("/node/pair", post(node_gateway::pair))
-        .route("/node", get(node_gateway::connect));
+        .route("/node", get(node_gateway::connect))
+        // The data-stream socket (§8). Not behind the owner gate for the same
+        // reason `/node` is not: the credential is the one-time stream token,
+        // which the brain minted and handed to exactly one node.
+        .route("/node/stream/{id}", get(streams::stream));
 
     Router::new()
         .merge(owned)

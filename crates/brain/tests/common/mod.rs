@@ -167,6 +167,47 @@ impl TestBrain {
         }
     }
 
+    /// Boot a brain whose public listener terminates TLS with `cert`/`key`.
+    ///
+    /// The certificate is loaded by the **same** `TlsPaths::load` the daemon uses,
+    /// so a test that passes here passes on the real start-up path; what differs is
+    /// only who called `bind`.
+    pub async fn start_tls(cert: &std::path::Path, key: &std::path::Path) -> Self {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let brain = Self::boot_durable(dir.path());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback socket");
+        let addr = listener.local_addr().expect("the bound address");
+        let login_url = brain.login_url.clone();
+        let token = brain.state.owner_token().to_string();
+        let paths = swarmbot_brain::tls::TlsPaths {
+            cert: cert.to_path_buf(),
+            key: key.to_path_buf(),
+        };
+        let serve = tokio::spawn(server::serve_tls(
+            brain.state.clone(),
+            listener,
+            paths,
+            None,
+            ServeOptions::in_process(),
+        ));
+        // `wait_for_port` cannot be used here: a TLS listener completes the TCP
+        // handshake and then waits for a ClientHello, so a bare connect succeeds
+        // before anything is ready. A real TLS handshake is the readiness probe.
+        wait_for_tls(addr).await;
+        Self {
+            swarm: Arc::clone(&brain.swarm),
+            state: brain.state.clone(),
+            addr,
+            base_url: format!("https://{addr}"),
+            token,
+            login_url,
+            dir: Some(dir),
+            serve: Some(serve),
+        }
+    }
+
     pub fn ws_url(&self) -> String {
         format!("ws://{}/ws/live", self.addr)
     }
@@ -252,36 +293,82 @@ impl TestBrain {
     ///
     /// A timeout explains itself: "did not go quiet" without saying *what* is
     /// still working is the kind of failure that costs an hour to diagnose.
+    /// It reads the state **twice** — before and after the wait — because the
+    /// two answers are different failures: work that is still running, and work
+    /// that finished while `wait_for_idle` was watching but whose bookkeeping
+    /// (a turn, a delivery, a task) was left behind. A single reading cannot
+    /// tell those apart, and the second one is a bug in the product rather than
+    /// a slow machine.
     pub async fn settle(&self) {
+        let before = self.work_report();
         if self.swarm.wait_for_idle(IDLE_BUDGET).await {
             return;
         }
-        let mut busy = Vec::new();
-        let mut queued = Vec::new();
-        for bot in self.swarm.store.list_bots().unwrap_or_default() {
-            if self.swarm.runners.is_busy(&bot.id) {
-                busy.push(bot.name.clone());
-            }
-            let waiting = self
-                .swarm
-                .store
-                .queued_deliveries(&bot.id)
-                .map(|deliveries| deliveries.len())
-                .unwrap_or(0);
-            if waiting > 0 {
-                queued.push(format!("{}:{waiting}", bot.name));
-            }
-        }
+        let after = self.work_report();
+        panic!(
+            "the swarm did not go quiet within {IDLE_BUDGET:?}\n  before: {before}\n  after:  {after}"
+        );
+    }
+
+    /// Every signal `wait_for_idle` consults, in one line.
+    ///
+    /// `running_turns` is included on purpose: it is the one signal that is
+    /// **not** in memory, so a turn the store still calls `Running` is invisible
+    /// in `busy`/`queued`/`parked` — and invisible is how a stuck turn survived
+    /// a whole debugging session (AGENTS.md, "make the failure print the state").
+    pub fn work_report(&self) -> String {
+        let bots = self.swarm.store.list_bots().unwrap_or_default();
+        let busy: Vec<&str> = bots
+            .iter()
+            .filter(|bot| self.swarm.runners.is_busy(&bot.id))
+            .map(|bot| bot.name.as_str())
+            .collect();
+        let queued: Vec<String> = bots
+            .iter()
+            .filter_map(|bot| {
+                let waiting = self
+                    .swarm
+                    .store
+                    .queued_deliveries(&bot.id)
+                    .map(|deliveries| deliveries.len())
+                    .unwrap_or(0);
+                (waiting > 0).then(|| format!("{}:{waiting}", bot.name))
+            })
+            .collect();
         let tasks = self
             .swarm
             .store
             .queued_tasks()
             .map(|tasks| tasks.len())
             .unwrap_or(0);
-        panic!(
-            "the swarm did not go quiet within {IDLE_BUDGET:?}: busy={busy:?} queued={queued:?}              parked={} queued_tasks={tasks}",
+        let mut running: Vec<String> = self
+            .swarm
+            .store
+            .running_turns()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|turn| {
+                let name = self
+                    .swarm
+                    .store
+                    .get_bot(&turn.bot_id)
+                    .ok()
+                    .flatten()
+                    .map(|bot| bot.name)
+                    .unwrap_or_else(|| turn.bot_id.as_str().to_string());
+                format!(
+                    "{name}={} started={} llm_calls={}",
+                    turn.id.as_str(),
+                    turn.started_at.to_rfc3339(),
+                    turn.usage.llm_calls
+                )
+            })
+            .collect();
+        running.sort();
+        format!(
+            "busy={busy:?} queued={queued:?} parked={} queued_tasks={tasks} running_turns={running:?}",
             self.swarm.runners.parked_count()
-        );
+        )
     }
 
     /// The entries of one conversation, ascending.
@@ -335,6 +422,41 @@ impl Drop for TestBrain {
 }
 
 /// Block until something accepts a connection on `addr`.
+/// Wait until a TLS listener completes handshakes, not merely accepts TCP.
+///
+/// A TLS listener accepts the socket and *then* waits for a ClientHello, so
+/// `TcpStream::connect` succeeding says nothing about readiness — a plaintext
+/// readiness probe would race the accept loop and make the first request in a
+/// test flaky in a way that looks like a TLS bug.
+async fn wait_for_tls(addr: std::net::SocketAddr) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        // A handshake that fails for any reason (including an untrusted cert)
+        // still proves the server answered, which is all readiness means.
+        let attempt = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await;
+        if let Ok(Ok(stream)) = attempt {
+            // Send a byte that is not a TLS record: the server drops the
+            // connection, and the drop is what says "the handler is running".
+            use tokio::io::AsyncWriteExt as _;
+            let mut stream = stream;
+            let _ = stream.write_all(b"not a tls hello").await;
+            let _ = stream.shutdown().await;
+            // One accept is enough: the listener loop is running.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the TLS listener on {addr} never accepted a connection"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 async fn wait_for_port(addr: SocketAddr) {
     for _ in 0..200 {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {

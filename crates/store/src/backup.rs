@@ -30,10 +30,11 @@
 //! operation on a data dir that may belong to another process (or a dead one),
 //! and `ThreadedStore` owns lanes that must not be borrowed for it.
 //!
-//! Restoring is deliberately not implemented here: a restore is "open the
-//! snapshot as a store", which [`SqliteStore::open`](crate::SqliteStore::open)
-//! already does. The test suite proves the snapshot is restorable that way
-//! rather than trusting the bytes.
+//! Restoring is **not** in this module: replacing a live data dir has its own
+//! safety rules (a running brain, a stale `-wal`, a way back), so it lives in
+//! [`crate::restore`]. This module's half of that contract is only that a
+//! snapshot is a *complete and verifiable* database, which is what
+//! [`SqliteStore::open`](crate::SqliteStore::open) proving it restorable adds to.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -58,7 +59,8 @@ pub const MANIFEST_VERSION: u32 = 1;
 
 /// The snapshot is written under the same name as the live database, so
 /// restoring it is "put this file back as `<data>/swarmbot.sqlite`".
-const SNAPSHOT_FILE: &str = DATABASE_FILE;
+/// Public so `restore` names the same file instead of re-spelling it.
+pub const SNAPSHOT_FILE: &str = DATABASE_FILE;
 
 /// Temporary manifest name; the rename onto [`MANIFEST_FILE`] is the moment a
 /// backup becomes a backup.
@@ -94,6 +96,15 @@ const COUNTED_TABLES: &[&str] = &[
     "routines",
     "routine_runs",
 ];
+
+/// The tables a restore re-counts, as a slice a caller can iterate.
+///
+/// Public because `restore` verifies a *copied* snapshot against the same list the
+/// manifest was built from: two lists would drift, and the drift would show up as
+/// a restore that "succeeded" with fewer rows than the backup held.
+pub fn counted_tables() -> &'static [&'static str] {
+    COUNTED_TABLES
+}
 
 /// What [`backup`] wrote, and the manifest it wrote last.
 #[derive(Clone, Debug, PartialEq)]

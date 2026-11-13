@@ -29,6 +29,7 @@ use swarmbot_contracts::{
     Bot, BotId, BotStatus, Conversation, ConversationId, ConversationKind, Entry, EntryId,
     LiveCursor, NodeId, NodeInfo, RequestId, Routine, RoutineId, RoutineRun, RoutineSchedule,
     RuntimeRequest, Settings, Task, TaskId, TaskStatus, TaskStep, Turn, TurnId, TurnStatus,
+    UsageReport,
 };
 
 /// Which pane the main area shows. The delegation graph is an overlay panel
@@ -39,6 +40,9 @@ pub enum Screen {
     Conversation,
     Nodes,
     Routines,
+    /// What the backends reported the team spent (`GET /api/usage`). Read-only:
+    /// nothing here can change the spend, so nothing here writes to the brain.
+    Usage,
     Settings,
 }
 
@@ -139,6 +143,15 @@ pub struct AppState {
     pub pairing: Option<PairingCode>,
     pub routines: Vec<Routine>,
     pub routine_runs: HashMap<RoutineId, Vec<RoutineRun>>,
+    /// The usage screen's last answer. Three states, kept distinct on purpose:
+    /// `None` = never fetched, `Ok` = a report, `Err` = the fetch failed and the
+    /// screen must say so (with a Retry) rather than render zeroes.
+    pub usage: Option<Result<UsageReport, String>>,
+    /// The window the usage screen asks for, in hours. The buttons set it; the
+    /// `since` instant sent to the brain is derived from it at click time
+    /// (`view::usage::since_for`), so a long-lived window does not quietly
+    /// become a different one while the app sits open.
+    pub usage_hours: i64,
     pub selected_routine: Option<RoutineId>,
     pub routine_creator_open: bool,
     pub routine_draft_bot: Option<BotId>,
@@ -225,6 +238,10 @@ impl AppState {
             pairing: None,
             routines: Vec::new(),
             routine_runs: HashMap::new(),
+            usage: None,
+            // The brain's own default (`DEFAULT_WINDOW_HOURS`), so the first
+            // fetch asks the same question the CLI's bare `swarmbot usage` does.
+            usage_hours: swarmbot_contracts::turn::DEFAULT_WINDOW_HOURS,
             selected_routine: None,
             routine_creator_open: false,
             routine_draft_bot: None,
