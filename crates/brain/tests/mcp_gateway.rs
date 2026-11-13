@@ -106,6 +106,26 @@ impl RunningInternalBrain {
         format!("http://{}{path}", self.internal_addr)
     }
 
+    /// An HTTP client that authenticates as the owner.
+    ///
+    /// The static `/mcp` route serves the whole tool registry, so it is on the
+    /// owner's gate; a harness reaches it with the token from `<data>/owner-token`
+    /// (or the `Authorization` header `swarmbot-mcp.json` carries).
+    fn owner_client(&self) -> Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", self.brain.state.owner_token())
+                .parse()
+                .expect("an ascii bearer header"),
+        );
+        Client::builder()
+            .timeout(TIMEOUT)
+            .default_headers(headers)
+            .build()
+            .expect("client")
+    }
+
     async fn stop(self) {
         self.brain.state.request_shutdown();
         self.brain.swarm.shutdown().await;
@@ -139,6 +159,27 @@ async fn internal_listener_writes_mcp_config_file() {
     let val: Value = serde_json::from_str(&content).expect("parse mcp config json");
     let expected_url = brain.url("/mcp");
     assert_eq!(val["mcpServers"]["swarmbot"]["url"], json!(expected_url));
+    assert_eq!(val["mcpServers"]["swarmbot"]["type"], json!("http"));
+    // The static route requires the owner gate, so the config a harness reads has
+    // to carry the credential — and the file therefore has to be owner-only, like
+    // `<data>/owner-token` whose value it holds.
+    assert_eq!(
+        val["mcpServers"]["swarmbot"]["headers"]["Authorization"],
+        json!(format!("Bearer {}", brain.brain.state.owner_token()))
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&mcp_cfg_path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "the MCP config holds the owner token: mode {mode:o} is too open"
+        );
+    }
 }
 
 fn parse_sse_or_json(text: &str) -> Value {
@@ -159,10 +200,132 @@ fn parse_sse_or_json(text: &str) -> Value {
     }
 }
 
+/// The static `/mcp` route serves the whole tool registry — `shell` and the fs
+/// tools included — so it must refuse a caller that presents no credential, with
+/// the documented envelope and no MCP session. Before the fix this route had no
+/// auth layer at all: the same `tools/call` answered 200 and ran the tool.
 #[tokio::test]
-async fn internal_listener_serves_mcp_initialize_and_tools_list() {
+async fn internal_listener_refuses_an_anonymous_tools_call() {
     let brain = RunningInternalBrain::start().await;
-    let client = Client::builder().timeout(TIMEOUT).build().expect("client");
+    let anonymous = Client::builder().timeout(TIMEOUT).build().expect("client");
+
+    // 1. `initialize` is refused before any MCP session exists.
+    let resp = anonymous
+        .post(brain.url("/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "anonymous", "version": "1.0" }
+            }
+        }))
+        .send()
+        .await
+        .expect("send anonymous initialize");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(
+        resp.headers().get("mcp-session-id").is_none(),
+        "a refused caller must not be handed a session"
+    );
+    let body: Value = resp.json().await.expect("the documented envelope");
+    assert_eq!(body["error"]["code"], json!("unauthorized"), "{body}");
+
+    // 2. The tool call itself is refused. This is the assertion that pins the
+    //    bug: an unauthenticated caller could list and *run* every tool.
+    let resp = anonymous
+        .post(brain.url("/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "read_file",
+                "arguments": { "path": "marker.txt" }
+            }
+        }))
+        .send()
+        .await
+        .expect("send anonymous tools/call");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body: Value = resp.json().await.expect("the documented envelope");
+    assert_eq!(body["error"]["code"], json!("unauthorized"), "{body}");
+    assert!(
+        !body.to_string().contains("hello from mcp test"),
+        "the tool must not have run: {body}"
+    );
+
+    // 3. The same call with the owner token works end to end, so the route is
+    //    authenticated rather than disabled.
+    let owner = brain.owner_client();
+    let sid = mcp_initialize(&owner, &brain.url("/mcp")).await;
+    let (list_status, _, list_val) = mcp_post(
+        &owner,
+        &brain.url("/mcp"),
+        sid.as_deref(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/list",
+            "params": {}
+        }),
+    )
+    .await;
+    assert_eq!(list_status, reqwest::StatusCode::OK);
+    let list_val = list_val.expect("list response");
+    let tool_names: Vec<&str> = list_val["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(tool_names.contains(&"shell"), "{tool_names:?}");
+    assert!(tool_names.contains(&"read_file"), "{tool_names:?}");
+
+    let (call_status, _, call_val) = mcp_post(
+        &owner,
+        &brain.url("/mcp"),
+        sid.as_deref(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "read_file",
+                "arguments": { "path": "marker.txt" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(call_status, reqwest::StatusCode::OK);
+    let call_val = call_val.expect("call response");
+    assert_ne!(
+        call_val["result"]["isError"],
+        json!(true),
+        "read_file failed: {call_val}"
+    );
+    let text = call_val["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("hello from mcp test"),
+        "the owner's tool call ran: {text}"
+    );
+
+    brain.stop().await;
+}
+
+/// The authenticated path, end to end: with the owner token, `/mcp` serves the
+/// whole registry and executes a tool call. This is the half that proves the fix
+/// is "authenticate the route", not "disable it".
+#[tokio::test]
+async fn internal_listener_serves_mcp_initialize_and_tools_list_to_the_owner() {
+    let brain = RunningInternalBrain::start().await;
+    let client = brain.owner_client();
 
     // 1. Send MCP initialize request to /mcp
     let init_req = json!({
@@ -379,6 +542,11 @@ async fn mcp_initialize(client: &Client, url: &str) -> Option<String> {
     sid
 }
 
+/// A per-turn endpoint authenticates with its own token and nothing else: the
+/// registry lookup is the check, and the harness that only ever sees its own turn
+/// is deliberately *not* asked for the owner token. This test uses an
+/// unauthenticated client on purpose — adding owner auth here would be a second
+/// credential for a URL that already carries one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn per_turn_mcp_endpoint_runs_bot_tools_filters_by_request_and_returns_404_after_drop() {
     use swarmbot_contracts::conversation::ConversationKind;

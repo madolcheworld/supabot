@@ -23,7 +23,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, ClickEvent, Context, Entity, FocusHandle, Focusable, ListAlignment, ListState, Render,
@@ -257,12 +257,10 @@ impl Root {
         self.toggle_palette(window, cx);
     }
 
-    #[allow(dead_code)]
     fn on_graph_click(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_graph(cx);
     }
 
-    #[allow(dead_code)]
     fn on_palette_click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_palette(window, cx);
     }
@@ -1612,6 +1610,7 @@ impl Focusable for Root {
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         RENDERS.fetch_add(1, Ordering::SeqCst);
+        let now = Instant::now();
         let s = self.state.read(cx);
 
         let main = match s.screen {
@@ -1626,6 +1625,18 @@ impl Render for Root {
             ),
             Screen::Settings => settings::render(s, &self.state, &self.commands),
         };
+
+        // The one renderer of `state.toast` and `state.conn`, above the main
+        // column and above the conversation. It is `None` — zero elements, no
+        // stolen height — while the app is connected and has nothing to say.
+        let top_bar = top_bar_model(s, now).map(|model| {
+            render_top_bar(
+                &model,
+                s.graph_open,
+                cx.listener(Self::on_palette_click),
+                cx.listener(Self::on_graph_click),
+            )
+        });
 
         let mut root = div()
             .relative()
@@ -1643,7 +1654,19 @@ impl Render for Root {
             .on_action(cx.listener(Self::on_stop))
             .on_action(cx.listener(Self::on_focus_composer))
             .child(sidebar::render(s, &self.state, &self.commands))
-            .child(main)
+            .child(
+                // The main column: the status row, then the screen. The inner
+                // wrapper gives the screen a definite height to fill, so a
+                // screen that lays itself out with `size_full` does not overflow
+                // under the bar.
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .children(top_bar)
+                    .child(div().flex_1().min_h_0().flex().flex_col().child(main)),
+            )
             .when(s.graph_open, |d| {
                 d.child(side_panel::render(
                     s,
@@ -1809,15 +1832,47 @@ fn normalize_bot_handle(raw: &str) -> String {
         .to_string()
 }
 
-#[allow(dead_code)]
-fn render_top_bar(
-    s: &AppState,
-    on_palette: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    on_graph: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> gpui::Div {
+/// How long the bar says "resynced" after a gap, mirroring the window
+/// [`crate::worker::spawn_ticker`] keeps redrawing for.
+const RESYNC_LABEL_TTL: Duration = Duration::from_secs(4);
+
+/// The connection line of the top bar: the honest label and its colour.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopBarStatus {
+    pub label: String,
+    pub color: u32,
+}
+
+/// What the top bar would draw, derived from state and the current time alone.
+///
+/// This exists so the visibility decision is a **pure function**: a GPUI
+/// element cannot be asserted on without a GPU, but "does the bar have anything
+/// to say, and what" can be, and that is the part a reviewer cares about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopBarModel {
+    pub status: TopBarStatus,
+    /// The one-line status message, already checked against its expiry window.
+    pub toast: Option<String>,
+    pub brain_url: String,
+}
+
+/// What the top bar should show at `now`, or `None` when it has nothing to say.
+///
+/// `None` is load-bearing: a permanently rendered header would steal a row from
+/// the transcript for a window that is connected and quiet, so the bar appears
+/// only when there is news — a toast inside its window, a socket that is not
+/// `Connected`, or the few seconds of "resynced" after a gap. This is the only
+/// renderer of [`AppState::toast`] and [`ConnectionState`], so "invisible" here
+/// means every failed send, failed save, failed login and offline state is
+/// invisible to the owner.
+pub fn top_bar_model(s: &AppState, now: Instant) -> Option<TopBarModel> {
     let resynced = s
         .resynced_at
-        .is_some_and(|at| at.elapsed() < Duration::from_secs(4));
+        .is_some_and(|at| now.saturating_duration_since(at) < RESYNC_LABEL_TTL);
+    let toast = s.visible_toast(now).map(str::to_string);
+    if toast.is_none() && s.conn.is_online() && !resynced {
+        return None;
+    }
     let (label, color) = if resynced {
         ("resynced".to_string(), theme::SUCCESS)
     } else {
@@ -1830,7 +1885,22 @@ fn render_top_bar(
             ConnectionState::Offline { .. } => (s.conn.label(), theme::DANGER),
         }
     };
+    Some(TopBarModel {
+        status: TopBarStatus { label, color },
+        toast,
+        brain_url: s.brain_url.clone(),
+    })
+}
 
+/// The status row above the main pane: the connection, the brain's URL and the
+/// last action's message. Only built when [`top_bar_model`] has something to
+/// say, so it costs no vertical space while the app is connected and quiet.
+fn render_top_bar(
+    model: &TopBarModel,
+    graph_open: bool,
+    on_palette: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_graph: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Div {
     div()
         .h(theme::space::HEADER_H)
         .flex_none()
@@ -1848,28 +1918,34 @@ fn render_top_bar(
                 .text_color(rgb(theme::TEXT))
                 .child("SwarmBot"),
         )
-        .child(bits::dot(color, px(9.0)))
-        .child(div().text_xs().text_color(rgb(color)).child(label))
+        .child(bits::dot(model.status.color, px(9.0)))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(model.status.color))
+                .child(model.status.label.clone()),
+        )
         .child(
             div()
                 .text_xs()
                 .text_color(rgb(theme::TEXT_DIM))
-                .child(s.brain_url.clone()),
+                .child(model.brain_url.clone()),
         )
-        .children(s.toast.as_ref().map(|toast| {
+        .children(model.toast.as_ref().map(|toast| {
+            // A long failure message must not push the buttons off the row.
             div()
+                .min_w_0()
+                .max_w(px(520.0))
+                .truncate()
                 .text_xs()
                 .text_color(rgb(theme::ACCENT_HOVER))
                 .child(toast.clone())
         }))
         .child(div().flex_1())
         .child(
-            bits::button(
-                if s.graph_open { "Hide graph" } else { "Graph" },
-                Tone::Ghost,
-            )
-            .id("toggle-graph")
-            .on_click(on_graph),
+            bits::button(if graph_open { "Hide graph" } else { "Graph" }, Tone::Ghost)
+                .id("toggle-graph")
+                .on_click(on_graph),
         )
         .child(
             bits::button("Palette", Tone::Ghost)
@@ -1880,7 +1956,10 @@ fn render_top_bar(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_bot_handle;
+    use super::{resolve_bot_handle, top_bar_model};
+    use crate::state::{AppState, ConnectionState, TOAST_TTL};
+    use crate::theme;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn resolve_bot_handle_prefers_explicit_handle_or_falls_back_to_display_name() {
@@ -1890,5 +1969,95 @@ mod tests {
         );
         assert_eq!(resolve_bot_handle("  ", "Code Reviewer"), "code-reviewer");
         assert_eq!(resolve_bot_handle("   ", "   "), "");
+    }
+
+    fn connected_state() -> AppState {
+        let mut state = AppState::new("http://brain.test");
+        state.conn = ConnectionState::Connected;
+        state
+    }
+
+    /// The bar is the only renderer of the toast and the connection state, so
+    /// "it renders nothing here" is exactly "the owner is told nothing".
+    #[test]
+    fn the_top_bar_is_empty_when_connected_with_no_toast() {
+        let state = connected_state();
+        assert!(
+            top_bar_model(&state, Instant::now()).is_none(),
+            "a connected, quiet window gets no status row and loses no height"
+        );
+    }
+
+    #[test]
+    fn the_top_bar_shows_a_toast_and_hides_it_once_the_window_is_over() {
+        let mut state = connected_state();
+        let set_at = Instant::now();
+        state.set_toast("send failed: connection refused", set_at);
+
+        let model = top_bar_model(&state, set_at).expect("a toast must be visible");
+        assert_eq!(
+            model.toast.as_deref(),
+            Some("send failed: connection refused")
+        );
+        assert_eq!(model.status.label, "connected");
+        assert_eq!(model.status.color, theme::SUCCESS);
+        assert_eq!(model.brain_url, "http://brain.test");
+
+        // Inside the window the bar stays.
+        let inside = set_at + TOAST_TTL - Duration::from_millis(1);
+        assert!(top_bar_model(&state, inside).is_some());
+
+        // Past it the bar is gone even before the ticker has cleared the field:
+        // a view must never show a message the state has outlived.
+        assert!(state.toast.is_some(), "the ticker has not run yet");
+        assert!(
+            top_bar_model(&state, set_at + TOAST_TTL).is_none(),
+            "an expired toast must not keep the row on screen"
+        );
+    }
+
+    #[test]
+    fn the_top_bar_reports_every_disconnected_state_in_its_honest_colour() {
+        let now = Instant::now();
+        let cases = [
+            (ConnectionState::Connecting, "connecting…", theme::WARNING),
+            (
+                ConnectionState::Reconnecting { attempt: 2 },
+                "reconnecting (attempt 2)",
+                theme::WARNING,
+            ),
+            (
+                ConnectionState::Offline {
+                    reason: "socket closed".to_string(),
+                },
+                "offline: socket closed",
+                theme::DANGER,
+            ),
+        ];
+        for (conn, label, color) in cases {
+            let mut state = AppState::new("http://brain.test");
+            state.conn = conn.clone();
+            let model = top_bar_model(&state, now)
+                .unwrap_or_else(|| panic!("{conn:?} must be visible to the owner"));
+            assert_eq!(model.status.label, label, "{conn:?}");
+            assert_eq!(model.status.color, color, "{conn:?}");
+            assert_eq!(model.toast, None, "{conn:?} has no toast to show");
+        }
+    }
+
+    #[test]
+    fn the_resynced_notice_is_visible_for_a_few_seconds_and_then_goes_quiet() {
+        let mut state = connected_state();
+        let resynced_at = Instant::now();
+        state.resynced_at = Some(resynced_at);
+
+        let model = top_bar_model(&state, resynced_at).expect("the resync notice is visible");
+        assert_eq!(model.status.label, "resynced");
+        assert_eq!(model.status.color, theme::SUCCESS);
+
+        assert!(
+            top_bar_model(&state, resynced_at + Duration::from_secs(5)).is_none(),
+            "after the notice's window the bar is quiet again"
+        );
     }
 }

@@ -337,6 +337,18 @@ fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) {
                 s.routines = vec![r];
                 s.routine_creator_open = true;
             }
+            // Fold one fabricated command *failure* through the real reducer.
+            // The top bar is only rendered when it has news (see
+            // `view::top_bar_model`), so without a toast the selftest would
+            // never paint the one row that shows a failed send — the very bug
+            // this driver is meant to prove fixed on a real compositor.
+            crate::reducer::apply_result(
+                s,
+                proto::CommandResult::Send(Err(ClientError::Transport {
+                    url: brain_url.to_string(),
+                    reason: "fabricated by --selftest".to_string(),
+                })),
+            );
         });
         // A sink so the views can send commands; the receiver is dropped, so a
         // send simply fails and nothing reaches a brain (there is none).

@@ -169,7 +169,11 @@ impl BotService {
         bot.updated_at = Utc::now();
         self.store.update_bot(&bot)?;
         self.hub.publish(Change::Bot(bot.clone()));
-        if !enabled && let Some(handle) = self.runners.get(id) {
+        if !enabled && let Some(handle) = self.runners.unregister(id) {
+            // `unregister`, not `get`: a handle that stays in the map keeps a
+            // disabled bot looking "already has a runner", so `ensure_runners`
+            // skips it forever after re-enabling and every delivery fails with
+            // "the runner … is gone" — a bot that can never be woken again.
             handle.shutdown();
         }
         Ok(bot)

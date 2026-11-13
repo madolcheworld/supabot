@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use swarmbot_contracts::{NodeId, PolicyCeiling, Surface, ToolError, ToolResult};
+use swarmbot_contracts::{Invocation, NodeId, PolicyCeiling, Surface, ToolError, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 use crate::handler::{NodeCall, NodeExecutor};
@@ -327,7 +327,19 @@ impl NodeExecutor for LocalExecutor {
     /// whoever wired this executor decided the call belongs to this machine,
     /// and refusing by id would only break the daemon's own node id (which is
     /// not `nod_local`). A mismatch is logged, not enforced.
-    async fn exec(&self, node: &NodeId, call: NodeCall) -> Result<ToolResult, ToolError> {
+    ///
+    /// `_invocation` is deliberately unused: this type has no audit log and
+    /// raises no approval card, so the only thing it could do with attribution is
+    /// ignore it. The layer above records the call against the invocation it was
+    /// given — the brain's registry before the forward, the node daemon's
+    /// `fs`/`shell` handlers around the execution — and that is where the fact is
+    /// checked, not here.
+    async fn exec(
+        &self,
+        node: &NodeId,
+        _invocation: &Invocation,
+        call: NodeCall,
+    ) -> Result<ToolResult, ToolError> {
         if node != &self.node_id {
             // Refuse, do not absorb. Running another node's call here would
             // execute it on the brain's machine, inside the brain's roots and
@@ -381,7 +393,7 @@ fn fs_stat(path: &Path) -> Result<ToolResult, ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handlers::testkit::Rig;
+    use crate::handlers::testkit::{Rig, test_invocation};
     use swarmbot_contracts::{NodeRoot, PolicyMap};
 
     /// The regression test for a placement lie: `LocalExecutor` used to log a
@@ -397,6 +409,7 @@ mod tests {
         let err = executor
             .exec(
                 &remote,
+                &test_invocation(),
                 NodeCall::FsRead {
                     path: "notes.txt".into(),
                     offset: None,
@@ -421,6 +434,7 @@ mod tests {
         let ok = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsRead {
                     path: "notes.txt".into(),
                     offset: None,
@@ -443,6 +457,7 @@ mod tests {
         let wrote = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsWrite {
                     path: "hello.txt".into(),
                     content: "hello world".into(),
@@ -459,6 +474,7 @@ mod tests {
         let read = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsRead {
                     path: "hello.txt".into(),
                     offset: None,
@@ -474,6 +490,7 @@ mod tests {
         let stat = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsStat {
                     path: "hello.txt".into(),
                 },
@@ -485,6 +502,7 @@ mod tests {
         let edited = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsEdit {
                     path: "hello.txt".into(),
                     old_string: "world".into(),
@@ -499,6 +517,7 @@ mod tests {
         executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsMkdir {
                     path: "archive".into(),
                     parents: None,
@@ -509,6 +528,7 @@ mod tests {
         executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsMove {
                     from: "hello.txt".into(),
                     to: "archive/hello.txt".into(),
@@ -520,6 +540,7 @@ mod tests {
         executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsRemove {
                     path: "archive/hello.txt".into(),
                     recursive: None,
@@ -537,6 +558,7 @@ mod tests {
         let result = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::ShellExec {
                     command: "echo from-executor".into(),
                     cwd: None,
@@ -554,6 +576,7 @@ mod tests {
         let cancelled = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::ShellExec {
                     command: "sleep 30".into(),
                     cwd: None,
@@ -572,6 +595,7 @@ mod tests {
         let error = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsRead {
                     path: "/etc/passwd".into(),
                     offset: None,
@@ -607,6 +631,7 @@ mod tests {
         let error = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::ShellExec {
                     command: "echo never".into(),
                     cwd: None,
@@ -635,6 +660,7 @@ mod tests {
         let globbed = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsGlob {
                     pattern: "*.rs".into(),
                     path: None,
@@ -648,6 +674,7 @@ mod tests {
         let grepped = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsGrep {
                     pattern: "needle".into(),
                     path: None,
@@ -666,6 +693,7 @@ mod tests {
         let listed = executor
             .exec(
                 &NodeId::local(),
+                &test_invocation(),
                 NodeCall::FsList {
                     path: "src".into(),
                     depth: Some(1),

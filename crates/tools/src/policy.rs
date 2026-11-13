@@ -374,6 +374,109 @@ impl PathPolicy {
             .iter()
             .any(|denied| resolved == denied.as_path() || resolved.starts_with(denied))
     }
+
+    /// The first deny-listed path spelled out in a shell command line, if any.
+    ///
+    /// `shell` is the one handler that does not go through [`Self::resolve`]
+    /// for the paths it touches — it cannot, because it hands a string to a
+    /// shell and the shell decides what those words mean. That left the deny
+    /// list advisory for the most powerful tool in the registry:
+    /// `cat ~/.ssh/id_rsa` ran happily inside a root.
+    ///
+    /// What this does: scan the command's words, expand `~` and `$HOME`, make
+    /// them absolute against `cwd`, normalize, and refuse when one lands on the
+    /// deny list.
+    ///
+    /// What this does **not** do — stated plainly, because a boundary that
+    /// oversells itself is worse than a documented one:
+    ///
+    /// * it does not enforce **roots**; a shell command legitimately names
+    ///   `/bin/sh`, `/usr/bin/git` and `$HOME/.cache`, so requiring containment
+    ///   would refuse nearly every real command;
+    /// * it does not follow a path the command *builds* at run time
+    ///   (`cat $(echo ~/.ssh)/id_rsa`), nor one reached after a `cd`;
+    /// * it is not a shell parser — it is a word scan, the same kind of
+    ///   heuristic as [`is_destructive`], and it errs toward refusing.
+    ///
+    /// A real boundary for `shell` is a sandbox (mount namespace, seccomp), not
+    /// a string scan; until then this closes the direct spelling and says so.
+    pub fn denied_reference(&self, command: &str, cwd: &Path) -> Option<(String, String)> {
+        for word in shell_words(command) {
+            let candidate = word
+                .split_once('=')
+                .map(|(_, value)| value)
+                .unwrap_or(&word);
+            if !looks_like_path(candidate) {
+                continue;
+            }
+            let expanded = expand_shell_home(candidate);
+            let absolute = if expanded.is_absolute() {
+                expanded
+            } else {
+                cwd.join(expanded)
+            };
+            let resolved = normalize(&absolute);
+            if self.is_denied(&resolved) {
+                return Some((word, resolved.display().to_string()));
+            }
+        }
+        None
+    }
+}
+
+/// Split a command line into words, dropping quotes and treating the shell's
+/// separators as word breaks.
+///
+/// Deliberately naive: the goal is to find path-looking words, not to
+/// reproduce shell grammar. A word that survives quoting (`"~/.ssh/id_rsa"`)
+/// is still found, which is the direction that matters.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in command.chars() {
+        match ch {
+            // Separators end a word. `=` and `:` do not: they appear inside
+            // flags (`--out=~/x`) and inside paths.
+            c if c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '<' | '>') => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            '\'' | '"' | '`' => {}
+            other => current.push(other),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// True when a word is worth resolving as a path: absolute, home-relative, or
+/// containing a separator. A bare `make` or `--verbose` is skipped, which is
+/// what keeps the scan from resolving every argument against the workspace.
+fn looks_like_path(word: &str) -> bool {
+    word.starts_with('/')
+        || word.starts_with('~')
+        || word.starts_with("./")
+        || word.starts_with("../")
+        || word.starts_with("$HOME")
+        || word.starts_with("${HOME}")
+        || word.contains('/')
+}
+
+/// Expand `~`, `$HOME` and `${HOME}` — the three spellings that name the home
+/// directory in a command line. Anything else is left for the shell.
+fn expand_shell_home(word: &str) -> PathBuf {
+    let Some(home) = dirs::home_dir() else {
+        return PathBuf::from(word);
+    };
+    for prefix in ["${HOME}", "$HOME", "~"] {
+        if let Some(rest) = word.strip_prefix(prefix) {
+            return home.join(rest.trim_start_matches('/'));
+        }
+    }
+    PathBuf::from(word)
 }
 
 /// Expand a leading `~` or `~/…` against the user's home directory.
@@ -698,6 +801,75 @@ mod tests {
         assert!(default.contains(&PathBuf::from("/etc/sudoers")));
         assert!(default.contains(&home.join(".local/share/swarmbot/identity.key")));
         assert!(default.contains(&home.join(".local/share/swarmbot/secrets.json")));
+    }
+
+    #[test]
+    fn a_shell_command_may_not_spell_out_a_denied_path() {
+        // The hole this pins: `shell` hands a string to a shell, so its paths
+        // never went through `resolve`, and `cat ~/.ssh/id_rsa` ran inside a
+        // root with the deny list never consulted.
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir(&vault).expect("vault");
+        let policy = PathPolicy::new(vec![rw(tmp.path())], vec![vault.clone()]);
+
+        let secret = vault.join("key.pem");
+        let spelled = secret.display().to_string();
+
+        // Direct spelling.
+        let hit = policy.denied_reference(&format!("cat {spelled}"), &workspace);
+        assert!(hit.is_some(), "a spelled-out denied path must be caught");
+
+        // Through `~`, through a flag, through a redirect, through quotes.
+        for command in [
+            "cat ~/.ssh/id_rsa".to_string(),
+            format!("tar -xf {spelled}"),
+            format!("echo hi > {spelled}"),
+            format!("cat \"{spelled}\""),
+            "cat $HOME/.ssh/id_rsa".to_string(),
+            "cat ${HOME}/.ssh/id_rsa".to_string(),
+        ] {
+            // The `~`/`$HOME` cases resolve against the real home directory, so
+            // they only match when the default list has `.ssh`; assert the
+            // absolute ones unconditionally.
+            if command.contains("HOME") || command.contains('~') {
+                let home = dirs::home_dir().expect("HOME");
+                if !policy.is_denied(&home.join(".ssh")) {
+                    continue;
+                }
+            }
+            assert!(
+                policy.denied_reference(&command, &workspace).is_some(),
+                "not caught: {command}"
+            );
+        }
+
+        // Ordinary commands, and a file outside the deny list, still run: the
+        // scan must not refuse the whole shell.
+        for command in ["echo hello", "ls -la", "cargo build --release"] {
+            assert!(
+                policy.denied_reference(command, &workspace).is_none(),
+                "false positive on: {command}"
+            );
+        }
+        let ordinary = workspace.join("notes.txt");
+        std::fs::write(&ordinary, b"x").expect("write");
+        assert!(
+            policy
+                .denied_reference(&format!("cat {}", ordinary.display()), &workspace)
+                .is_none(),
+            "a path inside a root but outside the deny list must pass"
+        );
+
+        // A relative path is resolved against the shell's cwd, not the process
+        // cwd — the same rule the handler uses.
+        assert!(
+            policy
+                .denied_reference("cat vault/key.pem", tmp.path())
+                .is_some()
+        );
     }
 
     #[test]

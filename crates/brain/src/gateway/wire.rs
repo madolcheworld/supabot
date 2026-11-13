@@ -22,6 +22,7 @@
 
 use serde_json::{Value, json};
 
+use swarmbot_contracts::id::NodeId;
 use swarmbot_contracts::tool::{ToolError, ToolResult};
 use swarmbot_contracts::{Invocation, SHELL_OUTPUT_LIMIT_BYTES};
 use swarmbot_node_protocol::rpc::{self, Encoding, GrepOutputMode};
@@ -269,11 +270,29 @@ pub fn decode_result(method: &str, call: &NodeCall, value: Value) -> Result<Tool
 /// A denial stays a denial (data the model can react to) and a transport failure
 /// stays an error — the two are never merged, because "the node said no" and "the
 /// node could not be reached" call for different next moves.
-pub fn translate(method: &str, error: &ProtocolError) -> ToolError {
+///
+/// `node` is named in the message because the caller of a tool cannot otherwise
+/// tell *which* machine went quiet: a bot hosted on one node never talks to
+/// another, but its operator reads the error out of context.
+pub fn translate(node: &NodeId, method: &str, error: &ProtocolError) -> ToolError {
     use swarmbot_node_protocol::wire::TypedError;
 
     if matches!(error, ProtocolError::Interrupted) {
         return ToolError::Cancelled;
+    }
+    if let ProtocolError::CallTimedOut { after, .. } = error {
+        // A deadline is a failure, never a denial: nothing was refused, the
+        // node simply did not finish. The message says what was done about it
+        // (an interrupt was *asked for*) and what that does not promise (the
+        // node may still be running the call), because a model that reads
+        // "timed out" as "it did not happen" would be wrong.
+        return ToolError::failed(format!(
+            "node {node} did not answer `{method}` ({}) within {}s: the brain stopped waiting and \
+             sent `@effect/rpc/Interrupt`. The node may still be running the call; its answer, if it \
+             ever comes, is discarded.",
+            kind_of(method),
+            after.as_secs(),
+        ));
     }
     match error.typed() {
         Some(TypedError::PathDenied { path, reason }) => ToolError::PathDenied {
@@ -303,6 +322,18 @@ pub fn translate(method: &str, error: &ProtocolError) -> ToolError {
         )),
         Some(other) => ToolError::failed(format!("the node refused `{method}`: {other}")),
         None => ToolError::failed(format!("the node could not be reached: {error}")),
+    }
+}
+
+/// A plain-language name for the kind of call a method is.
+///
+/// The method name (`fs.read`) is the precise answer; this is the sentence a
+/// model reads in an error, where "a filesystem call" says what `fs.read` is.
+fn kind_of(method: &str) -> &'static str {
+    if method == rpc::SHELL_EXEC {
+        "a shell command"
+    } else {
+        "a filesystem call"
     }
 }
 
@@ -451,6 +482,8 @@ pub fn shell_result(run: &ShellRun) -> Result<ToolResult, ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use swarmbot_contracts::id::{BotId, ConversationId};
     use swarmbot_node_protocol::wire::{CauseError, TypedError};
 
@@ -701,12 +734,13 @@ mod tests {
 
     #[test]
     fn typed_errors_keep_their_kind_and_a_denial_stays_data() {
+        let node = NodeId::new();
         let denied = ProtocolError::remote(CauseError::fail(TypedError::policy_refused(
             "shell.exec",
             "this node's `shell` ceiling is `never`",
             false,
         )));
-        match translate(rpc::SHELL_EXEC, &denied) {
+        match translate(&node, rpc::SHELL_EXEC, &denied) {
             ToolError::PolicyRefused { reason, retry } => {
                 assert!(reason.contains("ceiling"), "{reason}");
                 assert!(!retry);
@@ -718,7 +752,7 @@ mod tests {
             "/etc/shadow",
             "outside roots",
         )));
-        match translate(rpc::FS_READ, &path) {
+        match translate(&node, rpc::FS_READ, &path) {
             ToolError::PathDenied { path, reason } => {
                 assert_eq!(path, "/etc/shadow");
                 assert_eq!(reason, "outside roots");
@@ -729,18 +763,50 @@ mod tests {
         let unauth = ProtocolError::remote(CauseError::fail(TypedError::not_authenticated(
             "node.hello has not been verified",
         )));
-        match translate(rpc::FS_READ, &unauth) {
+        match translate(&node, rpc::FS_READ, &unauth) {
             ToolError::PolicyRefused { retry, .. } => assert!(!retry, "re-pairing is a human job"),
             other => panic!("expected a refusal, got {other:?}"),
         }
 
         assert_eq!(
-            translate(rpc::FS_READ, &ProtocolError::Interrupted),
+            translate(&node, rpc::FS_READ, &ProtocolError::Interrupted),
             ToolError::Cancelled
         );
-        let gone = translate(rpc::FS_READ, &ProtocolError::SocketClosed);
+        let gone = translate(&node, rpc::FS_READ, &ProtocolError::SocketClosed);
         assert!(matches!(gone, ToolError::Failed { .. }), "{gone:?}");
         assert!(gone.to_string().contains("socket closed"), "{gone}");
+    }
+
+    /// The deadline is the one failure the wire cannot report as a remote error:
+    /// nothing came back, so the brain has to say so itself — naming the node and
+    /// the kind of call, and not pretending the interrupt stopped the work.
+    #[test]
+    fn a_deadline_is_a_failure_that_names_the_node_and_the_call() {
+        let node = NodeId::new();
+        let error = ProtocolError::CallTimedOut {
+            method: rpc::FS_READ.to_string(),
+            after: Duration::from_secs(60),
+        };
+        match translate(&node, rpc::FS_READ, &error) {
+            ToolError::Failed { message } => {
+                assert!(message.contains(&node.to_string()), "{message}");
+                assert!(message.contains(rpc::FS_READ), "{message}");
+                assert!(message.contains("did not answer"), "{message}");
+                assert!(message.contains("60s"), "{message}");
+                assert!(message.contains("a filesystem call"), "{message}");
+                // Honest about what the interrupt does not promise.
+                assert!(message.contains("may still be running"), "{message}");
+            }
+            other => panic!("a timeout is a failure, not a denial: {other:?}"),
+        }
+        // A shell command is named as one: `fs.read` and `shell.exec` are not
+        // the same kind of thing to wait for, and the message says which it was.
+        let shell = ProtocolError::CallTimedOut {
+            method: rpc::SHELL_EXEC.to_string(),
+            after: Duration::from_secs(150),
+        };
+        let message = translate(&node, rpc::SHELL_EXEC, &shell).to_string();
+        assert!(message.contains("a shell command"), "{message}");
     }
 
     #[test]

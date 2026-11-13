@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -115,6 +116,26 @@ pub trait McpTurnProvider: Send + Sync {
 pub type McpProviderSlot = Arc<RwLock<Option<Arc<dyn McpTurnProvider>>>>;
 
 /// A wired brain, without listeners.
+/// How often the housekeeping ticker runs.
+pub const HOUSEKEEPING_TICK: Duration = Duration::from_secs(60);
+
+/// How many live events the store keeps. A reconnecting client replays from
+/// the log, so this is a generous ring, not a short history: 20k events is
+/// several days of ordinary use. Its job is to make growth bounded, which it
+/// was not — `events_log` gained one permanent row per published change.
+pub const EVENT_LOG_KEEP: u64 = 20_000;
+
+/// A routine run still `Running` after this long was cut off by a crash or a
+/// deleted bot; no turn legitimately runs for six hours.
+pub const ROUTINE_RUN_STALE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// What one housekeeping pass did, so a test (and the log) can see it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HousekeepingReport {
+    pub events_dropped: u64,
+    pub routine_runs_reaped: usize,
+}
+
 pub struct Swarm {
     pub config: BrainConfig,
     pub store: Arc<dyn Persistence>,
@@ -141,6 +162,7 @@ pub struct Swarm {
     mcp_provider: McpProviderSlot,
     expiry: ExpirySlot,
     routine_ticker: ExpirySlot,
+    housekeeping: ExpirySlot,
 }
 
 /// The machine-side pieces a swarm needs, built by the composition root
@@ -216,7 +238,12 @@ impl Swarm {
             Arc::clone(&runners),
             Arc::clone(&tasks),
         );
-        let instructions = InstructionRenderer::new(Arc::clone(&store));
+        // The skill library is `<data>/skills`: a directory per skill with a
+        // `SKILL.md` in it. A brain with no library is not an error — a bot's
+        // skills then render as names, with the honest note that the library
+        // has no entry, instead of pretending there is a playbook behind them.
+        let instructions =
+            InstructionRenderer::with_skills_root(Arc::clone(&store), data_dir.join("skills"));
         let routines = RoutineScheduler::new(Arc::clone(&store), Arc::clone(&runners));
 
         // Now the registry can hold both halves: the node tools (built from the
@@ -264,6 +291,7 @@ impl Swarm {
             mcp_provider: Arc::new(RwLock::new(None)),
             expiry: ExpirySlot(std::sync::Mutex::new(None)),
             routine_ticker: ExpirySlot(std::sync::Mutex::new(None)),
+            housekeeping: ExpirySlot(std::sync::Mutex::new(None)),
         }))
     }
 
@@ -413,15 +441,68 @@ impl Swarm {
 
     /// Start the task that checks and fires scheduled routines. Idempotent:
     /// a second call replaces the first ticker.
+    ///
+    /// Nothing called this before the review, which is why the whole routines
+    /// feature — API, client, UI screen, scheduler, table — was dead code: the
+    /// routes could create a routine and nothing ever fired it. `boot` calls it
+    /// now; a caller that wants a still brain (`--no-ticker`) can stop it again.
     pub fn start_routine_ticker(&self) {
         let handle = self.routines.spawn_ticker();
         self.routine_ticker.set(handle);
+    }
+
+    /// Start the housekeeping ticker: bound the live-event log and mark routine
+    /// runs a crash cut off.
+    ///
+    /// The event log is the only unbounded table in the schema — one permanent
+    /// row per published change — and `LiveHub::truncate_log` existed with no
+    /// caller, so a long-lived data dir grew without limit. The ring is what a
+    /// reconnecting client replays from, so the bound is generous
+    /// ([`EVENT_LOG_KEEP`]); it exists to stop unbounded growth, not to make
+    /// history short.
+    pub fn start_housekeeping_ticker(self: &Arc<Self>) {
+        let swarm = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(HOUSEKEEPING_TICK);
+            // The first tick fires immediately; skipping it keeps boot snappy.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                swarm.housekeep_once();
+            }
+        });
+        self.housekeeping.set(handle);
+    }
+
+    /// One pass of the housekeeping ticker. Public so a test can run it
+    /// without waiting on a timer.
+    pub fn housekeep_once(&self) -> HousekeepingReport {
+        self.housekeep(EVENT_LOG_KEEP)
+    }
+
+    /// One pass with an explicit ring size, so a test can prove the bound
+    /// without publishing twenty thousand events first.
+    pub fn housekeep(&self, keep: u64) -> HousekeepingReport {
+        let mut report = HousekeepingReport::default();
+        match self.hub.truncate_log(keep) {
+            Ok(dropped) => report.events_dropped = dropped,
+            Err(err) => warn!(error = %err, "cannot truncate the live-event log"),
+        }
+        match self
+            .routines
+            .reap_stale_runs(chrono::Utc::now(), ROUTINE_RUN_STALE_AFTER)
+        {
+            Ok(reaped) => report.routine_runs_reaped = reaped,
+            Err(err) => warn!(error = %err, "cannot reap stale routine runs"),
+        }
+        report
     }
 
     /// Stop everything: runners finish their turn, nothing is left "running".
     pub async fn shutdown(&self) {
         self.expiry.stop();
         self.routine_ticker.stop();
+        self.housekeeping.stop();
         self.orchestrator.shutdown().await;
         info!("swarm stopped");
     }
@@ -505,4 +586,102 @@ fn hostname() -> String {
 /// The policy a node starts with: the brain's own ceilings.
 pub fn default_node_policy(settings: &swarmbot_contracts::config::Settings) -> PolicyMap {
     settings.safety.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use swarmbot_contracts::config::BrainConfig;
+
+    fn test_swarm() -> (Arc<Swarm>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut config = BrainConfig {
+            default_backend: "fake".to_string(),
+            backends: vec![swarmbot_contracts::config::BackendSpec::fake("fake")],
+            ..BrainConfig::default()
+        };
+        config.team = Some(BrainConfig::demo_team("fake"));
+        let swarm = crate::compose::memory(
+            config,
+            dir.path(),
+            vec![],
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("swarm");
+        swarm.provision_team().expect("provision");
+        (swarm, dir)
+    }
+
+    #[tokio::test]
+    async fn housekeeping_bounds_the_event_log() {
+        // `LiveHub::truncate_log` existed with no caller, so `events_log` grew
+        // one permanent row per published change for the life of the data dir.
+        let (swarm, _dir) = test_swarm();
+        let bot = swarm.bots.by_name("lead").expect("lead");
+        for i in 0..20 {
+            let _ =
+                swarm
+                    .transcript
+                    .event(&bot.direct_conversation_id, "note", format!("entry {i}"));
+        }
+        // Count what the log holds through the port: `events_since` from the
+        // epoch start is the whole ring.
+        let epoch = swarm.store.epoch().expect("epoch");
+        let from_start = swarmbot_contracts::live::LiveCursor { epoch, sequence: 0 };
+        let before = swarm.store.events_since(from_start, 1000).expect("events");
+        assert!(
+            before.len() >= 20,
+            "events were published: {}",
+            before.len()
+        );
+
+        let report = swarm.housekeep(5);
+        assert!(
+            report.events_dropped > 0,
+            "the log must shrink to the requested ring: {report:?}"
+        );
+
+        let after = swarm.store.events_since(from_start, 1000).expect("events");
+        assert!(
+            after.len() <= 5,
+            "the ring is bounded: {} events left",
+            after.len()
+        );
+        assert!(
+            !after.is_empty(),
+            "the newest events survive, so a reconnecting client can replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn housekeeping_reaps_a_routine_run_a_crash_cut_off() {
+        let (swarm, _dir) = test_swarm();
+        let bot = swarm.bots.by_name("lead").expect("lead");
+        // Fire it eight hours ago, so the run it started is older than the
+        // six-hour staleness bound `housekeep_once` uses.
+        let fired_at = chrono::Utc::now() - chrono::Duration::hours(8);
+        let mut routine = swarm
+            .routines
+            .create_routine(
+                bot.id.clone(),
+                "Nightly",
+                "check the build",
+                swarmbot_contracts::routine::RoutineSchedule::Interval { every_secs: 60 },
+                fired_at - chrono::Duration::minutes(1),
+            )
+            .expect("routine");
+        routine.next_run_at = Some(fired_at - chrono::Duration::seconds(1));
+        swarm.store.update_routine(&routine).expect("update");
+        swarm.routines.fire_due(fired_at).expect("fire");
+
+        let report = swarm.housekeep_once();
+        assert_eq!(report.routine_runs_reaped, 1, "{report:?}");
+
+        let runs = swarm.routines.list_runs(&routine.id, 5).expect("runs");
+        assert_eq!(
+            runs[0].status,
+            swarmbot_contracts::routine::RunStatus::Failed,
+            "a run no turn ever finished must not stay Running forever"
+        );
+    }
 }

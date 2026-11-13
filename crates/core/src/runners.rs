@@ -86,11 +86,20 @@ pub struct SharedState {
     busy: AtomicBool,
     conversation: Mutex<Option<ConversationId>>,
     turn_cancel: Mutex<Option<CancellationToken>>,
+    /// The turn currently running, so a Stop can settle the approval cards it
+    /// is blocked on. Tracked separately from `conversation` because a Stop
+    /// has to name a turn, not a conversation.
+    turn: Mutex<Option<TurnId>>,
 }
 
 impl SharedState {
     pub fn is_busy(&self) -> bool {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    /// The turn in flight, if any.
+    pub fn running_turn(&self) -> Option<TurnId> {
+        self.turn.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn active_conversation(&self) -> Option<ConversationId> {
@@ -101,6 +110,40 @@ impl SharedState {
     }
 }
 
+/// The text of a caught panic payload, for a log line that says what happened.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a non-string panic payload".to_string()
+    }
+}
+
+/// Clears the "working" roster on the way out of `run_turn`, whatever the way
+/// out was.
+///
+/// `run_turn` has four exit paths — a normal return, an early `?` on a store
+/// error, and a dropped future when the brain cancels the turn — and only one
+/// of them used to reach the explicit clear. The others left `busy` set, so the
+/// roster claimed a bot was working when it was not, and `Swarm::shutdown`
+/// waited on a runner that had already stopped.
+struct BusyGuard(Arc<SharedState>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::SeqCst);
+        *self
+            .0
+            .conversation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self.0.turn_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.0.turn.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
 /// The handle the rest of the brain holds.
 pub struct RunnerHandle {
     bot_id: BotId,
@@ -108,6 +151,8 @@ pub struct RunnerHandle {
     cancel: CancellationToken,
     state: Arc<SharedState>,
     finished: Arc<tokio::sync::Notify>,
+    /// Set once the runner task has ended, so `joined()` is idempotent.
+    done: Arc<AtomicBool>,
 }
 
 impl RunnerHandle {
@@ -171,7 +216,13 @@ impl RunnerHandle {
 
     /// Wait for the runner task to end (a graceful shutdown).
     pub async fn joined(&self) {
-        if self.cancel.is_cancelled() && !self.is_busy() {
+        // No guess, and no `cancel.is_cancelled() && !is_busy()` shortcut: that
+        // shortcut was wrong exactly when a turn was cancelled mid-flight, and
+        // `Notify::notify_waiters` stored no permit, so a `joined()` that
+        // arrived after the task ended hung `Swarm::shutdown` forever. The
+        // `done` flag makes the answer unconditional; `notify_one` is what
+        // stores a permit for a caller that arrives late.
+        if self.done.load(Ordering::SeqCst) {
             return;
         }
         self.finished.notified().await;
@@ -411,12 +462,14 @@ impl BotRunner {
         let cancel = CancellationToken::new();
         let state = Arc::new(SharedState::default());
         let finished = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(AtomicBool::new(false));
         let handle = Arc::new(RunnerHandle {
             bot_id: bot_id.clone(),
             cmd: cmd_tx,
             cancel: cancel.clone(),
             state: Arc::clone(&state),
             finished: Arc::clone(&finished),
+            done: Arc::clone(&done),
         });
         let runner = Self {
             bot_id,
@@ -428,8 +481,31 @@ impl BotRunner {
             failures: 0,
         };
         let runners = Arc::clone(&runner.env.runners);
+        let panic_bot = runner.bot_id.clone();
+        let panic_state = Arc::clone(&runner.state);
         tokio::spawn(async move {
-            runner.run().await;
+            // A panic in this task used to be **silent**: tokio stores it in
+            // the `JoinHandle`, and nothing here awaits that handle, so a
+            // runner that panicked simply stopped. The bot stayed "Working" in
+            // the store, its turn stayed `Running`, no transcript entry was
+            // ever written — and every idle check downstream saw a quiet team
+            // and reported success. That is how a real failure hid as a flaky
+            // test. Catching it here makes it loud and keeps the roster honest.
+            let outcome = std::panic::AssertUnwindSafe(runner.run());
+            if let Err(payload) = futures::FutureExt::catch_unwind(outcome).await {
+                let message = panic_message(&payload);
+                tracing::error!(
+                    bot = %panic_bot,
+                    panic = %message,
+                    "a bot runner panicked; this bot will not answer again until the brain restarts"
+                );
+                panic_state.busy.store(false, Ordering::SeqCst);
+            }
+            // `notify_one`, not `notify_waiters`: a permit is stored when
+            // nobody is waiting, so a `joined()` that arrives *after* the task
+            // finished still returns. `notify_waiters` dropped that wakeup and
+            // `Swarm::shutdown` hung on it.
+            done.store(true, Ordering::SeqCst);
             finished.notify_waiters();
         });
         // Registering after the spawn is fine: deliveries that arrive in
@@ -571,6 +647,19 @@ impl BotRunner {
                 };
                 if matches {
                     cancel_current(&self.state);
+                    // A turn blocked on an approval card does not observe the
+                    // cancel token — it is parked on a oneshot. Settle the card
+                    // too, or Stop waits out the full expiry (ten minutes).
+                    if let Some(turn) = self.state.running_turn()
+                        && let Err(error) = self.env.approval.cancel_turn(&turn)
+                    {
+                        warn!(
+                            bot = %self.bot_id,
+                            turn = %turn,
+                            error = %error,
+                            "cannot cancel the approvals of a stopped turn"
+                        );
+                    }
                 }
                 self.drop_queued(conversation.as_ref());
                 true
@@ -691,8 +780,15 @@ async fn run_turn(
         *state.turn_cancel.lock().unwrap_or_else(|e| e.into_inner()) = Some(turn_cancel.clone());
         *state.conversation.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(conversation_id.clone());
+        *state.turn.lock().unwrap_or_else(|e| e.into_inner()) = Some(turn.id.clone());
         state.busy.store(true, Ordering::SeqCst);
     }
+    // From here on, every exit path — including the `?` below and a future
+    // that is dropped because the turn was cancelled — has to clear the
+    // roster. A drop guard is the only shape that covers all of them: the
+    // explicit clear at the end of this function never ran on the cancelled
+    // path, which left `busy` set forever and `Swarm::shutdown` waiting.
+    let _busy = BusyGuard(Arc::clone(&state));
     publish_status(
         &env,
         &bot_id,
@@ -778,6 +874,29 @@ async fn run_turn(
         let _ = store.update_delivery(&record);
     }
 
+    // A routine's run row has to be closed here, or every run the API lists
+    // stays `Running` forever — a permanent lie and a table that grows one dead
+    // row per tick.
+    for delivery in &deliveries {
+        if delivery.routine_id.is_none() {
+            continue;
+        }
+        let (ok, reason) = match &outcome {
+            Ok((done, turn)) if done.aborted || turn.status == TurnStatus::Aborted => {
+                (false, Some("the turn running this routine was stopped"))
+            }
+            Ok(_) => (true, None),
+            Err(_) => (false, Some("the turn failed")),
+        };
+        if let Err(err) = crate::routines::settle_delivery(store.as_ref(), delivery, ok, reason) {
+            warn!(
+                error = %err,
+                delivery = %delivery.id,
+                "cannot settle a routine run"
+            );
+        }
+    }
+
     // A task's result goes back to whoever asked, not into this transcript.
     // A turn the owner stopped is a failure of the task, not an empty success:
     // the requester has to know the work did not finish.
@@ -792,11 +911,9 @@ async fn run_turn(
         env.hooks.settle_task(&task.id, &text, failed);
     }
 
-    state.busy.store(false, Ordering::SeqCst);
-    *state.conversation.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *state.turn_cancel.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let _ = env.hooks.take_turn_targets(&turn.id);
 
+    // The roster is cleared by `_busy` on the way out — see its comment.
     outcome
 }
 
@@ -1611,8 +1728,48 @@ impl StreamRenderer {
                 self.maybe_flush();
             }
             LlmEvent::ToolCallStart { .. } | LlmEvent::ToolCallArgsDelta { .. } => self.flush(),
+            LlmEvent::Restart { attempt } => self.restart(attempt),
             LlmEvent::Finished { .. } => self.flush(),
         }
+    }
+
+    /// A retry restarts the stream from zero, so what was rendered for the
+    /// failed attempt has to go.
+    ///
+    /// Leaving it would read the two attempts as one answer ("I will check…"
+    /// from attempt 1 glued to attempt 2's reply), which is a transcript that
+    /// says something the model never said. The posted entry is blanked rather
+    /// than deleted: `finalize_reply` overwrites it with the authoritative
+    /// [`swarmbot_llm::ChatResponse`] text at the end of the turn, and a blank
+    /// row is a smaller lie than a wrong one.
+    fn restart(&mut self, attempt: u32) {
+        self.text.clear();
+        self.reasoning_text.clear();
+        self.pending_bytes = 0;
+        if let Some(entry) = &mut self.message {
+            if let EntryKind::Message(message) = &mut entry.kind {
+                message.text.clear();
+            }
+            entry.revision += 1;
+            entry.updated_at = chrono::Utc::now();
+            if let Err(err) = self.transcript.update(entry) {
+                warn!(error = %err, "cannot clear the superseded attempt's reply");
+            }
+        }
+        if let Some(entry) = &mut self.reasoning {
+            if let EntryKind::Reasoning(reasoning) = &mut entry.kind {
+                reasoning.text.clear();
+            }
+            entry.revision += 1;
+            entry.updated_at = chrono::Utc::now();
+            if let Err(err) = self.transcript.update(entry) {
+                warn!(error = %err, "cannot clear the superseded attempt's reasoning");
+            }
+        }
+        debug!(
+            attempt,
+            "the backend restarted its stream; the failed attempt's text was discarded"
+        );
     }
 
     fn maybe_flush(&mut self) {
@@ -2092,6 +2249,275 @@ mod tests {
             assert!(prompts[1].contains("steer-other-conv"), "{prompts:?}");
         }
 
+        swarm.shutdown().await;
+    }
+
+    /// A backend whose turn blocks until it is released, so a test can hold a
+    /// turn open and then cancel it. It deliberately ignores `cancel`: the
+    /// point is that the *runner* drops the turn future, which is the path that
+    /// used to leak the "busy" flag.
+    struct HoldBackend {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl swarmbot_llm::LlmBackend for HoldBackend {
+        fn id(&self) -> &str {
+            "hold"
+        }
+
+        fn kind(&self) -> BackendKind {
+            BackendKind::Fake
+        }
+
+        fn capabilities(&self) -> swarmbot_llm::Capabilities {
+            swarmbot_llm::Capabilities {
+                streaming: false,
+                tool_calls: false,
+                reasoning: false,
+                steer: false,
+                survives_restart: false,
+            }
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            _events: mpsc::Sender<LlmEvent>,
+            _cancel: CancellationToken,
+        ) -> Result<ChatResponse, swarmbot_llm::LlmError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(ChatResponse::empty())
+        }
+
+        async fn probe(&self) -> Result<swarmbot_llm::BackendStatus, swarmbot_llm::LlmError> {
+            Ok(swarmbot_llm::BackendStatus {
+                backend: "hold".to_string(),
+                ok: true,
+                detail: "ok".to_string(),
+                model: None,
+                version: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restart_discards_the_failed_attempts_streamed_text() {
+        // A retry restarts the stream from zero. Without handling `Restart`,
+        // the renderer would append attempt 2 to attempt 1 and the transcript
+        // would read as one answer the model never gave.
+        let (swarm, _dir) = test_swarm();
+        let lead = swarm.bots.by_name("lead").unwrap();
+        let turn = Turn::start(
+            lead.id.clone(),
+            lead.direct_conversation_id.clone(),
+            TurnInitiator::Owner,
+            None,
+            None,
+        );
+        swarm.store.insert_turn(&turn).unwrap();
+
+        let mut renderer = StreamRenderer::new(
+            Arc::clone(&swarm.transcript),
+            lead.direct_conversation_id.clone(),
+            lead.id.clone(),
+            turn.id.clone(),
+        );
+        renderer.on_event(LlmEvent::TextDelta("I will check that".into()));
+        renderer.on_event(LlmEvent::ReasoningDelta("thinking about it".into()));
+        renderer.flush();
+
+        renderer.on_event(LlmEvent::Restart { attempt: 1 });
+        assert_eq!(
+            renderer.text, "",
+            "the superseded attempt's live text is gone"
+        );
+        assert_eq!(renderer.reasoning_text, "");
+
+        renderer.on_event(LlmEvent::TextDelta("PONG".into()));
+        renderer.flush();
+        let streamed = renderer.finish();
+
+        let entry = streamed.message.expect("a reply entry");
+        let text = entry.kind.text().unwrap_or_default();
+        assert_eq!(
+            text, "PONG",
+            "only the successful attempt's text survives: {text:?}"
+        );
+    }
+
+    /// `Notify::notify_waiters` stores no permit, so a `joined()` that arrives
+    /// *after* the task ended used to wait forever and `Swarm::shutdown` hung
+    /// with it. The spawn now uses `notify_one` and a `done` flag, and this is
+    /// the test that pins it.
+    #[tokio::test]
+    async fn joined_returns_when_the_runner_already_stopped() {
+        let (swarm, _dir) = test_swarm();
+        swarm.ensure_runners().unwrap();
+        let lead = swarm.bots.by_name("lead").unwrap();
+        let handle = swarm.runners.get(&lead.id).expect("runner");
+
+        handle.shutdown();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tokio::time::timeout(Duration::from_secs(2), handle.joined())
+            .await
+            .expect("joined() must return once the runner has ended");
+    }
+
+    /// A runner that panics must not disappear silently.
+    ///
+    /// Before this, tokio stored the panic in a `JoinHandle` nobody awaited: the
+    /// task simply stopped, the bot stayed `Working` in the store, its turn
+    /// stayed `Running`, and no transcript entry was ever written — so every
+    /// idle check downstream saw a quiet team and reported success. That is how
+    /// a real failure can hide as a flaky test.
+    #[tokio::test]
+    async fn a_panicking_runner_is_reported_and_leaves_the_roster_idle() {
+        struct PanicBackend;
+
+        #[async_trait::async_trait]
+        impl swarmbot_llm::LlmBackend for PanicBackend {
+            fn id(&self) -> &str {
+                "panic"
+            }
+
+            fn kind(&self) -> BackendKind {
+                BackendKind::Fake
+            }
+
+            fn capabilities(&self) -> swarmbot_llm::Capabilities {
+                swarmbot_llm::Capabilities {
+                    streaming: false,
+                    tool_calls: false,
+                    reasoning: false,
+                    steer: false,
+                    survives_restart: false,
+                }
+            }
+
+            async fn chat(
+                &self,
+                _request: ChatRequest,
+                _events: mpsc::Sender<LlmEvent>,
+                _cancel: CancellationToken,
+            ) -> Result<ChatResponse, swarmbot_llm::LlmError> {
+                panic!("the backend exploded mid-turn")
+            }
+
+            async fn probe(&self) -> Result<swarmbot_llm::BackendStatus, swarmbot_llm::LlmError> {
+                Ok(swarmbot_llm::BackendStatus {
+                    backend: "panic".to_string(),
+                    ok: true,
+                    detail: "ok".to_string(),
+                    model: None,
+                    version: None,
+                })
+            }
+        }
+
+        let (swarm, _dir) = test_swarm();
+        swarm.backends.register(
+            "panic",
+            Arc::new(PanicBackend) as Arc<dyn swarmbot_llm::LlmBackend>,
+        );
+        let mut lead = swarm.bots.by_name("lead").unwrap();
+        lead.backend = "panic".to_string();
+        swarm.bots.update(&lead).unwrap();
+        swarm.ensure_runners().unwrap();
+
+        swarm
+            .send(&lead.direct_conversation_id, "explode please")
+            .unwrap();
+
+        let handle = swarm.runners.get(&lead.id).expect("runner");
+        tokio::time::timeout(Duration::from_secs(5), handle.joined())
+            .await
+            .expect("a panicked runner still signals that it ended");
+        assert!(
+            !handle.is_busy(),
+            "a panicked runner must not leave the bot marked Working"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_clears_the_roster_and_lets_shutdown_finish() {
+        // The hang this pins, in order: a turn is in flight, the owner stops
+        // it, the runner task ends *before* anyone calls `joined()`, and the
+        // "busy" flag it left behind made `joined()` skip its early return and
+        // wait on a `notify_waiters()` that had already fired. `shutdown()`
+        // then never returned.
+        let (swarm, _dir) = test_swarm();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(HoldBackend {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+        swarm.backends.register(
+            "hold",
+            Arc::clone(&backend) as Arc<dyn swarmbot_llm::LlmBackend>,
+        );
+
+        let mut lead = swarm.bots.by_name("lead").unwrap();
+        lead.backend = "hold".to_string();
+        swarm.bots.update(&lead).unwrap();
+        swarm.ensure_runners().unwrap();
+
+        swarm
+            .send(&lead.direct_conversation_id, "block forever")
+            .unwrap();
+        started.notified().await;
+        let handle = swarm.runners.get(&lead.id).expect("runner");
+        assert!(handle.is_busy(), "the turn is running");
+
+        // Stop the turn, then stop the brain while the runner is still winding
+        // down: the runner task ends before `joined()` is reached.
+        assert!(
+            swarm
+                .runners
+                .interrupt(&lead.id, Some(&lead.direct_conversation_id))
+        );
+        handle.shutdown();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            !handle.is_busy(),
+            "a stopped turn must clear the roster, or the next `joined()` hangs"
+        );
+        tokio::time::timeout(Duration::from_secs(2), handle.joined())
+            .await
+            .expect("joined() must return after the runner has ended");
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), swarm.shutdown())
+            .await
+            .expect("shutdown must finish after a turn was cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_bot_loses_its_runner_and_gets_a_new_one_back() {
+        // A handle left in the map made `ensure_runners` skip the bot forever,
+        // so a re-enabled bot could never be woken again.
+        let (swarm, _dir) = test_swarm();
+        swarm.ensure_runners().unwrap();
+        let lead = swarm.bots.by_name("lead").unwrap();
+        assert!(swarm.runners.get(&lead.id).is_some());
+
+        swarm.bots.set_enabled(&lead.id, false).unwrap();
+        assert!(
+            swarm.runners.get(&lead.id).is_none(),
+            "a disabled bot must not keep a dead handle"
+        );
+
+        swarm.bots.set_enabled(&lead.id, true).unwrap();
+        swarm.ensure_runners().unwrap();
+        assert!(
+            swarm.runners.get(&lead.id).is_some(),
+            "re-enabling must produce a live runner"
+        );
         swarm.shutdown().await;
     }
 }

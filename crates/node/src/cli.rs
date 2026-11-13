@@ -36,7 +36,9 @@ use crate::{NODE_VERSION, NodeError};
                   deny list and its own ceilings, with the effective ceiling always \
                   `min(brain, node)`. A brain can ask; it can never raise what this node allows.\n\n\
                   Everything lives under one data dir: `identity.json` (mode 0600), `node.toml`, \
-                  `workspace/`, `audit/`, `spill/`, `node-state.json`."
+                  `workspace/`, `audit/`, `spill/`, `node-state.json`. By default `workspace/` is a \
+                  read-write root and `spill/` a read-only one, so a bot can page back the output a \
+                  `shell.exec` had to truncate but cannot use that directory as scratch space."
 )]
 pub struct Cli {
     /// Where this node keeps its identity, config, workspace, audit log and spill.
@@ -86,7 +88,10 @@ pub struct RunOptions {
     pub brain: Option<String>,
 
     /// A read-write root this node will act inside. Repeatable. Replaces the
-    /// file's roots. Defaults to `<data>/workspace`.
+    /// file's roots **and** the default roots. Defaults to `<data>/workspace`,
+    /// next to a read-only `<data>/spill` root — naming any root here drops
+    /// that spill root too, so add `--read-only-root <data>/spill` to keep
+    /// spilled `shell.exec` output readable back.
     #[arg(long = "root", value_name = "PATH")]
     pub roots: Vec<PathBuf>,
 

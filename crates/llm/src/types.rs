@@ -303,8 +303,9 @@ impl ChatRequest {
 ///
 /// Invariant: this value is **authoritative**. `LlmEvent` deltas streamed
 /// during the call are best-effort (a retry after a mid-stream failure
-/// restarts them from scratch); anything persisted or acted on comes from
-/// here.
+/// restarts them from scratch, and [`LlmEvent::Restart`] is how a consumer is
+/// told to discard what it already rendered); anything persisted or acted on
+/// comes from here.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChatResponse {
     pub text: String,
@@ -348,6 +349,30 @@ impl ChatResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmEvent {
+    /// **Attempt boundary: everything rendered for this turn so far is void.**
+    ///
+    /// A backend that retries restarts its stream from zero, so without this
+    /// event a consumer that had already rendered the failed attempt's deltas
+    /// would append the retry's on top of them and read the two attempts as
+    /// one answer. The invariant every consumer must honour: on `Restart`,
+    /// discard what it rendered for this turn (the live text, the reasoning,
+    /// the transcript entry it has been updating) before rendering anything
+    /// that follows. The authoritative result is still the
+    /// [`ChatResponse`]; `Finished` still arrives exactly once, for the
+    /// attempt that succeeded.
+    ///
+    /// `attempt` is 1-based and counts **retries**, not attempts: the first
+    /// `Restart` a consumer can see is `Restart { attempt: 1 }`, immediately
+    /// before the second attempt starts. The first attempt emits no `Restart`
+    /// — there is nothing to discard yet — so no consumer needs a special case
+    /// for a leading no-op, and the event is only ever a real boundary.
+    ///
+    /// Emitted *before* the retried attempt's first byte, deliberately: a
+    /// retry that fails again must not leave the superseded attempt's text on
+    /// screen while it is being retried.
+    Restart {
+        attempt: u32,
+    },
     TextDelta(String),
     ReasoningDelta(String),
     /// Emitted once per tool call, on the first fragment seen for its index.

@@ -26,6 +26,27 @@
 //! child with `setsid`-like detachment — observed on opencode 2.0.28 — which
 //! no `killpg` of the wrapper's group can touch).
 //!
+//! # Abandoning a request is safe — and that is what keeps one timeout local
+//!
+//! The connection is shared by every turn of every bot on the backend, so a
+//! per-request timeout must not shut the process down. It does not have to:
+//! JSON-RPC responses are correlated by **id**, not ordered, so an unanswered
+//! request desyncs nothing. A caller may drop its future at any point
+//! ([`Connection::rpc`]'s [`PendingSlot`] guard then removes the pending entry);
+//! a late answer arrives for an id nobody waits for and is logged at `debug`.
+//! The adapter therefore abandons a request whose budget ran out and leaves the
+//! connection serving everybody else.
+//!
+//! Two consequences worth stating plainly:
+//!
+//! * [`Connection::shutdown`] is for the *connection's* life (a failed
+//!   handshake nobody else can see, `probe`'s throwaway connection, the `Drop`
+//!   backstop) — never for one turn's timeout;
+//! * a request the agent never answers may leave work behind *inside* the
+//!   agent (a `session/new` whose id we never learned). This build states that
+//!   limit rather than hiding it: the process is reused, so such a session is
+//!   released when the agent exits.
+//!
 //! Everything below speaks the operator-facing error discipline of the crate:
 //! failures are [`LlmError`] values, and neither spawn errors nor logs ever
 //! render [`AgentLaunch::env`] values — one of them may be an API key.
@@ -33,7 +54,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -228,6 +249,27 @@ enum WriterCommand {
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>>;
 type Watchers = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Value>>>>;
 
+/// One in-flight request's pending slot, removed when the request's future is
+/// dropped for any reason — the caller timed out, `select!` took another arm,
+/// the turn was stopped. Abandoning a request is how a per-request budget stays
+/// local to its turn (see the module docs), so it must not leak the sender: an
+/// agent that never answers would otherwise pin one entry per timed-out call
+/// until the process exits. Removing an id the reader already answered is a
+/// no-op, which is why this is unconditional.
+struct PendingSlot {
+    pending: Pending,
+    id: u64,
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+    }
+}
+
 /// How long shutdown waits between closing the agent's stdin (EOF — the
 /// polite half) and group-killing it (the certain half). Observed behaviour
 /// that makes the polite half load-bearing: `opencode acp` detaches its
@@ -253,6 +295,15 @@ pub(crate) struct Connection {
     auth_hint: Arc<Mutex<Option<String>>>,
     /// Advertised `agentCapabilities.mcpCapabilities` from `initialize`.
     mcp_capabilities: OnceLock<McpCapabilities>,
+    /// Advertised `agentCapabilities.sessionCapabilities.close`: the protocol
+    /// has `session/close`, but it is optional, so this build sends it only to
+    /// an agent that said it supports it. Unset reads as "not supported".
+    session_close: OnceLock<bool>,
+    /// Consecutive setup calls (`session/new`, `set_model`, …) that ran out
+    /// their budget unanswered. One timeout fails one turn (see the module
+    /// docs); a *run* of them says the process itself is wedged, and the
+    /// adapter replaces it lazily on a later turn.
+    setup_timeouts: AtomicU32,
     kill: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -340,6 +391,8 @@ impl Connection {
             exit_status,
             auth_hint: Arc::clone(&auth_hint),
             mcp_capabilities: OnceLock::new(),
+            session_close: OnceLock::new(),
+            setup_timeouts: AtomicU32::new(0),
             kill,
         });
 
@@ -387,12 +440,20 @@ impl Connection {
                 ),
             });
         }
-        if let Some(mcp_caps) = init
-            .agent_capabilities
-            .and_then(|caps| caps.mcp_capabilities)
-        {
+        let capabilities = init.agent_capabilities;
+        if let Some(mcp_caps) = capabilities.and_then(|caps| caps.mcp_capabilities) {
             let _ = connection.mcp_capabilities.set(mcp_caps);
         }
+        // `session/close` is optional in ACP v1 and gated on the agent saying
+        // so. Record the answer now, so a finished turn knows whether the
+        // protocol's release is available or the session must be left to the
+        // process (the stated limit in the module docs).
+        let _ = connection.session_close.set(
+            capabilities
+                .and_then(|caps| caps.session_capabilities)
+                .and_then(|caps| caps.close)
+                .is_some(),
+        );
         if !init.auth_methods.is_empty() {
             let names: Vec<&str> = init
                 .auth_methods
@@ -415,6 +476,32 @@ impl Connection {
 
     pub(crate) fn mcp_capabilities(&self) -> Option<McpCapabilities> {
         self.mcp_capabilities.get().copied()
+    }
+
+    /// Whether the agent advertised `agentCapabilities.sessionCapabilities.close`.
+    /// When it did not, this build must not call `session/close`: an optional
+    /// method nobody advertised is not ours to guess at, and the honest
+    /// statement is that the session lives until the process exits.
+    pub(crate) fn supports_session_close(&self) -> bool {
+        self.session_close.get().copied().unwrap_or(false)
+    }
+
+    /// One setup call ran out its budget unanswered. Counted, never fatal: the
+    /// request is abandoned by id (see [`PendingSlot`]) and the shared
+    /// connection keeps serving every other turn. A run of these is the
+    /// adapter's signal that the *process* is wedged, not the turn.
+    pub(crate) fn note_setup_timeout(&self) {
+        self.setup_timeouts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A setup call was answered, so whatever run of timeouts this process had
+    /// is over — a slow-but-working agent is not replaced on the next turn.
+    pub(crate) fn note_setup_ok(&self) {
+        self.setup_timeouts.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn setup_timeouts(&self) -> u32 {
+        self.setup_timeouts.load(Ordering::SeqCst)
     }
 
     /// The login hint built from the agent's advertised auth methods, when it
@@ -442,7 +529,10 @@ impl Connection {
 
     /// Send one request and wait for its response. Timeouts are the caller's
     /// job (the turn loop needs an *idle* timeout that updates reset, not a
-    /// flat one).
+    /// flat one), and so is deciding what a timeout means: dropping this future
+    /// abandons the request safely — [`PendingSlot`] removes the entry and a
+    /// late answer is logged, not misrouted. That is what lets a caller put a
+    /// per-request budget on a request without killing the shared connection.
     pub(crate) async fn rpc(&self, method: &str, params: Value) -> Result<Value, AcpRequestError> {
         if !self.alive() {
             return Err(AcpRequestError::Exited(self.exit_detail()));
@@ -453,6 +543,13 @@ impl Connection {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(id, tx);
+        // Armed for the whole await: if the caller's future is dropped (a
+        // timeout, a `select!` arm, a turn aborted) the slot goes with it
+        // instead of leaking a sender for a request the agent may never answer.
+        let _slot = PendingSlot {
+            pending: Arc::clone(&self.pending),
+            id,
+        };
         let line = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -461,10 +558,6 @@ impl Connection {
         })
         .to_string();
         if self.cmd_tx.send(WriterCommand::Line(line)).is_err() {
-            self.pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&id);
             return Err(AcpRequestError::Exited(self.exit_detail()));
         }
         match rx.await {

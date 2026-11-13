@@ -28,12 +28,12 @@ use swarmbot_contracts::id::{
 };
 use swarmbot_contracts::repo::{BotSessionRecord, Persistence, ToolCallRecord, recover};
 use swarmbot_contracts::{
-    ApprovalRule, Bot, CausalChain, Conversation, Decision, Delivery, DeliveryState, DomainError,
-    Entry, EntryId, EntryKind, LiveCursor, LiveEvent, MessageEntry, NodeId, NodeInfo, NodeKind,
-    NodeRoot, PairingRecord, PolicyCeiling, PolicyMap, PostState, RequestStatus, Responder,
-    Routine, RoutineRun, RoutineSchedule, RoutineStatus, RuleEffect, RuleId, RuleScope, RunStatus,
-    RuntimeRequest, Settings, StepKind, Surface, Task, TaskStatus, TaskStep, ToolCallId, Turn,
-    TurnInitiator, TurnStatus, Urgency, Usage, normalize_name,
+    ApprovalRule, Bot, CausalChain, Conversation, ConversationKind, Decision, Delivery,
+    DeliveryState, DomainError, Entry, EntryId, EntryKind, LiveCursor, LiveEvent, MessageEntry,
+    NodeId, NodeInfo, NodeKind, NodeRoot, PairingRecord, PolicyCeiling, PolicyMap, PostState,
+    RequestStatus, Responder, Routine, RoutineRun, RoutineSchedule, RoutineStatus, RuleEffect,
+    RuleId, RuleScope, RunStatus, RuntimeRequest, Settings, StepKind, Surface, Task, TaskStatus,
+    TaskStep, ToolCallId, Turn, TurnInitiator, TurnStatus, Urgency, Usage, normalize_name,
 };
 
 use crate::JsonlMirror;
@@ -1686,6 +1686,24 @@ pub fn contract_mirror<S: Persistence>(make: &mut impl FnMut() -> S) -> anyhow::
     let mirror = JsonlMirror::new(dir.clone());
 
     let conversation = ConversationId::new();
+    // The header is what makes the file replayable: it carries the
+    // conversation row, without which a rebuilt store cannot append.
+    let original_kind = ConversationKind::Direct {
+        bot_id: swarmbot_contracts::id::BotId::new(),
+    };
+    let row = Conversation {
+        id: conversation.clone(),
+        kind: original_kind.clone(),
+        title: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        last_seq: 0,
+        archived: false,
+    };
+    mirror.ensure_header(&row)?;
+    // Idempotent: a second call with the same row writes nothing.
+    mirror.ensure_header(&row)?;
+
     let entries: Vec<Entry> = (1..=3)
         .map(|seq| Entry::owner_message(conversation.clone(), seq, format!("line {seq}")))
         .collect();
@@ -1700,7 +1718,11 @@ pub fn contract_mirror<S: Persistence>(make: &mut impl FnMut() -> S) -> anyhow::
         path.display()
     );
     let raw = std::fs::read_to_string(&path)?;
-    ensure_eq!(raw.lines().count(), 3, "one line per appended entry");
+    ensure_eq!(
+        raw.lines().count(),
+        4,
+        "one header line plus one line per appended entry"
+    );
     ensure_that!(
         raw.lines()
             .all(|line| line.starts_with('{') && !line.contains('\n')),
@@ -1728,20 +1750,47 @@ pub fn contract_mirror<S: Persistence>(make: &mut impl FnMut() -> S) -> anyhow::
 
     // The escape hatch: the SQLite file is gone, the transcripts are not.
     let rebuilt = make();
+    let report = JsonlMirror::rebuild(&dir, &rebuilt)?;
     ensure_eq!(
-        JsonlMirror::rebuild(&dir, &rebuilt)?,
+        report.entries,
         3,
         "rebuild counts the entries it wrote (torn lines do not count)"
+    );
+    ensure_eq!(
+        report.conversations,
+        1,
+        "rebuild restores the conversation row, not only its entries"
+    );
+    ensure_eq!(
+        report.inferred,
+        0,
+        "a file with a header needs no guesswork"
     );
     ensure_eq!(
         rebuilt.entries_after(&conversation, 0, 10)?,
         entries,
         "rebuild restores the transcript into a fresh store"
     );
+    // The row has to come back too: `next_seq` reads `last_seq` from it, so a
+    // store rebuilt from entries alone could be read but never appended to.
+    let restored = rebuilt
+        .get_conversation(&conversation)?
+        .expect("the conversation row is restored");
+    ensure_eq!(
+        restored.kind,
+        original_kind.clone(),
+        "the conversation kind survives the rebuild"
+    );
+    ensure_eq!(
+        restored.last_seq,
+        entries.iter().map(|entry| entry.seq).max().unwrap_or(0),
+        "last_seq is the highest restored sequence, so the next append continues"
+    );
     // Replaying an intact store hits the revision guard on every entry and
     // must skip, not fail and not duplicate.
+    let second = JsonlMirror::rebuild(&dir, &rebuilt)?;
     ensure_eq!(
-        JsonlMirror::rebuild(&dir, &rebuilt)?,
+        second.entries,
         0,
         "a second rebuild writes nothing — conflicts are skipped"
     );
@@ -1750,9 +1799,9 @@ pub fn contract_mirror<S: Persistence>(make: &mut impl FnMut() -> S) -> anyhow::
         3,
         "and nothing was duplicated"
     );
-    ensure_eq!(
-        JsonlMirror::rebuild(&scratch.child("never-created"), &rebuilt)?,
-        0,
+    let empty = JsonlMirror::rebuild(&scratch.child("never-created"), &rebuilt)?;
+    ensure_that!(
+        empty.is_empty(),
         "rebuilding from a missing directory is a no-op, not an error"
     );
     Ok(())

@@ -22,6 +22,22 @@
 //!   (default 5 s), inbound `Ping` answered with `Pong`, and the socket is
 //!   closed after [`PeerConfig::liveness_timeout`] (default 20 s) without any
 //!   inbound frame — half-open detection;
+//! * call deadlines (§4.7): [`Peer::call_with_id_deadline`] and
+//!   [`Peer::call_stream_with_id_deadline`] stop waiting after a caller-chosen
+//!   deadline. Expiry **withdraws** the call — [`Peer::abandon`] removes its
+//!   pending entry so a late answer can neither settle it nor leak the
+//!   bookkeeping, and the peer is sent `@effect/rpc/Interrupt` — and the call
+//!   fails with [`ProtocolError::CallTimedOut`]. Liveness and a deadline are
+//!   different failures on purpose: liveness means the *socket* went quiet, a
+//!   deadline means the *work* did not finish while frames kept flowing.
+//!
+//!   **A deadline is not a cancellation guarantee.** It bounds how long this
+//!   side waits and *asks* the peer to stop. Our own node answers an interrupt
+//!   by dropping the handler future, which runs its `Drop` guards and kills the
+//!   process group (§4.7, §5.1); a peer that ignores the frame may still be
+//!   running the command when this side has given up, and nothing here can kill
+//!   a process on another machine. The caller is told that in
+//!   [`ProtocolError::CallTimedOut`]'s own doc and in the brain's tool error.
 //! * two independent id spaces (§4.2): ids are allocated by the side that
 //!   sends the request, so both directions may use `0,1,2,…` without
 //!   colliding; inbound and outbound bookkeeping live in separate maps;
@@ -48,7 +64,7 @@ pub use futures::future::BoxFuture;
 use futures::{SinkExt as _, StreamExt as _};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
 
 use crate::rpc::{NODE_HELLO, is_stream_method};
 use crate::wire::{self, CauseError, Frame, Id, ProtocolError, TypedError};
@@ -351,6 +367,11 @@ impl<S: Socket> Peer<S> {
 
     /// [`Peer::call`] with a caller-chosen id and request headers (§4.10).
     /// The brain uses the headers to stamp [`crate::rpc::HEADER_NODE_ID`].
+    ///
+    /// This waits for as long as the peer takes. The liveness timeout is not a
+    /// bound on it: a peer that keeps sending frames (pings, heartbeats) keeps
+    /// the socket alive while never answering. Any path a human or a bot's turn
+    /// is waiting on wants [`Peer::call_with_id_deadline`] instead.
     pub async fn call_with_id(
         &self,
         id: Id,
@@ -369,6 +390,57 @@ impl<S: Socket> Peer<S> {
             .send(Cmd::Call { id, frame, resp })
             .map_err(|_| ProtocolError::SocketClosed)?;
         rx.await.map_err(|_| ProtocolError::SocketClosed)?
+    }
+
+    /// [`Peer::call_with_id`] with a deadline (§4.7).
+    ///
+    /// When the peer has not answered within `deadline` the call is
+    /// **withdrawn**: its pending entry is removed so a late answer cannot
+    /// settle it, the peer is sent `@effect/rpc/Interrupt`, and the call fails
+    /// with [`ProtocolError::CallTimedOut`]. Withdrawing is what keeps the
+    /// pending table from growing by one entry per hung call, and what makes a
+    /// late answer a logged no-op instead of a delivery to nobody.
+    ///
+    /// A call that answers just after the deadline loses the race and is
+    /// reported as a timeout: this side really did stop waiting, and its answer
+    /// is discarded. The deadline is a bound on *waiting*, not on the peer's
+    /// work — see the module docs for what that does and does not promise.
+    pub async fn call_with_id_deadline(
+        &self,
+        id: Id,
+        method: &str,
+        params: Value,
+        headers: Vec<(String, String)>,
+        deadline: Duration,
+    ) -> Result<Value, ProtocolError> {
+        let frame = Frame::Request {
+            id: id.clone(),
+            method: method.to_string(),
+            params,
+            headers,
+        };
+        let (resp, rx) = oneshot::channel();
+        self.cmd
+            .send(Cmd::Call {
+                id: id.clone(),
+                frame,
+                resp,
+            })
+            .map_err(|_| ProtocolError::SocketClosed)?;
+        match timeout(deadline, rx).await {
+            // A dropped sender means the driver went away without answering:
+            // that is a closed socket, not a deadline.
+            Ok(settled) => settled.map_err(|_| ProtocolError::SocketClosed)?,
+            Err(_) => {
+                // Withdraw *before* returning: the caller has stopped waiting,
+                // so the bookkeeping must not outlive the wait.
+                let _ = self.abandon(&id);
+                Err(ProtocolError::CallTimedOut {
+                    method: method.to_string(),
+                    after: deadline,
+                })
+            }
+        }
     }
 
     /// A streaming RPC (§4.6): every chunk value is forwarded to `out` (the
@@ -415,6 +487,50 @@ impl<S: Socket> Peer<S> {
         rx.await.map_err(|_| ProtocolError::SocketClosed)?
     }
 
+    /// [`Peer::call_stream_with_id`] with a deadline (§4.7).
+    ///
+    /// The deadline covers the **whole stream**, not the gap between chunks: a
+    /// stream that keeps dribbling chunks forever is exactly the shape a
+    /// deadline exists to stop. Expiry withdraws the call like
+    /// [`Peer::call_with_id_deadline`] does, which also drops the chunk sink, so
+    /// a collector reading `out` finishes instead of waiting for a stream that
+    /// will never end.
+    pub async fn call_stream_with_id_deadline(
+        &self,
+        id: Id,
+        method: &str,
+        params: Value,
+        headers: Vec<(String, String)>,
+        out: mpsc::Sender<Value>,
+        deadline: Duration,
+    ) -> Result<(), ProtocolError> {
+        let frame = Frame::Request {
+            id: id.clone(),
+            method: method.to_string(),
+            params,
+            headers,
+        };
+        let (resp, rx) = oneshot::channel();
+        self.cmd
+            .send(Cmd::Stream {
+                id: id.clone(),
+                frame,
+                out,
+                resp,
+            })
+            .map_err(|_| ProtocolError::SocketClosed)?;
+        match timeout(deadline, rx).await {
+            Ok(settled) => settled.map_err(|_| ProtocolError::SocketClosed)?,
+            Err(_) => {
+                let _ = self.abandon(&id);
+                Err(ProtocolError::CallTimedOut {
+                    method: method.to_string(),
+                    after: deadline,
+                })
+            }
+        }
+    }
+
     /// Fire-and-forget RPC: sent as a normal request (this dialect has no
     /// id-less notifications), and whatever the peer answers is discarded.
     /// `Ok` means the frame was queued for sending.
@@ -433,11 +549,33 @@ impl<S: Socket> Peer<S> {
     /// Cancel a call this peer made (§4.7). The peer's server answers with an
     /// error frame whose `data` holds `Interrupt` reasons, which surfaces
     /// from the original `call`/`call_stream` as [`ProtocolError::Remote`].
+    ///
+    /// The pending entry is left in place on purpose: the peer still owes an
+    /// answer, and that answer is what settles the call. Use [`Peer::abandon`]
+    /// when this side has stopped waiting and no answer is wanted.
     pub async fn interrupt(&self, request_id: &Id) -> Result<(), ProtocolError> {
         self.cmd
             .send(Cmd::Interrupt {
                 id: request_id.clone(),
             })
+            .map_err(|_| ProtocolError::SocketClosed)
+    }
+
+    /// Withdraw a call this peer made: forget it and ask the peer to stop (§4.7).
+    ///
+    /// The driver removes the call's pending entry **first** and only then
+    /// queues `@effect/rpc/Interrupt`, so an answer that arrives afterwards
+    /// finds no entry, is logged and ignored, and cannot resurrect a call whose
+    /// caller has gone. Dropping the entry also drops the stream sink, which is
+    /// what lets a stream collector finish after a deadline.
+    ///
+    /// `Ok(())` even when nothing was pending: a call that settled first is a
+    /// race, not an error, and turning it into one would make every deadline a
+    /// coin flip. What this does *not* do is stop work on the peer — see the
+    /// module docs on what an interrupt does and does not guarantee.
+    pub fn abandon(&self, id: &Id) -> Result<(), ProtocolError> {
+        self.cmd
+            .send(Cmd::Abandon { id: id.clone() })
             .map_err(|_| ProtocolError::SocketClosed)
     }
 
@@ -493,6 +631,12 @@ enum Cmd {
         ack: oneshot::Sender<Result<(), ProtocolError>>,
     },
     Interrupt {
+        id: Id,
+    },
+    /// Withdraw a call this side made: forget its pending entry, then send
+    /// `@effect/rpc/Interrupt` for it (§4.7). One command, so the two cannot be
+    /// reordered against an answer that is already on its way.
+    Abandon {
         id: Id,
     },
     /// A handler task's terminal outcome; the driver turns it into the
@@ -597,6 +741,15 @@ impl State {
                 });
             }
             Cmd::Interrupt { id } => {
+                self.queue(&Frame::Interrupt { request_id: id });
+            }
+            Cmd::Abandon { id } => {
+                // Forget first, then ask the peer to stop: a reply that lands
+                // after this finds no pending entry, so it is logged and
+                // ignored instead of being delivered to a caller that has
+                // stopped waiting — and the dropped oneshot sender cannot panic
+                // the driver.
+                self.pending.remove(&id);
                 self.queue(&Frame::Interrupt { request_id: id });
             }
             Cmd::Served { id, outcome } => {
@@ -1504,6 +1657,277 @@ mod tests {
         // The consumer channel is closed once the call settled.
         assert_eq!(out_rx.recv().await, None);
         drop((server, client));
+    }
+
+    /// The defect this pins: `call_with_id` awaited a oneshot, so a peer that
+    /// kept the socket alive (pings) while never answering its handler held the
+    /// caller forever — the liveness timeout never fires on a live socket.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_is_never_answered_fails_at_its_deadline_and_is_interrupted() {
+        let (sock, mut raw) = duplex_pair(64 * 1024);
+        let peer = Peer::new(sock, quiet_cfg());
+        let id = peer.next_id();
+        let deadline = Duration::from_secs(5);
+        let call = tokio::spawn({
+            let peer = peer.clone();
+            let id = id.clone();
+            async move {
+                peer.call_with_id_deadline(
+                    id,
+                    "fs.read",
+                    json!({ "path": "a.txt" }),
+                    Vec::new(),
+                    deadline,
+                )
+                .await
+            }
+        });
+
+        // The request is on the wire; this far end is a node that never answers.
+        let request = raw
+            .recv_text()
+            .await
+            .expect("a frame")
+            .expect("the request");
+        assert!(matches!(
+            wire::parse(&request).expect("parses"),
+            Frame::Request { .. }
+        ));
+
+        // A deadline bounds the wait; it does not fail fast.
+        tokio::time::advance(deadline - Duration::from_secs(1)).await;
+        assert!(!call.is_finished(), "the call gave up before its deadline");
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        match call.await.expect("the call task finishes") {
+            Err(ProtocolError::CallTimedOut { method, after }) => {
+                assert_eq!(method, "fs.read");
+                assert_eq!(after, deadline);
+            }
+            other => panic!("expected a deadline failure, got {other:?}"),
+        }
+
+        // §4.7: the peer is *asked to stop*, not merely abandoned.
+        let interrupt = raw
+            .recv_text()
+            .await
+            .expect("a frame")
+            .expect("the interrupt");
+        match wire::parse(&interrupt).expect("parses") {
+            Frame::Interrupt { request_id } => assert_eq!(request_id, id),
+            other => panic!("expected an Interrupt frame, got {other:?}"),
+        }
+        drop(peer);
+    }
+
+    /// A late answer must not panic the driver or poison the connection.
+    ///
+    /// What this can *observe* is limited, and the name says so rather than
+    /// promising the stronger claim: a unary caller already holds its
+    /// `CallTimedOut` and its oneshot receiver is gone, so "the answer was
+    /// delivered anyway" has no API to show up in. What is checked here is the
+    /// half that is visible — the frame is ignored without killing the socket,
+    /// and the next call on the same connection succeeds. That the pending entry
+    /// is actually removed is pinned where it *is* observable:
+    /// `a_stream_that_stops_answering_fails_at_its_deadline`, where a leaked
+    /// entry would keep the chunk sink alive and deliver a late chunk.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_answer_after_a_timeout_does_not_panic_or_break_the_connection() {
+        let (sock, mut raw) = duplex_pair(64 * 1024);
+        let peer = Peer::new(sock, quiet_cfg());
+        let id = peer.next_id();
+        let call = tokio::spawn({
+            let peer = peer.clone();
+            let id = id.clone();
+            async move {
+                peer.call_with_id_deadline(
+                    id,
+                    "fs.read",
+                    json!({ "path": "a.txt" }),
+                    Vec::new(),
+                    Duration::from_secs(5),
+                )
+                .await
+            }
+        });
+        raw.recv_text()
+            .await
+            .expect("a frame")
+            .expect("the request");
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(matches!(
+            call.await.expect("the call task finishes"),
+            Err(ProtocolError::CallTimedOut { .. })
+        ));
+        // Reading the interrupt proves the driver processed the withdrawal, so
+        // the answer below really is a late answer to a settled id.
+        let interrupt = raw
+            .recv_text()
+            .await
+            .expect("a frame")
+            .expect("the interrupt");
+        assert!(matches!(
+            wire::parse(&interrupt).expect("parses"),
+            Frame::Interrupt { .. }
+        ));
+
+        // The node answers the withdrawn id anyway.
+        raw.send_text(&wire::render(&Frame::Response {
+            id: id.clone(),
+            result: json!("late"),
+        }))
+        .await
+        .expect("the late answer is written");
+
+        // The connection still works: a fresh call is answered normally. If the
+        // late frame had settled (or panicked) the driver, this would fail.
+        let second = peer.next_id();
+        let later = tokio::spawn({
+            let peer = peer.clone();
+            let id = second.clone();
+            async move {
+                peer.call_with_id_deadline(
+                    id,
+                    "fs.stat",
+                    json!({ "path": "b.txt" }),
+                    Vec::new(),
+                    Duration::from_secs(5),
+                )
+                .await
+            }
+        });
+        let request = raw
+            .recv_text()
+            .await
+            .expect("a frame")
+            .expect("the second request");
+        match wire::parse(&request).expect("parses") {
+            Frame::Request { id: seen, .. } => assert_eq!(seen, second),
+            other => panic!("expected the second request, got {other:?}"),
+        }
+        raw.send_text(&wire::render(&Frame::Response {
+            id: second,
+            result: json!({ "ok": true }),
+        }))
+        .await
+        .expect("the answer is written");
+        let answered = later
+            .await
+            .expect("the second call task finishes")
+            .expect("a call that answers in time still succeeds");
+        assert_eq!(answered["ok"], json!(true));
+        assert!(!peer.is_closed(), "a late answer must not kill the socket");
+        drop(peer);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_call_answered_before_its_deadline_still_succeeds() {
+        let (a, b) = duplex_pair(64 * 1024);
+        let peer = Peer::new(a, quiet_cfg());
+        let far = Peer::new(
+            b,
+            PeerConfig {
+                handler: Some(Arc::new(Echo { side: "far" })),
+                ..quiet_cfg()
+            },
+        );
+        let id = peer.next_id();
+        let value = peer
+            .call_with_id_deadline(
+                id,
+                "fs.stat",
+                json!({ "path": "a.txt" }),
+                Vec::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("answered well inside its deadline");
+        assert_eq!(value["side"], json!("far"));
+        assert_eq!(value["method"], json!("fs.stat"));
+        drop(far);
+    }
+
+    /// The deadline covers the whole stream, and withdrawing it releases the
+    /// chunk sink — otherwise a collector would wait for a stream that never
+    /// ends, which is the same hang in a different place.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_stops_answering_fails_at_its_deadline() {
+        let (sock, mut raw) = duplex_pair(64 * 1024);
+        let peer = Peer::new(sock, quiet_cfg());
+        let (tx, mut rx) = mpsc::channel(8);
+        let id = peer.next_id();
+        let call = tokio::spawn({
+            let peer = peer.clone();
+            let id = id.clone();
+            async move {
+                peer.call_stream_with_id_deadline(
+                    id,
+                    SHELL_EXEC,
+                    Value::Null,
+                    Vec::new(),
+                    tx,
+                    Duration::from_secs(5),
+                )
+                .await
+            }
+        });
+        let request = raw
+            .recv_text()
+            .await
+            .expect("a frame")
+            .expect("the request");
+        assert!(matches!(
+            wire::parse(&request).expect("parses"),
+            Frame::Request { .. }
+        ));
+
+        // One chunk, Acknowledged, and then the node goes quiet mid-stream.
+        raw.send_text(&wire::render(&Frame::Chunk {
+            id: id.clone(),
+            result: vec![json!("c0")],
+        }))
+        .await
+        .expect("the chunk is written");
+        assert_eq!(rx.recv().await, Some(json!("c0")));
+        let ack = raw.recv_text().await.expect("a frame").expect("the ack");
+        assert!(matches!(
+            wire::parse(&ack).expect("parses"),
+            Frame::Ack { .. }
+        ));
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(matches!(
+            call.await.expect("the call task finishes"),
+            Err(ProtocolError::CallTimedOut { .. })
+        ));
+
+        // The node keeps streaming into the withdrawn call. Nothing of it may
+        // reach the collector: with the pending entry left in the table the
+        // driver still holds the sink, forwards this chunk, and `rx` yields it
+        // — a call the caller has given up on, resurrected with data. The bound
+        // is well under this test's liveness timeout, so a chunk can only arrive
+        // through the withdrawal's removal, never through the socket dying.
+        raw.send_text(&wire::render(&Frame::Chunk {
+            id: id.clone(),
+            result: vec![json!("late")],
+        }))
+        .await
+        .expect("the late chunk is written");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await,
+            Ok(None),
+            "a late chunk must not reach a withdrawn stream (and withdrawing it must drop its sink)"
+        );
+        let interrupt = raw
+            .recv_text()
+            .await
+            .expect("a frame")
+            .expect("the interrupt");
+        assert!(matches!(
+            wire::parse(&interrupt).expect("parses"),
+            Frame::Interrupt { .. }
+        ));
+        drop(peer);
     }
 
     #[tokio::test(start_paused = true)]

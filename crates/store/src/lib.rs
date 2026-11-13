@@ -6,6 +6,12 @@
 //! (tests) — plus [`JsonlMirror`], the append-only transcript mirror that can
 //! rebuild a store when the database file is lost.
 //!
+//! [`ThreadedStore`] is the same durable store behind dedicated threads: the
+//! port is synchronous, so a caller cannot stop waiting for its own answer,
+//! but with one writer lane and WAL reader lanes a contended write no longer
+//! serialises *reads* — see the module docs for exactly what that does and
+//! does not fix.
+//!
 //! Both stores must be **observably identical** through the port: same
 //! ordering, same conflict rules, same counts. Two mechanisms keep them so:
 //!
@@ -22,11 +28,13 @@ pub mod contract;
 pub mod memory;
 pub mod mirror;
 pub mod sqlite;
+pub mod threaded;
 
 pub use contract::run_contract_suite;
 pub use memory::MemoryStore;
 pub use mirror::JsonlMirror;
 pub use sqlite::SqliteStore;
+pub use threaded::ThreadedStore;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use swarmbot_contracts::Seq;

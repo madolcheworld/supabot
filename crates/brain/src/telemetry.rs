@@ -62,6 +62,9 @@ pub const SENSITIVE_HEADERS: &[HeaderName] = &[
     axum::http::header::PROXY_AUTHORIZATION,
 ];
 
+/// What a credential is replaced with in a log line.
+pub const REDACTED: &str = "[redacted]";
+
 /// The set of strings that must never reach the log, at runtime.
 ///
 /// A secret is registered when it is learned (a token minted, a key loaded), so
@@ -90,6 +93,18 @@ impl SecretRegistry {
         secrets.insert(secret.trim().to_string());
     }
 
+    /// Forget a credential once nothing can legitimately log it any more.
+    ///
+    /// A per-turn MCP token is minted and dropped on every model call, so keeping
+    /// every one forever would grow the scrubber without bound and make every
+    /// line slower for no benefit. Once the turn's registry entry is gone the
+    /// token authenticates nothing, so it is no longer a secret — and the path
+    /// itself is redacted by [`redact_path`] either way.
+    pub fn forget(&self, secret: &str) {
+        let mut secrets = self.secrets.write().unwrap_or_else(|e| e.into_inner());
+        secrets.remove(secret.trim());
+    }
+
     /// How many credentials are being watched.
     pub fn len(&self) -> usize {
         self.secrets.read().map(|s| s.len()).unwrap_or(0)
@@ -111,7 +126,7 @@ impl SecretRegistry {
         let mut out = text.to_string();
         for secret in secrets.iter() {
             if out.contains(secret.as_str()) {
-                out = out.replace(secret.as_str(), "[redacted]");
+                out = out.replace(secret.as_str(), REDACTED);
             }
         }
         Cow::Owned(out)
@@ -245,10 +260,11 @@ pub fn init_tracing(registry: Arc<SecretRegistry>) {
 /// The one-line description of a request that goes into a span.
 ///
 /// Deliberately not `{:?}` on the request: `Debug` for `HeaderMap` prints every
-/// header, including `Authorization` and `Cookie`.
+/// header, including `Authorization` and `Cookie`. The path goes through
+/// [`redact_path`] because one route carries its credential *in the path*.
 pub fn describe_request<B>(request: &Request<B>) -> String {
     let uri = request.uri();
-    let path = uri.path();
+    let path = redact_path(uri.path());
     let query = uri.query().map(redact_query);
     match query {
         Some(query) if !query.is_empty() => {
@@ -262,12 +278,27 @@ pub fn describe_request<B>(request: &Request<B>) -> String {
     }
 }
 
+/// Replace a credential that travels in a URL path.
+///
+/// `/mcp/t/{token}` is the per-turn MCP endpoint on the internal listener, and
+/// its token *is* the credential: the registry lookup is the authentication.
+/// The access log renders paths verbatim and outlives the process, so the token
+/// is replaced here — unconditionally, before the line is formatted — and the
+/// [`SecretRegistry`] is a second line of defence rather than the only one. The
+/// route itself is kept: "which endpoint was hit" is what makes the line useful.
+pub fn redact_path(path: &str) -> Cow<'_, str> {
+    match path.strip_prefix("/mcp/t/") {
+        Some(rest) if !rest.is_empty() => Cow::Owned(format!("/mcp/t/{REDACTED}")),
+        _ => Cow::Borrowed(path),
+    }
+}
+
 /// Replace the value of any credential-shaped query parameter.
 pub fn redact_query(query: &str) -> String {
     query
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((key, _)) if is_sensitive_key(key) => format!("{key}=[redacted]"),
+            Some((key, _)) if is_sensitive_key(key) => format!("{key}={REDACTED}"),
             _ => pair.to_string(),
         })
         .collect::<Vec<_>>()
@@ -357,6 +388,44 @@ mod tests {
         let line = describe_request(&request("/ws/live?cursor=1:2&access_token=hunter2xx"));
         assert!(line.contains("cursor=1:2"), "{line}");
         assert!(!line.contains("hunter2xx"), "{line}");
+    }
+
+    #[test]
+    fn a_per_turn_mcp_token_in_the_path_is_redacted() {
+        // `/mcp/t/{token}` is the one route whose credential is in the path, and
+        // the access log renders the path verbatim. The route is kept, the token
+        // is not — an operator still needs to see which endpoint was hit.
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let line = describe_request(&request(&format!("/mcp/t/{token}")));
+        assert!(!line.contains(token), "{line}");
+        assert!(line.contains("/mcp/t/[redacted]"), "{line}");
+        assert_eq!(redact_path(&format!("/mcp/t/{token}")), "/mcp/t/[redacted]");
+        // Everything else is untouched: the static route, the health probe, the
+        // public API and a path that only looks like the prefix.
+        for unchanged in ["/mcp", "/health", "/api/bots", "/mcp/t", "/mcp/t/"] {
+            assert_eq!(redact_path(unchanged), unchanged);
+        }
+    }
+
+    #[test]
+    fn a_forgotten_secret_is_no_longer_scrubbed() {
+        // Per-turn MCP tokens are minted and dropped on every model call, so the
+        // registry has to be able to forget one: keeping every token forever
+        // would make the scrubber grow without bound.
+        let registry = SecretRegistry::new();
+        registry.register("a-per-turn-token-value");
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.redact("hit /mcp/t/a-per-turn-token-value"),
+            "hit /mcp/t/[redacted]"
+        );
+        registry.forget("a-per-turn-token-value");
+        assert_eq!(registry.len(), 0);
+        assert_eq!(
+            registry.redact("hit /mcp/t/a-per-turn-token-value"),
+            "hit /mcp/t/a-per-turn-token-value",
+            "a forgotten token is no longer a secret"
+        );
     }
 
     #[test]

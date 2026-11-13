@@ -24,6 +24,7 @@
 //! 10. headers are `[[name, value], …]`.
 
 use std::fmt;
+use std::time::Duration;
 
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -486,6 +487,16 @@ pub enum ProtocolError {
 
     #[error("liveness timeout: no frame received within the deadline")]
     LivenessTimeout,
+
+    /// A call this side made was not answered within its deadline
+    /// ([`crate::mux::Peer::call_with_id_deadline`]). The call has been
+    /// withdrawn and the peer sent `@effect/rpc/Interrupt` (§4.7).
+    ///
+    /// This is deliberately **not** [`ProtocolError::LivenessTimeout`]: the
+    /// socket is alive — frames are flowing — it is the *work* that did not
+    /// finish. And it is not a remote error either: the peer said nothing.
+    #[error("the peer did not answer `{method}` within {after:?}")]
+    CallTimedOut { method: String, after: Duration },
 
     #[error("call interrupted")]
     Interrupted,

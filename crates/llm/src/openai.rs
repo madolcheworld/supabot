@@ -30,7 +30,20 @@
 //! A retry **restarts the stream**. Deltas emitted by a failed attempt were
 //! already sent and cannot be retracted, so the contract is: callers treat
 //! [`LlmEvent`] deltas as best-effort progress and the returned
-//! [`ChatResponse`] as authoritative.
+//! [`ChatResponse`] as authoritative. Every retry is announced with
+//! [`LlmEvent::Restart`] *before* the retried attempt produces its first byte:
+//! that is the consumer's instruction to discard what it rendered for this
+//! turn, so a live transcript shows one answer instead of two attempts glued
+//! together.
+//!
+//! # What counts as a complete stream
+//!
+//! A turn is complete only when the server said so: `data: [DONE]` (the [OI]
+//! terminator) or a `finish_reason` on a choice. A stream that simply stops —
+//! EOF with neither — is refused as [`LlmError::Malformed`], because a proxy
+//! closing mid-answer is byte-for-byte indistinguishable from a finished
+//! stream, and committing the half reply would put text in the transcript that
+//! the model never finished.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -268,7 +281,9 @@ async fn status_error(response: reqwest::Response) -> HttpError {
 /// dispatched on its terminating blank line, so a stream that *ends* mid
 /// event drops that final event. OpenAI-compatible servers terminate every
 /// event; if one ever failed to, we would lose at most the trailing `usage`
-/// chunk — degraded accounting, never a wrong response.
+/// chunk. The truncation itself cannot pass silently: `consume_sse` refuses a
+/// stream that ends without `[DONE]` or a `finish_reason`, so a dropped tail is
+/// an error rather than a short answer.
 fn frame_sse(body: BodyStream) -> impl Stream<Item = Result<String, HttpError>> {
     use eventsource_stream::{EventStreamError, Eventsource};
     body.eventsource().map(|event| match event {
@@ -505,6 +520,15 @@ impl OpenAiCompat {
             if cancel.is_cancelled() {
                 return Err(LlmError::Cancelled);
             }
+            if attempt > 0 {
+                // A retry re-streams from zero. Everything a consumer rendered
+                // for the failed attempt is void now, and it has to be told
+                // *before* this attempt's first delta — otherwise the two
+                // attempts' text is appended and reads as one answer. Emitted
+                // after the backoff so the boundary lands immediately before
+                // the request it describes.
+                emit(&events, LlmEvent::Restart { attempt }).await?;
+            }
             match self.attempt(&url, &headers, &body, &events, &cancel).await {
                 Ok(response) => return Ok(response),
                 Err(AttemptEnd::Retry { error, after }) => {
@@ -603,6 +627,14 @@ impl OpenAiCompat {
     }
 
     /// Parse the framed SSE stream into events plus the assembled response.
+    ///
+    /// Termination invariant: a turn is complete only when the server *said*
+    /// it was — `data: [DONE]` or a `finish_reason`. EOF alone is not a
+    /// terminator: a proxy that closes mid-answer produces exactly that byte
+    /// stream, and inferring `Stop` from it would commit a half reply the
+    /// model never finished. So a stream that ends without a terminator is
+    /// refused as [`LlmError::Malformed`] naming what is missing, whether or
+    /// not any text arrived.
     async fn consume_sse(
         &self,
         body: BodyStream,
@@ -611,6 +643,7 @@ impl OpenAiCompat {
     ) -> Result<ChatResponse, LlmError> {
         let mut framed = Box::pin(frame_sse(body));
         let mut state = StreamState::default();
+        let mut terminated = false;
         loop {
             let item = tokio::select! {
                 biased;
@@ -626,6 +659,7 @@ impl OpenAiCompat {
                         continue;
                     }
                     if data == "[DONE]" {
+                        terminated = true;
                         break;
                     }
                     state.handle_chunk(&self.spec.id, data, events).await?;
@@ -636,10 +670,14 @@ impl OpenAiCompat {
                         reason: format!("SSE stream failed mid-response: {error}"),
                     });
                 }
-                // The server closed without `data: [DONE]`: assemble what
-                // arrived instead of failing a complete-looking turn.
+                // The server closed. That is only an ending when it already
+                // sent a terminator (checked below); otherwise it is a
+                // truncation and must not be dressed up as a complete turn.
                 None => break,
             }
+        }
+        if !terminated && !state.has_finish_reason() {
+            return Err(state.truncated_error(&self.spec.id));
         }
         state.finish(&self.spec.id, events).await
     }
@@ -796,6 +834,55 @@ struct ToolCallAccumulator {
 }
 
 impl StreamState {
+    /// Whether the server told us why it stopped. A `finish_reason` is a
+    /// terminator in its own right: some servers send it and then close
+    /// without `data: [DONE]`.
+    fn has_finish_reason(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+
+    /// The refusal for a stream that stopped without a terminator.
+    ///
+    /// Names exactly what is missing and how much arrived, because the
+    /// operator's next question is "was that the model or the network?". The
+    /// deltas that did arrive were already streamed as progress; the point of
+    /// the refusal is that no [`ChatResponse`] exists, so nothing incomplete
+    /// can be persisted or acted on.
+    ///
+    /// [`LlmError::Malformed`] rather than `Unavailable` on purpose: the
+    /// retry policy in [`crate::backend::LlmError::retryable`] already lists
+    /// "malformed streams" as not retryable, because a server that ends
+    /// without a terminator will do it again — retrying only pays for the same
+    /// truncated generation twice. A stream cut by a *transport* error takes
+    /// the other branch in `consume_sse` and stays retryable.
+    fn truncated_error(&self, backend: &str) -> LlmError {
+        let reason =
+            if self.text.is_empty() && self.reasoning.is_empty() && self.tool_calls.is_empty() {
+                "the connection closed before any content: the SSE stream ended without \
+             `data: [DONE]` or a finish_reason, so there is no reply to use"
+                    .to_string()
+            } else if self.text.is_empty() {
+                format!(
+                    "the connection closed mid-answer: the SSE stream ended after {} reasoning \
+                 byte(s) and {} tool call(s) but no text, without `data: [DONE]` or a \
+                 finish_reason; the reply is incomplete and was not used",
+                    self.reasoning.len(),
+                    self.tool_calls.len()
+                )
+            } else {
+                format!(
+                    "the connection closed mid-answer: the SSE stream ended after {} byte(s) of \
+                 text without `data: [DONE]` or a finish_reason; the reply is incomplete and \
+                 was not used",
+                    self.text.len()
+                )
+            };
+        LlmError::Malformed {
+            backend: backend.to_string(),
+            reason,
+        }
+    }
+
     async fn handle_chunk(
         &mut self,
         backend: &str,
@@ -978,8 +1065,10 @@ impl StreamState {
             });
         }
 
-        // When the stream ends without an explicit finish_reason, infer:
-        // assembled tool calls mean the model stopped to call them.
+        // `finish` only runs for a stream that carried a terminator (see
+        // `consume_sse`). When the terminator was `[DONE]` with no
+        // `finish_reason`, infer: assembled tool calls mean the model stopped
+        // to call them, anything else is a normal stop.
         let finish_reason = self.finish_reason.unwrap_or(if tool_calls.is_empty() {
             FinishReason::Stop
         } else {

@@ -263,7 +263,10 @@ pub(crate) async fn forward_remote(
     let gate = gate_call(ctx, env, surface, tool, &target, read_only, command).await?;
     let mut result = match gate.blocked_result(tool, &target) {
         Some(blocked) => blocked,
-        None => ctx.nodes.exec(&node, call).await?,
+        // The caller's invocation goes with the call: the node audits against it
+        // and echoes it in `node.requestApproval`, so the executor must not have
+        // to reconstruct it from "which turn is running there".
+        None => ctx.nodes.exec(&node, &ctx.invocation, call).await?,
     };
     stamp_meta(&mut result, &gate, surface, &target, &node);
     Ok(result)
@@ -413,9 +416,15 @@ pub(crate) mod testkit {
     }
 
     /// A node executor that records forwarded calls instead of moving them.
+    ///
+    /// The invocation is recorded alongside the call, in the same order: the port
+    /// carries attribution, and a fake that threw it away could not tell a
+    /// forwarded call's real caller from the placeholder an inferring executor
+    /// would have had to invent.
     #[derive(Debug, Default)]
     pub(crate) struct TestNodes {
         pub calls: Mutex<Vec<(NodeId, NodeCall)>>,
+        invocations: Mutex<Vec<Invocation>>,
         response: Mutex<Option<ToolResult>>,
     }
 
@@ -433,11 +442,25 @@ pub(crate) mod testkit {
         pub fn recorded(&self) -> Vec<(NodeId, NodeCall)> {
             self.calls.lock().expect("test mutex").clone()
         }
+
+        /// The invocation each recorded call carried, in `recorded()` order.
+        pub fn recorded_invocations(&self) -> Vec<Invocation> {
+            self.invocations.lock().expect("test mutex").clone()
+        }
     }
 
     #[async_trait::async_trait]
     impl NodeExecutor for TestNodes {
-        async fn exec(&self, node: &NodeId, call: NodeCall) -> Result<ToolResult, ToolError> {
+        async fn exec(
+            &self,
+            node: &NodeId,
+            invocation: &Invocation,
+            call: NodeCall,
+        ) -> Result<ToolResult, ToolError> {
+            self.invocations
+                .lock()
+                .expect("test mutex")
+                .push(invocation.clone());
             self.calls
                 .lock()
                 .expect("test mutex")
@@ -556,5 +579,43 @@ pub(crate) mod testkit {
             BotId::from_suffix(&"b".repeat(32)),
             ConversationId::from_suffix(&"c".repeat(32)),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Port-level: what a forwarded call hands the [`crate::NodeExecutor`].
+
+    use super::*;
+    use crate::handlers::testkit::Rig;
+
+    /// The invariant the widened port exists for: the invocation a handler was
+    /// given is the invocation the executor receives, unchanged. A node audits
+    /// the call against it and echoes it back in `node.requestApproval`, so a
+    /// placeholder — or another turn's id — is a lie about who asked. The old
+    /// port had nowhere to put this fact, which is why the brain had to infer it
+    /// from "which turn is running on that node" and got it wrong with two.
+    #[tokio::test]
+    async fn forward_remote_hands_the_callers_invocation_to_the_executor() {
+        let rig = Rig::new();
+        let remote = NodeId::new();
+        let call = NodeCall::FsStat {
+            path: "notes.txt".into(),
+        };
+
+        let outcome =
+            forward_remote(&rig.ctx, &rig.env, "stat", remote.clone(), call.clone()).await;
+        // The default test executor has no answer wired, so the forward fails —
+        // which is also the proof that nothing ran locally instead.
+        assert!(outcome.is_err(), "{outcome:?}");
+
+        assert_eq!(rig.nodes.recorded().len(), 1, "exactly one forward");
+        assert_eq!(rig.nodes.recorded()[0].0, remote);
+        assert_eq!(rig.nodes.recorded()[0].1, call);
+        assert_eq!(
+            rig.nodes.recorded_invocations(),
+            vec![rig.ctx.invocation.clone()],
+            "the executor must see the caller's own invocation, not one it invented"
+        );
     }
 }

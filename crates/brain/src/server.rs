@@ -8,9 +8,12 @@
 //!   wrong method with a bare 405 and no body, and a client that decodes every
 //!   failure as `{"error":{…}}` should not have to special-case the framework's
 //!   own replies.
-//! * **the two listeners.** The public one carries the API; the internal one is
-//!   loopback-only by configuration and carries the MCP gateway, so a harness on
-//!   the same machine cannot reach the owner's API through it by accident.
+//! * **the two listeners.** The public one carries the API; the internal one
+//!   carries the MCP gateway. It is loopback-only — `internal_addr` is refused at
+//!   resolve time unless it is `127.0.0.0/8` or `::1` ([`crate::config`]) — and
+//!   its static `/mcp` route carries the owner gate, so a harness on the same
+//!   machine cannot reach the owner's API through it and an operator typo cannot
+//!   expose tool execution to the network.
 //! * **one stop path.** SIGINT, SIGTERM and `POST /api/shutdown` all end up in the
 //!   same place: stop accepting, let the in-flight requests finish, then return so
 //!   the caller can shut the swarm down. A second signal exits at once, because
@@ -90,11 +93,13 @@ pub fn app(state: AppState) -> Router {
 ///
 /// No CORS and no owner routes: this listener is for a harness on the same
 /// machine, and a second path to the API would be a second place to get
-/// authorization wrong.
+/// authorization wrong. "Same machine" is enforced where the address is
+/// resolved ([`crate::config::validate_internal_addr`]), and the static `/mcp`
+/// route still carries the owner gate — a loopback socket is not a credential.
 pub fn internal_app(state: &AppState) -> Router {
     let mcp = routes::node_gateway::create_mcp_service(state);
     instrumented(
-        routes::internal_router(mcp, Arc::clone(&state.turn_mcp)),
+        routes::internal_router(state.clone(), mcp, Arc::clone(&state.turn_mcp)),
         state,
     )
 }
@@ -311,7 +316,7 @@ pub async fn serve(
         tokio::spawn(async move {
             if let Some(addr) = internal_addr {
                 info!(listener = %addr, "the internal listener is up: the MCP gateway");
-                write_mcp_config(&serving.config.paths, &addr);
+                write_mcp_config(&serving.config.paths, &addr, serving.auth.token());
             }
             axum::serve(listener, router)
                 .with_graceful_shutdown(async move { serving.wait_for_shutdown().await })
@@ -347,24 +352,35 @@ pub async fn serve(
 }
 
 /// Write the MCP client configuration file for CLI harnesses on this machine.
-fn write_mcp_config(paths: &crate::config::Paths, addr: &std::net::SocketAddr) {
+///
+/// The static `/mcp` route is behind the owner gate, so a config that named only
+/// the URL would be a config a harness could not use. The bearer token therefore
+/// travels in the file, and the file is written **0600** through
+/// [`crate::config::write_private`] — the same treatment as `<data>/owner-token`,
+/// whose value it carries. Two invariants go with it: the token is never logged
+/// (it is registered with the scrubber at boot) and this listener refuses to bind
+/// anything but loopback, so "a harness on this machine" is the whole audience.
+///
+/// The `type: http` field is what the Claude CLI's `--mcp-config` expects for a
+/// URL server; without it a server with headers is ambiguous.
+fn write_mcp_config(paths: &crate::config::Paths, addr: &std::net::SocketAddr, token: &str) {
     let mcp_url = format!("http://{addr}/mcp");
     let json_val = serde_json::json!({
         "mcpServers": {
             "swarmbot": {
-                "url": mcp_url
+                "type": "http",
+                "url": mcp_url,
+                "headers": {
+                    "Authorization": format!("Bearer {token}"),
+                },
             }
         }
     });
     let target = paths.mcp_config();
-    if let Some(parent) = target.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     if let Ok(content) = serde_json::to_string_pretty(&json_val) {
-        if let Err(err) = std::fs::write(&target, content) {
-            debug!(path = %target.display(), %err, "could not write MCP config file");
-        } else {
-            info!(path = %target.display(), "wrote MCP harness configuration");
+        match crate::config::write_private(&target, &content) {
+            Ok(()) => info!(path = %target.display(), "wrote MCP harness configuration"),
+            Err(err) => debug!(path = %target.display(), %err, "could not write MCP config file"),
         }
     }
 }

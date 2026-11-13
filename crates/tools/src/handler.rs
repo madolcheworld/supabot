@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use swarmbot_contracts::{
-    DomainError, Invocation, NodeId, Surface, ToolError, ToolResult, ToolSpec,
+    DomainError, Invocation, NodeId, Surface, ToolError, ToolResult, ToolSpec, TurnId,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -130,6 +130,17 @@ impl fmt::Debug for ToolContext {
 pub trait ApprovalGate: Send + Sync {
     /// `Ok(true)` = allowed, `Ok(false)` = denied (render `ERROR: denied …`).
     async fn request(&self, ctx: &ToolContext, ask: ApprovalAsk) -> Result<bool, DomainError>;
+
+    /// A turn was stopped while a card was waiting: settle it as cancelled.
+    ///
+    /// The default is a no-op so a test double need not care. The real bridge
+    /// overrides it because a blocking ask has no other way out: without this,
+    /// Stop left the tool call waiting for the full `approval_expiry_secs`
+    /// (ten minutes by default) before the turn could finish.
+    fn cancel_turn(&self, turn: &TurnId) -> Result<usize, DomainError> {
+        let _ = turn;
+        Ok(0)
+    }
 }
 
 /// One approval question, as data, so a gate can log it, show it in a card,
@@ -147,9 +158,25 @@ pub struct ApprovalAsk {
 
 /// Runs a call on a node. The local implementation executes in-process; the
 /// brain's implementation forwards remote nodes over the node protocol.
+///
+/// `invocation` is the **caller's own**, and it travels to the executing machine
+/// unchanged. It is a parameter rather than something an executor works out for
+/// itself because an executor *cannot* work it out: every handler already has it
+/// in [`ToolContext::invocation`], while the executor only sees a node id and a
+/// [`NodeCall`]. The old signature forced the brain to guess — scan the running
+/// turns and hope exactly one belonged to a bot hosted on that node — and a guess
+/// is wrong the moment two turns run on one node in parallel. It is not cosmetic
+/// either: the invocation is what the node audits the call against and what it
+/// echoes back in `node.requestApproval`, so a guessed one puts an approval card
+/// in the wrong conversation, which is a lie about who asked.
 #[async_trait::async_trait]
 pub trait NodeExecutor: Send + Sync {
-    async fn exec(&self, node: &NodeId, call: NodeCall) -> Result<ToolResult, ToolError>;
+    async fn exec(
+        &self,
+        node: &NodeId,
+        invocation: &Invocation,
+        call: NodeCall,
+    ) -> Result<ToolResult, ToolError>;
 }
 
 /// A node RPC, as data, so the same type can cross a socket later.

@@ -163,6 +163,18 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// fsync, rename. The temp name carries a uuid v7 so two concurrent writers
 /// to the same target cannot share a temp file — one of the two renames wins
 /// and the loser's file is already gone or gets cleaned up.
+///
+/// Two details exist because a rename replaces the *inode*, not just its
+/// contents:
+///
+/// * **the target's mode is carried over** (unix). `File::create` makes a
+///   0644 temp file, and renaming that over a 0600 target would publish a
+///   file the owner had deliberately kept private — a write is not a
+///   permission decision;
+/// * **the parent directory is fsynced** after the rename. Syncing the file
+///   only makes its *contents* durable; the name lives in the directory, so a
+///   crash between the rename and the next journal commit could still lose
+///   the file the caller was told it wrote.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
     let parent = path
         .parent()
@@ -173,10 +185,16 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
     let tmp = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::now_v7().simple()));
+    let mode = existing_mode(path);
 
-    fn write_tmp(tmp: &Path, target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    fn write_tmp(
+        tmp: &Path,
+        target: &Path,
+        bytes: &[u8],
+        mode: Option<u32>,
+    ) -> std::io::Result<()> {
         use std::io::Write as _;
-        let mut file = std::fs::File::create(tmp)?;
+        let mut file = create_tmp(tmp, mode)?;
         file.write_all(bytes)?;
         // Durability before visibility: the rename must never expose a file
         // whose contents are still in flight.
@@ -185,7 +203,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
         Ok(())
     }
 
-    if let Err(error) = write_tmp(&tmp, path, bytes) {
+    if let Err(error) = write_tmp(&tmp, path, bytes, mode) {
         // Best effort: a leftover temp file is litter, not corruption.
         let _ = std::fs::remove_file(&tmp);
         return Err(ToolError::failed(format!(
@@ -193,7 +211,75 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
             path.display()
         )));
     }
+    sync_parent_dir(parent);
     Ok(())
+}
+
+/// The mode of the file `path` currently names, so a replacing write keeps
+/// it. `metadata` (not `symlink_metadata`) because the rename replaces the
+/// path itself: when the path is a symlink the interesting mode is the one of
+/// the file whose content is being replaced, not the symlink's meaningless
+/// 0777. `0o7777` masks off the file-type bits, leaving permissions only.
+#[cfg(unix)]
+fn existing_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o7777)
+}
+
+/// No mode bits outside unix; the temp file gets the default, which is also
+/// what the target had.
+#[cfg(not(unix))]
+fn existing_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Create the temp file, applying `mode` when there is one to preserve.
+/// `create_new` rather than `create`: a name collision must fail the write
+/// instead of silently truncating another writer's temp file.
+fn create_tmp(tmp: &Path, mode: Option<u32>) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if let Some(mode) = mode {
+            options.mode(mode);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    options.open(tmp)
+}
+
+/// Best-effort fsync of the directory that holds the renamed file.
+///
+/// Best effort on purpose: the bytes and the name are already in place, so a
+/// filesystem that refuses to open or sync a directory (some network mounts
+/// answer `EINVAL` to fsync on a directory fd) must not turn a completed write
+/// into a failed tool call. The failure mode this guards is narrow — a power
+/// loss in the milliseconds after a reported success — and a warning is more
+/// honest than either silence or an error.
+fn sync_parent_dir(parent: &Path) {
+    match std::fs::File::open(parent) {
+        Ok(dir) => {
+            if let Err(error) = dir.sync_all() {
+                tracing::warn!(
+                    dir = %parent.display(),
+                    %error,
+                    "the rename is not durable: cannot fsync the parent directory"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                dir = %parent.display(),
+                %error,
+                "the rename is not durable: cannot open the parent directory to fsync it"
+            );
+        }
+    }
 }
 
 /// The shared implementation, used by the handler and by
@@ -390,6 +476,39 @@ mod tests {
             )
             .await;
         assert!(!created.is_error, "{created:?}");
+    }
+
+    /// A write is not a permission decision. The bytes go to a fresh temp file
+    /// and are renamed over the target, so without carrying the mode across a
+    /// 0600 file came back 0644 — the write silently published a file its
+    /// owner had kept private (a key, a secret, a config with a token in it).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replacing_a_file_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let rig = Rig::new();
+        let path = rig.write("secret.txt", "old");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        let result = rig
+            .call(
+                &handler(&rig),
+                json!({"path": "secret.txt", "content": "new"}),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&path).expect("file"), "new");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a write must not publish a file its owner kept private (mode {mode:o})"
+        );
     }
 
     #[tokio::test]

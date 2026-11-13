@@ -134,7 +134,28 @@ pub(crate) struct InitializeResult {
 pub(crate) struct AgentCapabilities {
     #[serde(rename = "mcpCapabilities", default)]
     pub mcp_capabilities: Option<McpCapabilities>,
+    #[serde(rename = "sessionCapabilities", default)]
+    pub session_capabilities: Option<SessionCapabilities>,
 }
+
+/// Session lifecycle capabilities. Only `close` is acted on: it is what lets a
+/// long-lived agent release the session a finished turn created. The other
+/// lifecycle methods (`list`, `resume`, …) are not used by this build and stay
+/// unparsed, like every field it does not act on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct SessionCapabilities {
+    /// `Some` when the agent advertises `session/close` — the wire shape is
+    /// `"close": {}`, so *presence* is the capability. `None` means this build
+    /// must not call `session/close`: it is optional in ACP v1, and an
+    /// unadvertised optional method is not ours to guess at.
+    #[serde(default)]
+    pub close: Option<SessionCloseCapabilities>,
+}
+
+/// The empty `{}` body that advertises `session/close` support. Unknown fields
+/// are ignored (tolerant parsing: the protocol is additive).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct SessionCloseCapabilities {}
 
 /// MCP transport capabilities advertised in `agentCapabilities.mcpCapabilities`.
 ///
@@ -503,6 +524,45 @@ mod tests {
         let parsed: StopReason =
             serde_json::from_value(json!("some_future_reason")).expect("decodes");
         assert_eq!(parsed, StopReason::Unknown);
+    }
+
+    #[test]
+    fn session_close_support_is_read_from_presence_not_from_a_value() {
+        // ACP v1 gates `session/close` on `sessionCapabilities.close` being
+        // present with an empty body — so presence is the whole signal, and an
+        // agent that omits it must read as "do not call it".
+        let with_close: InitializeResult = serde_json::from_value(json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {"sessionCapabilities": {"close": {}}},
+        }))
+        .expect("parses");
+        assert!(
+            with_close
+                .agent_capabilities
+                .and_then(|caps| caps.session_capabilities)
+                .and_then(|caps| caps.close)
+                .is_some()
+        );
+
+        for capabilities in [
+            json!({}),
+            json!({"sessionCapabilities": {}}),
+            json!({"sessionCapabilities": {"close": null}}),
+        ] {
+            let parsed: InitializeResult = serde_json::from_value(json!({
+                "protocolVersion": 1,
+                "agentCapabilities": capabilities,
+            }))
+            .expect("parses");
+            assert!(
+                parsed
+                    .agent_capabilities
+                    .and_then(|caps| caps.session_capabilities)
+                    .and_then(|caps| caps.close)
+                    .is_none(),
+                "{capabilities} must not read as close support"
+            );
+        }
     }
 
     #[test]

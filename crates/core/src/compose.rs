@@ -17,7 +17,7 @@ use swarmbot_contracts::error::DomainError;
 use swarmbot_contracts::id::NodeId;
 use swarmbot_contracts::node::NodeRoot;
 use swarmbot_contracts::repo::Persistence;
-use swarmbot_store::{JsonlMirror, MemoryStore, SqliteStore};
+use swarmbot_store::{JsonlMirror, MemoryStore, ThreadedStore};
 use swarmbot_tools::{AuditLog, LocalExecutor, PathPolicy, PolicyEngine};
 
 use crate::backends::BackendSet;
@@ -33,8 +33,17 @@ pub fn durable(
     std::fs::create_dir_all(data_dir).map_err(|err| {
         DomainError::internal(format!("cannot create {}: {err}", data_dir.display()))
     })?;
+    // `ThreadedStore`, not `SqliteStore`: a port call is synchronous, so with
+    // one `Mutex<Connection>` behind `busy_timeout = 5000` a single contended
+    // write parked a tokio worker for up to five seconds and serialised every
+    // other caller behind it. The wrapper gives the writer its own OS thread
+    // and the readers their own, so a contended write no longer blocks a read
+    // or a different lane. What it does **not** do is un-park a caller that
+    // invokes the port inline on an async task — that still costs that task a
+    // blocking call, and freeing it needs `spawn_blocking` (which needs tokio
+    // inside `store`). See `store::threaded`'s module docs for the full limit.
     let store: Arc<dyn Persistence> =
-        Arc::new(SqliteStore::open(&data_dir.join("swarmbot.sqlite"))?);
+        Arc::new(ThreadedStore::open(&data_dir.join("swarmbot.sqlite"))?);
     let mirror = Arc::new(JsonlMirror::new(data_dir.join("transcripts")));
     // A brand-new data dir has no stored settings, and `settings()` answers with
     // the built-in defaults in that case — which would silently throw away the

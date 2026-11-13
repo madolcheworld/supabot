@@ -1,10 +1,16 @@
 //! The reducer: [`LiveEvent`] in, [`AppState`] out, with no I/O in between.
 //!
 //! This is where the app's correctness lives, and it is a *pure* function of
-//! the state and the event — no clock reads that matter, no sockets, no GPUI.
-//! That is what makes it testable headlessly (`#[test]`, fabricated
-//! events) and what makes a resync safe: a `Resync` or a dropped socket is just
-//! "apply the next `Snapshot`", because every collection here is upserted by id.
+//! the state, the event and the time it is given — no clock reads that matter,
+//! no sockets, no GPUI. That is what makes it testable headlessly (`#[test]`,
+//! fabricated events, an injected [`Instant`]) and what makes a resync safe: a
+//! `Resync` or a dropped socket is just "apply the next `Snapshot`", because
+//! every collection here is upserted by id.
+//!
+//! The `_at` variants ([`apply_at`], [`apply_msg_at`], [`apply_result_at`]) are
+//! the real entry points; the short names stamp the wall clock and are what the
+//! worker calls. A toast's expiry is asserted with a fabricated `Instant`, never
+//! with a sleep.
 //!
 //! Two mapping rules from [`../../../docs/ui.md`] §3 are load-bearing and are
 //! enforced here, not in the view:
@@ -28,8 +34,14 @@ use swarmbot_contracts::{
 use crate::proto::{Command, CommandResult, ConnEvent, WorkerMsg};
 use crate::state::{AppState, ConnectionState};
 
-/// Apply one frame from the live socket.
+/// Apply one frame from the live socket, stamping anything time-bounded with
+/// the wall clock. Tests call [`apply_at`] with a fabricated instant instead.
 pub fn apply(state: &mut AppState, event: LiveEvent) {
+    apply_at(state, event, Instant::now());
+}
+
+/// [`apply`] with an injected clock.
+pub fn apply_at(state: &mut AppState, event: LiveEvent, now: Instant) {
     match event {
         LiveEvent::Snapshot(snapshot) => {
             let had_cursor = state.cursor.is_some();
@@ -54,7 +66,7 @@ pub fn apply(state: &mut AppState, event: LiveEvent) {
             state.cursor = Some(snapshot.cursor);
             if had_cursor {
                 // A snapshot after we already had a cursor is a resync.
-                state.resynced_at = Some(Instant::now());
+                state.resynced_at = Some(now);
             }
             state.conn = ConnectionState::Connected;
 
@@ -148,7 +160,7 @@ pub fn apply(state: &mut AppState, event: LiveEvent) {
         LiveEvent::Resync { reason } => {
             // The socket stays open; the brain sends a fresh `Snapshot` next.
             // Say so honestly and let the snapshot replace the world.
-            state.toast = Some(format!("resyncing: {reason}"));
+            state.set_toast(format!("resyncing: {reason}"), now);
         }
         LiveEvent::Failed { code, message } => {
             state.conn = ConnectionState::Offline {
@@ -159,12 +171,17 @@ pub fn apply(state: &mut AppState, event: LiveEvent) {
 }
 
 /// Apply one message from a worker thread (connection lifecycle, a live event,
-/// or the result of a command).
+/// or the result of a command), stamping the wall clock.
 pub fn apply_msg(state: &mut AppState, msg: WorkerMsg) {
+    apply_msg_at(state, msg, Instant::now());
+}
+
+/// [`apply_msg`] with an injected clock.
+pub fn apply_msg_at(state: &mut AppState, msg: WorkerMsg, now: Instant) {
     match msg {
         WorkerMsg::Conn(event) => apply_conn(state, event),
-        WorkerMsg::Live(event) => apply(state, event),
-        WorkerMsg::Result(result) => apply_result(state, result),
+        WorkerMsg::Live(event) => apply_at(state, event, now),
+        WorkerMsg::Result(result) => apply_result_at(state, result, now),
     }
 }
 
@@ -194,119 +211,132 @@ pub fn apply_conn(state: &mut AppState, event: ConnEvent) {
 /// Fold a command's typed result into the state. Errors become a toast (and,
 /// for a 401, the login prompt) — never a panic.
 pub fn apply_result(state: &mut AppState, result: CommandResult) {
+    apply_result_at(state, result, Instant::now());
+}
+
+/// [`apply_result`] with an injected clock: every toast this raises is stamped
+/// with `now`, which is what makes its expiry assertable without a sleep.
+pub fn apply_result_at(state: &mut AppState, result: CommandResult, now: Instant) {
     match result {
         CommandResult::Login(Ok(())) => {
             state.needs_login = false;
             state.login_error = None;
-            state.toast = Some("logged in".to_string());
+            state.set_toast("logged in", now);
         }
-        CommandResult::Login(Err(err)) => fail(state, "login failed", &err),
+        CommandResult::Login(Err(err)) => fail(state, "login failed", &err, now),
         CommandResult::Health(Ok(health)) => state.health = Some(health),
-        CommandResult::Health(Err(err)) => fail(state, "health check failed", &err),
+        CommandResult::Health(Err(err)) => fail(state, "health check failed", &err, now),
         CommandResult::Send(Ok(sent)) => {
             // The committed owner entry, applied now for snappiness; the live
             // socket will confirm it (an upsert of the same id is a no-op).
             let conv = sent.entry.conversation_id.clone();
             state.upsert_entry(sent.entry.clone());
             state.unread.insert(conv, 0);
-            state.toast = Some(if sent.queued.is_empty() {
-                if sent.reason.is_empty() {
-                    "sent".to_string()
+            state.set_toast(
+                if sent.queued.is_empty() {
+                    if sent.reason.is_empty() {
+                        "sent".to_string()
+                    } else {
+                        format!("sent · {}", sent.reason)
+                    }
                 } else {
-                    format!("sent · {}", sent.reason)
-                }
-            } else {
-                format!("queued ({} bot(s) busy)", sent.queued.len())
-            });
+                    format!("queued ({} bot(s) busy)", sent.queued.len())
+                },
+                now,
+            );
         }
-        CommandResult::Send(Err(err)) => fail(state, "send failed", &err),
-        CommandResult::Interrupt(Ok(true)) => state.toast = Some("stopped".to_string()),
-        CommandResult::Interrupt(Ok(false)) => {
-            state.toast = Some("nothing was running".to_string())
-        }
-        CommandResult::Interrupt(Err(err)) => fail(state, "stop failed", &err),
+        CommandResult::Send(Err(err)) => fail(state, "send failed", &err, now),
+        CommandResult::Interrupt(Ok(true)) => state.set_toast("stopped", now),
+        CommandResult::Interrupt(Ok(false)) => state.set_toast("nothing was running", now),
+        CommandResult::Interrupt(Err(err)) => fail(state, "stop failed", &err, now),
         CommandResult::Respond(Ok(request)) => {
             state.upsert_request(request);
-            state.toast = Some("answered".to_string());
+            state.set_toast("answered", now);
         }
-        CommandResult::Respond(Err(err)) => fail(state, "answer failed", &err),
+        CommandResult::Respond(Err(err)) => fail(state, "answer failed", &err, now),
         CommandResult::CancelTask(Ok(task)) => state.upsert_task(task),
-        CommandResult::CancelTask(Err(err)) => fail(state, "cancel failed", &err),
+        CommandResult::CancelTask(Err(err)) => fail(state, "cancel failed", &err, now),
         CommandResult::TaskDetail(Ok(detail)) => {
             let id = detail.task.id.clone();
             state.upsert_task(detail.task);
             state.steps.insert(id, detail.steps);
         }
-        CommandResult::TaskDetail(Err(err)) => fail(state, "could not load the task", &err),
+        CommandResult::TaskDetail(Err(err)) => fail(state, "could not load the task", &err, now),
         CommandResult::CreateGroup(Ok(conversation)) => {
             let id = conversation.id.clone();
             state.upsert_conversation(conversation);
             state.open(id);
-            state.toast = Some("group created".to_string());
+            state.set_toast("group created", now);
         }
-        CommandResult::CreateGroup(Err(err)) => fail(state, "could not create the group", &err),
+        CommandResult::CreateGroup(Err(err)) => {
+            fail(state, "could not create the group", &err, now)
+        }
         CommandResult::GroupUpdated(Ok(conversation)) => {
             state.upsert_conversation(conversation);
             state.edit_group_id = None;
             state.edit_group_title_seed = None;
             state.edit_group_members.clear();
             state.edit_group_lead = None;
-            state.toast = Some("group updated".to_string());
+            state.set_toast("group updated", now);
         }
-        CommandResult::GroupUpdated(Err(err)) => fail(state, "could not update the group", &err),
+        CommandResult::GroupUpdated(Err(err)) => {
+            fail(state, "could not update the group", &err, now)
+        }
         CommandResult::CreateBot(Ok(bot)) => {
             let dm = bot.direct_conversation_id.clone();
             state.upsert_bot(bot);
             state.open(dm);
-            state.toast = Some("bot created".to_string());
+            state.set_toast("bot created", now);
         }
-        CommandResult::CreateBot(Err(err)) => fail(state, "could not create the bot", &err),
+        CommandResult::CreateBot(Err(err)) => fail(state, "could not create the bot", &err, now),
         CommandResult::DeleteBot {
             bot,
             result: Ok(()),
         } => {
             state.remove_bot(&bot);
-            state.toast = Some("bot deleted".to_string());
+            state.set_toast("bot deleted", now);
         }
         CommandResult::DeleteBot {
             result: Err(err), ..
-        } => fail(state, "could not delete the bot", &err),
+        } => fail(state, "could not delete the bot", &err, now),
         CommandResult::DeleteGroup {
             conversation,
             result: Ok(()),
         } => {
             state.remove_conversation(&conversation);
-            state.toast = Some("group deleted".to_string());
+            state.set_toast("group deleted", now);
         }
         CommandResult::DeleteGroup {
             result: Err(err), ..
-        } => fail(state, "could not delete the group", &err),
+        } => fail(state, "could not delete the group", &err, now),
         CommandResult::BotSession(Ok(folded)) => {
-            state.toast = Some(format!("folded {folded} message(s)"))
+            state.set_toast(format!("folded {folded} message(s)"), now)
         }
-        CommandResult::BotSession(Err(err)) => fail(state, "session action failed", &err),
+        CommandResult::BotSession(Err(err)) => fail(state, "session action failed", &err, now),
         CommandResult::Pairing(Ok(pairing)) => state.pairing = Some(pairing),
-        CommandResult::Pairing(Err(err)) => fail(state, "could not mint a pairing code", &err),
-        CommandResult::RevokeNode(Ok(())) => state.toast = Some("node revoked".to_string()),
-        CommandResult::RevokeNode(Err(err)) => fail(state, "revoke failed", &err),
+        CommandResult::Pairing(Err(err)) => fail(state, "could not mint a pairing code", &err, now),
+        CommandResult::RevokeNode(Ok(())) => state.set_toast("node revoked", now),
+        CommandResult::RevokeNode(Err(err)) => fail(state, "revoke failed", &err, now),
         CommandResult::Settings(Ok(settings)) => {
             state.settings_draft = Some(settings.clone());
             state.settings = Some(settings);
         }
-        CommandResult::Settings(Err(err)) => fail(state, "could not load settings", &err),
+        CommandResult::Settings(Err(err)) => fail(state, "could not load settings", &err, now),
         CommandResult::UpdateSettings(Ok(settings)) => {
             state.settings_draft = Some(settings.clone());
             state.settings = Some(settings);
-            state.toast = Some("settings saved".to_string());
+            state.set_toast("settings saved", now);
         }
-        CommandResult::UpdateSettings(Err(err)) => fail(state, "could not save settings", &err),
+        CommandResult::UpdateSettings(Err(err)) => {
+            fail(state, "could not save settings", &err, now)
+        }
         CommandResult::Backends(Ok(backends)) => state.backends = backends,
-        CommandResult::Backends(Err(err)) => fail(state, "could not load backends", &err),
+        CommandResult::Backends(Err(err)) => fail(state, "could not load backends", &err, now),
         CommandResult::Probes(Ok(probes)) => state.probes = Some(probes),
         // The fresh bot state arrives as a live BotUpsert; a refusal is the
         // only thing this arm has to say.
         CommandResult::BotUpdated(Ok(())) => {}
-        CommandResult::BotUpdated(Err(err)) => fail(state, "could not update the bot", &err),
+        CommandResult::BotUpdated(Err(err)) => fail(state, "could not update the bot", &err, now),
         CommandResult::Models(backend, Ok(models)) => {
             state.models.insert(backend, Ok(models));
         }
@@ -316,43 +346,51 @@ pub fn apply_result(state: &mut AppState, result: CommandResult) {
             // and the menu renders them differently (with a Retry).
             state.models.insert(backend, Err(err.to_string()));
         }
-        CommandResult::Probes(Err(err)) => fail(state, "probe failed", &err),
+        CommandResult::Probes(Err(err)) => fail(state, "probe failed", &err, now),
         CommandResult::Nodes(Ok(nodes)) => state.nodes = nodes,
-        CommandResult::Nodes(Err(err)) => fail(state, "could not load nodes", &err),
+        CommandResult::Nodes(Err(err)) => fail(state, "could not load nodes", &err, now),
         CommandResult::Routines(Ok(routines)) => state.routines = routines,
-        CommandResult::Routines(Err(err)) => fail(state, "could not load routines", &err),
+        CommandResult::Routines(Err(err)) => fail(state, "could not load routines", &err, now),
         CommandResult::RoutineCreated(Ok(routine)) => {
             state.upsert_routine(routine);
             state.routine_creator_open = false;
-            state.toast = Some("routine created".to_string());
+            state.set_toast("routine created", now);
         }
-        CommandResult::RoutineCreated(Err(err)) => fail(state, "could not create routine", &err),
+        CommandResult::RoutineCreated(Err(err)) => {
+            fail(state, "could not create routine", &err, now)
+        }
         CommandResult::RoutineUpdated(Ok(routine)) => {
             state.upsert_routine(routine);
-            state.toast = Some("routine updated".to_string());
+            state.set_toast("routine updated", now);
         }
-        CommandResult::RoutineUpdated(Err(err)) => fail(state, "could not update routine", &err),
+        CommandResult::RoutineUpdated(Err(err)) => {
+            fail(state, "could not update routine", &err, now)
+        }
         CommandResult::RoutineDeleted(id, Ok(())) => {
             state.remove_routine(&id);
-            state.toast = Some("routine deleted".to_string());
+            state.set_toast("routine deleted", now);
         }
-        CommandResult::RoutineDeleted(_, Err(err)) => fail(state, "could not delete routine", &err),
+        CommandResult::RoutineDeleted(_, Err(err)) => {
+            fail(state, "could not delete routine", &err, now)
+        }
         CommandResult::RoutineRuns(id, Ok(runs)) => {
             state.routine_runs.insert(id, runs);
         }
-        CommandResult::RoutineRuns(_, Err(err)) => fail(state, "could not load routine runs", &err),
+        CommandResult::RoutineRuns(_, Err(err)) => {
+            fail(state, "could not load routine runs", &err, now)
+        }
         CommandResult::Shutdown(Ok(())) => {}
-        CommandResult::Shutdown(Err(err)) => fail(state, "shutdown failed", &err),
+        CommandResult::Shutdown(Err(err)) => fail(state, "shutdown failed", &err, now),
     }
 }
 
 /// Record a command failure as a toast; a 401 also raises the login prompt.
-fn fail(state: &mut AppState, what: &str, err: &ClientError) {
+fn fail(state: &mut AppState, what: &str, err: &ClientError, now: Instant) {
     if matches!(err, ClientError::Unauthorized) {
         state.needs_login = true;
         state.login_error = Some(err.to_string());
     }
-    state.toast = Some(format!("{what}: {err}"));
+    state.set_toast(format!("{what}: {err}"), now);
 }
 
 /// Build the [`Command`] a card button produces. Split out so a test can assert
@@ -908,5 +946,96 @@ mod tests {
                 lead: b2,
             }
         );
+    }
+
+    /// The P0 case: a failed send must leave a message the owner can see, and
+    /// that message must not stay on screen forever.
+    #[test]
+    fn a_failed_command_records_a_stamped_toast_that_expires_after_the_window() {
+        use crate::state::TOAST_TTL;
+        use std::time::Duration;
+
+        let mut state = AppState::new("http://brain.test");
+        let set_at = Instant::now();
+        apply_result_at(
+            &mut state,
+            CommandResult::Send(Err(ClientError::Transport {
+                url: "http://brain.test".into(),
+                reason: "connection refused".into(),
+            })),
+            set_at,
+        );
+        let text = state.toast.clone().expect("the failure is visible");
+        assert!(
+            text.starts_with("send failed:") && text.contains("connection refused"),
+            "the toast says what failed and why: {text}"
+        );
+        assert_eq!(
+            state.toast_at,
+            Some(set_at),
+            "the reducer records when it was set, not merely that it was set"
+        );
+
+        // Inside the window it survives the tick.
+        assert!(!state.expire_toast(set_at + TOAST_TTL - Duration::from_millis(1)));
+        assert_eq!(state.toast.as_deref(), Some(text.as_str()));
+
+        // At the window's end the tick clears it.
+        assert!(state.expire_toast(set_at + TOAST_TTL));
+        assert_eq!(state.toast, None);
+        assert_eq!(state.toast_at, None);
+    }
+
+    /// A toast raised on the live path (`Resync`) is stamped by the same clock,
+    /// so no producer can bypass the expiry.
+    #[test]
+    fn a_resync_notice_is_stamped_and_expires_like_any_other_toast() {
+        use crate::state::TOAST_TTL;
+        use std::time::Duration;
+
+        let mut state = AppState::new("http://brain.test");
+        let set_at = Instant::now();
+        apply_at(
+            &mut state,
+            LiveEvent::Resync {
+                reason: "cursor too old".into(),
+            },
+            set_at,
+        );
+        assert_eq!(
+            state.toast.as_deref(),
+            Some("resyncing: cursor too old"),
+            "the notice names why"
+        );
+        assert_eq!(state.toast_at, Some(set_at));
+        assert!(!state.expire_toast(set_at + Duration::from_secs(1)));
+        assert!(state.expire_toast(set_at + TOAST_TTL));
+        assert_eq!(state.toast, None);
+    }
+
+    #[test]
+    fn a_second_toast_replaces_the_first_and_restarts_its_window() {
+        use crate::state::TOAST_TTL;
+        use std::time::Duration;
+
+        let mut state = AppState::new("http://brain.test");
+        let first = Instant::now();
+        apply_result_at(&mut state, CommandResult::Interrupt(Ok(true)), first);
+        assert_eq!(state.toast.as_deref(), Some("stopped"));
+
+        let second = first + Duration::from_secs(3);
+        apply_result_at(&mut state, CommandResult::Interrupt(Ok(false)), second);
+        assert_eq!(state.toast.as_deref(), Some("nothing was running"));
+        assert_eq!(
+            state.toast_at,
+            Some(second),
+            "the second toast restarts the window instead of inheriting the first's clock"
+        );
+
+        // The first toast's deadline has passed and the second is still up.
+        assert!(!state.expire_toast(first + TOAST_TTL));
+        assert_eq!(state.toast.as_deref(), Some("nothing was running"));
+        assert!(state.expire_toast(second + TOAST_TTL));
+        assert_eq!(state.toast, None);
     }
 }

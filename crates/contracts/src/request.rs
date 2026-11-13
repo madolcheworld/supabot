@@ -340,12 +340,26 @@ impl ApprovalRule {
         }
         if let Some(prefix) = &self.command_prefix {
             let target = request.target.as_deref().unwrap_or_default();
-            if !target.starts_with(prefix.as_str()) {
+            if !target_matches_prefix(target, prefix) {
                 return false;
             }
         }
         true
     }
+}
+
+/// True when `target` starts with `prefix` **on a word boundary**.
+///
+/// A bare `starts_with` was a security hole, not a convenience: `command_prefix`
+/// holds the first word of a command, so `ls` matched `lsof`, and one
+/// "always allow `rm build/x`" — which stores the prefix `rm` — authorised
+/// `rm -rf /`. The boundary is what keeps a saved prefix as narrow as the
+/// answer that created it.
+fn target_matches_prefix(target: &str, prefix: &str) -> bool {
+    let Some(rest) = target.strip_prefix(prefix) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(char::is_whitespace)
 }
 
 #[cfg(test)]
@@ -421,6 +435,64 @@ mod tests {
 
         rule.scope = RuleScope::Bot(req.bot_id.clone());
         assert!(rule.matches(&req));
+    }
+
+    #[test]
+    fn a_command_prefix_matches_on_a_word_boundary_only() {
+        // The bug this pins: `command_prefix` stores the first word of a
+        // command, so a bare `starts_with` let one "always allow `rm build/x`"
+        // (prefix `rm`) authorise `rm -rf /`, and `ls` matched `lsof`.
+        let mut rule = ApprovalRule::new(RuleScope::Global, RuleEffect::Allow);
+        rule.surface = Some(Surface::Shell);
+        rule.command_prefix = Some("ls".into());
+
+        let ls = RuntimeRequest::approval(
+            BotId::new(),
+            ConversationId::new(),
+            Surface::Shell,
+            "shell",
+            "ls -la",
+            None,
+        );
+        assert!(rule.matches(&ls), "an exact first word still matches");
+
+        let lsof = RuntimeRequest::approval(
+            BotId::new(),
+            ConversationId::new(),
+            Surface::Shell,
+            "shell",
+            "lsof -i :8787",
+            None,
+        );
+        assert!(
+            !rule.matches(&lsof),
+            "`ls` must not match `lsof`: no word boundary, no match"
+        );
+
+        rule.command_prefix = Some("rm".into());
+        let rm_rf = RuntimeRequest::approval(
+            BotId::new(),
+            ConversationId::new(),
+            Surface::Shell,
+            "shell",
+            "rm -rf /",
+            None,
+        );
+        // The prefix still matches the *text*; refusing this is the
+        // approval service's job (`evaluate` downgrades a destructive Allow to
+        // Ask). What must hold here is the narrower contract: the boundary.
+        assert!(rule.matches(&rm_rf));
+        assert!(
+            !rule.matches(&RuntimeRequest::approval(
+                BotId::new(),
+                ConversationId::new(),
+                Surface::Shell,
+                "shell",
+                "rmdir /tmp/x",
+                None,
+            )),
+            "`rm` must not match `rmdir`"
+        );
     }
 
     #[test]

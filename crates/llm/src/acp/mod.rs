@@ -23,7 +23,8 @@
 //! 1. reuses the agent *process* (spawned lazily, kept alive, respawned if it
 //!    died) but creates a **fresh ACP session** — the history we render *is*
 //!    the agent's context, exactly like the stateless HTTP backend, and a
-//!    per-bot native session would double it;
+//!    per-bot native session would double it. The turn releases that session
+//!    when it ends (see "Sessions and processes" below);
 //! 2. renders instructions + transcript into text content blocks
 //!    ([`prompt_blocks`]);
 //! 3. streams `session/update` notifications into [`LlmEvent`]s:
@@ -32,6 +33,40 @@
 //!    transcribed in this milestone — stated in the README, not hidden);
 //! 4. maps `stopReason` onto [`FinishReason`] and returns the accumulated text
 //!    as the authoritative response.
+//!
+//! # One process, many turns: a timeout fails one turn, never the backend
+//!
+//! Every bot that names this backend shares one agent process per (pinned
+//! model, bot workspace). That sharing is the reason for the invariant this
+//! module holds everywhere: **a per-request timeout fails the turn that asked,
+//! never the shared process.**
+//!
+//! Abandoning a request is safe by protocol, not by hope: JSON-RPC responses
+//! are correlated by id and never ordered, so an unanswered `session/new`
+//! desyncs nothing — the reader drops a late answer with a debug log
+//! (`client.rs`). A setup call that runs out its budget is therefore dropped
+//! and the connection keeps serving everybody else. One honest limit follows:
+//! an abandoned `session/new` may leave a session inside the agent whose id we
+//! never learned; it is released when the process exits (completed turns
+//! release theirs with `session/close` — see below).
+//!
+//! A *run* of unanswered setup calls means the process is wedged, not the
+//! turn: after [`MAX_CONSECUTIVE_SETUP_TIMEOUTS`] of them the next turn
+//! replaces the connection lazily — the old process is shut down only once the
+//! turns still holding it finish, so replacing it never kills somebody else's
+//! turn. Connection *establishment* is serialised per connection key only and
+//! is cancel-aware, so a bot's cold start never makes another bot's stopped
+//! turn wait for it.
+//!
+//! # Sessions and processes: the stated limits
+//!
+//! A completed turn sends `session/close` — but only to an agent that
+//! advertises `agentCapabilities.sessionCapabilities.close`. The method is
+//! optional in ACP v1, and an unadvertised optional method is not ours to call:
+//! for such an agent the per-turn session lives inside the process until the
+//! process exits. There is **no idle reaper** in this build — a connection
+//! lives until the backend is dropped, the agent dies, or a run of setup
+//! timeouts replaces it. An agent that is merely idle keeps its process.
 //!
 //! # Tools, permissions, safety
 //!
@@ -120,6 +155,19 @@ fn setup_timeout(spec: &BackendSpec) -> Duration {
 /// cannot hold the stop.
 const CANCEL_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a finished turn waits for `session/close`. Bounded because the
+/// close is a courtesy the next turn must not pay for: an agent that does not
+/// answer it keeps the session until it exits, and the turn's result is already
+/// decided when we send it.
+const CLOSE_GRACE: Duration = Duration::from_secs(2);
+
+/// A connection whose setup calls went unanswered this many times *in a row*
+/// is replaced on the next turn. One unanswered call is a slow turn (the
+/// timeout fails only that turn); a run of them is a wedged process, and
+/// replacing it lazily — once, for future turns — is the only reaping this
+/// build does.
+const MAX_CONSECUTIVE_SETUP_TIMEOUTS: u32 = 3;
+
 /// The probe's own setup budget. `probe_all` runs every backend in parallel
 /// behind one HTTP call whose client gives it two minutes; a single agent that
 /// hangs in `session/new` (opencode's watcher scan, observed on this very
@@ -141,6 +189,17 @@ const MAX_LISTED_MODELS: usize = 500;
 /// The setup budget a probe may spend: the spec's, capped by [`PROBE_BUDGET`].
 pub(crate) fn probe_budget(spec: &BackendSpec) -> Duration {
     setup_timeout(spec).min(PROBE_BUDGET)
+}
+
+/// What one bounded setup call produced, before it is mapped to an
+/// [`LlmError`]. Kept separate from `LlmError` because the callers disagree on
+/// what each outcome means: a failed `session/new` is fatal, a missing optional
+/// `session/set_model` is a warning, and a timeout is fatal *for the turn* but
+/// must not touch the shared connection.
+enum SetupReply {
+    Answered(Result<Value, AcpRequestError>),
+    TimedOut,
+    Cancelled,
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +361,12 @@ pub struct AcpAgent {
     /// (empty key = the agent's own default). One process per model, because
     /// an env-pinned model cannot change inside a running child.
     conn: tokio::sync::Mutex<HashMap<String, Arc<Connection>>>,
+    /// One establishment gate per connection key. Held across a spawn and
+    /// handshake so two turns for the same key cannot start two agents — but
+    /// **only** per key, and only by the turn doing the connecting: the map
+    /// lock above is never held across a handshake, so a bot's cold `npx` boot
+    /// cannot make another bot's turn wait.
+    connect_gates: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl fmt::Debug for AcpAgent {
@@ -494,6 +559,7 @@ impl AcpAgent {
             mode: Some(mode),
             transport,
             conn: tokio::sync::Mutex::new(HashMap::new()),
+            connect_gates: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -586,10 +652,18 @@ impl AcpAgent {
         self.launch_with(self.substituted_model_env(None), self.cwd.clone())
     }
 
-    /// The live connection for one env-pin key, spawning (and handshaking)
-    /// on first use or after the agent died. The slot mutex is held across
-    /// the connect, so concurrent turns queue instead of spawning duplicate
-    /// agents; the owner's stop still wins through `cancel`.
+    /// The live connection for one env-pin key, spawning (and handshaking) on
+    /// first use or after the agent died or was replaced as wedged.
+    ///
+    /// Three rules, each of them a bug that used to exist:
+    ///
+    /// 1. the slot map's lock is held only to read or replace an entry, never
+    ///    across a spawn or handshake;
+    /// 2. establishment is serialised **per key** — two turns for the same
+    ///    workspace still share one agent, but a different key never waits;
+    /// 3. waiting for that gate and for the connect itself both select on
+    ///    `cancel`, so a stopped turn leaves the queue immediately instead of
+    ///    waiting out somebody else's `setup_timeout × (max_retries + 1)`.
     async fn connection_for(
         &self,
         key: &str,
@@ -597,9 +671,20 @@ impl AcpAgent {
         extra_env: BTreeMap<String, String>,
         cancel: &CancellationToken,
     ) -> Result<Arc<Connection>, LlmError> {
-        let mut slots = self.conn.lock().await;
-        if let Some(conn) = slots.get(key).filter(|conn| conn.alive()) {
-            return Ok(Arc::clone(conn));
+        // The common case: an established, healthy connection. It must not
+        // queue behind anybody's cold start.
+        if let Some(conn) = self.live_connection(key).await {
+            return Ok(conn);
+        }
+        let gate = self.connect_gate(key).await;
+        let _connecting = tokio::select! {
+            guard = gate.lock_owned() => guard,
+            _ = cancel.cancelled() => return Err(LlmError::Cancelled),
+        };
+        // Somebody may have finished connecting while this turn waited for the
+        // gate; adopting their connection is the whole point of the gate.
+        if let Some(conn) = self.live_connection(key).await {
+            return Ok(conn);
         }
         let launch = self.launch_with(extra_env, cwd);
         let timeout = setup_timeout(&self.spec);
@@ -618,7 +703,10 @@ impl AcpAgent {
             };
             match result {
                 Ok(conn) => {
-                    slots.insert(key.to_string(), Arc::clone(&conn));
+                    self.conn
+                        .lock()
+                        .await
+                        .insert(key.to_string(), Arc::clone(&conn));
                     return Ok(conn);
                 }
                 Err(error) => {
@@ -645,6 +733,46 @@ impl AcpAgent {
                 }
             }
         }
+    }
+
+    /// The stored connection for `key`, when it is still usable. A dead one, or
+    /// one that has run out its setup-timeout budget, is removed here: that is
+    /// the lazy reap — the process itself is only shut down when the last turn
+    /// still holding it finishes (`Connection::drop`), so replacing a wedged
+    /// agent cannot kill a turn that is still running.
+    async fn live_connection(&self, key: &str) -> Option<Arc<Connection>> {
+        let mut slots = self.conn.lock().await;
+        match slots.get(key) {
+            Some(conn)
+                if conn.alive() && conn.setup_timeouts() < MAX_CONSECUTIVE_SETUP_TIMEOUTS =>
+            {
+                Some(Arc::clone(conn))
+            }
+            Some(conn) => {
+                if conn.alive() {
+                    tracing::warn!(
+                        backend = %self.spec.id,
+                        setup_timeouts = conn.setup_timeouts(),
+                        "ACP agent has not answered setup calls; replacing it for the next turn"
+                    );
+                }
+                slots.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// The per-key establishment gate, created on first use. The outer lock is
+    /// taken only to fetch or insert the gate and is never held across the
+    /// handshake.
+    async fn connect_gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.connect_gates.lock().await;
+        Arc::clone(
+            gates
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 
     /// Fold one `session/update` notification into the running turn: stream
@@ -700,9 +828,42 @@ impl AcpAgent {
         Ok(())
     }
 
-    /// One setup-style RPC: bounded by `timeout` and the owner's stop, and a
-    /// timeout kills the connection (an agent stuck in `session/new` is not
-    /// worth keeping).
+    /// One setup-style RPC under a budget, before it is mapped to an
+    /// [`LlmError`]: callers differ on what a timeout or a refusal means for
+    /// them (`session/new` is fatal, a missing `session/set_model` is not).
+    ///
+    /// A timeout here **abandons the request and leaves the connection
+    /// alone** — see the module docs' invariant. Nothing on this wire depends
+    /// on request order, so a late answer for an abandoned id is dropped by the
+    /// reader; the next turn (or this one, after a refusal) can use the same
+    /// process.
+    async fn setup_reply(
+        &self,
+        conn: &Connection,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> SetupReply {
+        let result = tokio::select! {
+            result = conn.rpc(method, params) => result,
+            _ = cancel.cancelled() => return SetupReply::Cancelled,
+            _ = tokio::time::sleep(timeout) => {
+                conn.note_setup_timeout();
+                return SetupReply::TimedOut;
+            }
+        };
+        if result.is_ok() {
+            // The process answered: any run of timeouts is over, so it is not
+            // replaced as wedged on a later turn.
+            conn.note_setup_ok();
+        }
+        SetupReply::Answered(result)
+    }
+
+    /// One setup-style RPC whose failure is the turn's: bounded by `timeout` and
+    /// the owner's stop. A timeout fails this turn only — it must not touch the
+    /// shared connection.
     async fn setup_rpc(
         &self,
         conn: &Connection,
@@ -711,29 +872,73 @@ impl AcpAgent {
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<Value, LlmError> {
-        let result = tokio::select! {
-            result = conn.rpc(method, params) => result,
-            _ = cancel.cancelled() => return Err(LlmError::Cancelled),
-            _ = tokio::time::sleep(timeout) => {
-                conn.shutdown();
-                return Err(LlmError::Timeout { secs: timeout.as_secs() });
+        match self
+            .setup_reply(conn, method, params, timeout, cancel)
+            .await
+        {
+            SetupReply::Cancelled => Err(LlmError::Cancelled),
+            SetupReply::TimedOut => Err(LlmError::Timeout {
+                secs: timeout.as_secs(),
+            }),
+            SetupReply::Answered(Ok(value)) => Ok(value),
+            SetupReply::Answered(Err(error)) => {
+                let mut mapped = conn.map_error(method, error.clone());
+                // A refused session/new is where a missing login surfaces; the
+                // agent's own error text plus its advertised auth methods is the
+                // most honest message we can build.
+                if method == "session/new"
+                    && matches!(error, AcpRequestError::Rpc(_))
+                    && let LlmError::Unavailable { reason, .. } = &mut mapped
+                    && let Some(hint) = conn.auth_hint()
+                {
+                    reason.push_str(" — ");
+                    reason.push_str(&hint);
+                }
+                Err(mapped)
             }
-        };
-        result.map_err(|error| {
-            let mut mapped = conn.map_error(method, error.clone());
-            // A refused session/new is where a missing login surfaces; the
-            // agent's own error text plus its advertised auth methods is the
-            // most honest message we can build.
-            if method == "session/new"
-                && matches!(error, AcpRequestError::Rpc(_))
-                && let LlmError::Unavailable { reason, .. } = &mut mapped
-                && let Some(hint) = conn.auth_hint()
-            {
-                reason.push_str(" — ");
-                reason.push_str(&hint);
-            }
-            mapped
-        })
+        }
+    }
+
+    /// Release one turn's ACP session inside the long-lived agent process.
+    ///
+    /// The protocol's release is `session/close`, and it is **optional**: this
+    /// build sends it only to an agent that advertised
+    /// `agentCapabilities.sessionCapabilities.close`. For an agent that did
+    /// not, the session stays in the process until the process exits — the
+    /// stated limit in the module docs, not a silent omission.
+    ///
+    /// Never fails the turn: the turn's result is already decided, so a close
+    /// that errors or hangs is logged and the next turn reuses the process
+    /// either way.
+    async fn close_session(&self, conn: &Connection, session_id: &str) {
+        if !conn.supports_session_close() {
+            tracing::debug!(
+                backend = %self.spec.id,
+                session = %session_id,
+                "the agent does not advertise session/close; the session stays in the process until it exits"
+            );
+            return;
+        }
+        if !conn.alive() {
+            // Nothing to close: the process is gone, which releases everything.
+            return;
+        }
+        let close = conn.rpc("session/close", json!({"sessionId": session_id}));
+        match tokio::time::timeout(CLOSE_GRACE, close).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(
+                backend = %self.spec.id,
+                session = %session_id,
+                error = %conn.map_error("session/close", error),
+                "session/close failed; the agent keeps this session until it exits"
+            ),
+            Err(_) => tracing::warn!(
+                backend = %self.spec.id,
+                session = %session_id,
+                secs = CLOSE_GRACE.as_secs(),
+                "session/close went unanswered; the agent keeps this session until it exits"
+            ),
+        }
     }
 }
 
@@ -822,6 +1027,10 @@ impl LlmBackend for AcpAgent {
             })?;
         let session_id = session.session_id;
 
+        // From here on the session exists inside the agent, so every exit path
+        // — a refusal, a timeout, a stop, a full answer — must release it. The
+        // block makes that structural: no `?` below can skip the close.
+        let outcome: Result<ChatResponse, LlmError> = async {
         // 2. Model selection, honest channels in order of strength:
         //    (a) `model_env` pinned the model into this connection's child at
         //    spawn — nothing left to negotiate; (b) the agent advertises the
@@ -840,21 +1049,20 @@ impl LlmBackend for AcpAgent {
                         .iter()
                         .any(|model| model.model_id == desired)
                     {
-                        let set_model = conn.rpc(
-                            "session/set_model",
-                            json!({"sessionId": session_id, "modelId": desired}),
-                        );
-                        let result = tokio::select! {
-                            result = set_model => result,
-                            _ = cancel.cancelled() => return Err(LlmError::Cancelled),
-                            _ = tokio::time::sleep(setup) => {
-                                conn.shutdown();
-                                return Err(LlmError::Timeout { secs: setup.as_secs() });
-                            }
-                        };
+                        let result = self
+                            .setup_reply(
+                                &conn,
+                                "session/set_model",
+                                json!({"sessionId": session_id, "modelId": desired}),
+                                setup,
+                                &cancel,
+                            )
+                            .await;
                         match result {
-                            Ok(_) => {}
-                            Err(AcpRequestError::Rpc(rpc)) if rpc.is_method_not_found() => {
+                            SetupReply::Answered(Ok(_)) => {}
+                            SetupReply::Answered(Err(AcpRequestError::Rpc(rpc)))
+                                if rpc.is_method_not_found() =>
+                            {
                                 tracing::warn!(
                                     backend = %self.spec.id,
                                     model = %desired,
@@ -862,9 +1070,17 @@ impl LlmBackend for AcpAgent {
                                     models.current
                                 );
                             }
-                            Err(error) => {
+                            SetupReply::Answered(Err(error)) => {
                                 return Err(conn.map_error("session/set_model", error));
                             }
+                            // A timeout fails this turn only: the connection is
+                            // shared, and abandoning the request desyncs nothing.
+                            SetupReply::TimedOut => {
+                                return Err(LlmError::Timeout {
+                                    secs: setup.as_secs(),
+                                });
+                            }
+                            SetupReply::Cancelled => return Err(LlmError::Cancelled),
                         }
                     } else {
                         let available: Vec<&str> = models
@@ -897,25 +1113,24 @@ impl LlmBackend for AcpAgent {
                             .iter()
                             .any(|choice| choice.value == desired);
                     if matches_available {
-                        let set_config = conn.rpc(
-                            "session/set_config_option",
-                            json!({
-                                "sessionId": session_id,
-                                "configId": "model",
-                                "value": desired,
-                            }),
-                        );
-                        let result = tokio::select! {
-                            result = set_config => result,
-                            _ = cancel.cancelled() => return Err(LlmError::Cancelled),
-                            _ = tokio::time::sleep(setup) => {
-                                conn.shutdown();
-                                return Err(LlmError::Timeout { secs: setup.as_secs() });
-                            }
-                        };
+                        let result = self
+                            .setup_reply(
+                                &conn,
+                                "session/set_config_option",
+                                json!({
+                                    "sessionId": session_id,
+                                    "configId": "model",
+                                    "value": desired,
+                                }),
+                                setup,
+                                &cancel,
+                            )
+                            .await;
                         match result {
-                            Ok(_) => {}
-                            Err(AcpRequestError::Rpc(rpc)) if rpc.is_method_not_found() => {
+                            SetupReply::Answered(Ok(_)) => {}
+                            SetupReply::Answered(Err(AcpRequestError::Rpc(rpc)))
+                                if rpc.is_method_not_found() =>
+                            {
                                 tracing::warn!(
                                     backend = %self.spec.id,
                                     model = %desired,
@@ -923,9 +1138,17 @@ impl LlmBackend for AcpAgent {
                                     current.unwrap_or("(default)")
                                 );
                             }
-                            Err(error) => {
+                            SetupReply::Answered(Err(error)) => {
                                 return Err(conn.map_error("session/set_config_option", error));
                             }
+                            // Same rule as session/set_model: one turn's timeout,
+                            // never the shared process.
+                            SetupReply::TimedOut => {
+                                return Err(LlmError::Timeout {
+                                    secs: setup.as_secs(),
+                                });
+                            }
+                            SetupReply::Cancelled => return Err(LlmError::Cancelled),
                         }
                     } else {
                         let available: Vec<&str> = model_opt
@@ -1094,6 +1317,14 @@ impl LlmBackend for AcpAgent {
         )
         .await?;
         Ok(response)
+        }
+        .await;
+
+        // Release the session inside the agent before this turn's future
+        // returns — including after a refusal, a timeout or a stop. The process
+        // outlives the turn, so a session nobody closes is a leak inside it.
+        self.close_session(&conn, &session_id).await;
+        outcome
     }
 
     async fn probe(&self) -> Result<BackendStatus, LlmError> {
@@ -1269,53 +1500,62 @@ impl LlmBackend for AcpAgent {
         // ACP server stays silent about models, but `opencode models` is
         // not); without it, an empty list is the honest answer and the menu
         // says how to get one.
-        match session.models {
-            // Advertised by the agent itself: a pick reaches it via
-            // session/set_model, so the list is authoritative.
-            Some(state) => Ok(ModelList::authoritative(
-                state
-                    .available
-                    .into_iter()
-                    .map(|model| ModelOption::new(model.model_id))
-                    .collect(),
-            )),
-            // Read from the agent's own CLI: real models, but a pick cannot
-            // reach the agent over ACP — informational only, and the UI says
-            // so instead of offering a choice that silently does nothing.
-            None => {
-                if let Some(opt) = session
-                    .config_options
-                    .into_iter()
-                    .find(|opt| opt.id == "model")
-                    && !opt.options.is_empty()
-                {
-                    return Ok(ModelList::authoritative(
-                        opt.options
-                            .into_iter()
-                            .map(|choice| {
-                                if let Some(name) = choice.name {
-                                    ModelOption::with_label(choice.value, name)
-                                } else {
-                                    ModelOption::new(choice.value)
-                                }
-                            })
-                            .collect(),
-                    ));
+        //
+        // This probe opened a session too, so it closes it on the same terms as
+        // a turn: the block keeps every `?` below from skipping the close.
+        let session_id = session.session_id.clone();
+        let listed: Result<ModelList, LlmError> = async {
+            match session.models {
+                // Advertised by the agent itself: a pick reaches it via
+                // session/set_model, so the list is authoritative.
+                Some(state) => Ok(ModelList::authoritative(
+                    state
+                        .available
+                        .into_iter()
+                        .map(|model| ModelOption::new(model.model_id))
+                        .collect(),
+                )),
+                // Read from the agent's own CLI: real models, but a pick cannot
+                // reach the agent over ACP — informational only, and the UI says
+                // so instead of offering a choice that silently does nothing.
+                None => {
+                    if let Some(opt) = session
+                        .config_options
+                        .into_iter()
+                        .find(|opt| opt.id == "model")
+                        && !opt.options.is_empty()
+                    {
+                        return Ok(ModelList::authoritative(
+                            opt.options
+                                .into_iter()
+                                .map(|choice| {
+                                    if let Some(name) = choice.name {
+                                        ModelOption::with_label(choice.value, name)
+                                    } else {
+                                        ModelOption::new(choice.value)
+                                    }
+                                })
+                                .collect(),
+                        ));
+                    }
+                    let models = match &self.models_command {
+                        None => Vec::new(),
+                        Some(_) => self.run_models_command().await?,
+                    };
+                    // With `model_env` configured a pick really does reach the
+                    // agent (its connection is respawned pinned to the pick), so
+                    // the list is authoritative even though the wire was silent.
+                    Ok(if self.model_env.is_empty() {
+                        ModelList::informational(models)
+                    } else {
+                        ModelList::authoritative(models)
+                    })
                 }
-                let models = match &self.models_command {
-                    None => Vec::new(),
-                    Some(_) => self.run_models_command().await?,
-                };
-                // With `model_env` configured a pick really does reach the
-                // agent (its connection is respawned pinned to the pick), so
-                // the list is authoritative even though the wire was silent.
-                Ok(if self.model_env.is_empty() {
-                    ModelList::informational(models)
-                } else {
-                    ModelList::authoritative(models)
-                })
             }
         }
+        .await;
+        self.close_session(&conn, &session_id).await;
+        listed
     }
 }
 

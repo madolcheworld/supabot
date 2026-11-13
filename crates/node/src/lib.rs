@@ -40,13 +40,21 @@
 //! [`swarmbot_tools::LocalExecutor`] answers a `ShellExec` with one
 //! [`ToolResult`](swarmbot_contracts::ToolResult): it buffers, then reports
 //! `exit=<code>` plus stdout/stderr sections. A socket needs *chunks* with a
-//! real pid, so [`shell`] runs the command itself. It mirrors
-//! `swarmbot_tools::handlers::shell::exec_shell` — same `sh -c`, same
-//! `process_group(0)`, same scrubbed environment, same `killpg` on
-//! timeout/cancel — and reuses that module's public timeout constants. The
-//! implementation function itself is `pub(crate)` in `tools`, so it cannot be
-//! called from here; see the header of [`shell`] for the list of things that
-//! must stay in sync.
+//! real pid, so the call takes the streaming shape instead — and that shape is
+//! **the same implementation**, called rather than copied:
+//! [`swarmbot_tools::handlers::shell::exec_shell_streaming`]. [`shell`] here is
+//! only the adapter, and what this crate contributes is its own half of the
+//! decision: the node's [`PolicyEngine`](swarmbot_tools::PolicyEngine), its
+//! `PathPolicy`, its spill directory and audit line, plus the mapping from
+//! [`swarmbot_tools::ShellEvent`]s onto the wire's `ShellChunk` JSON.
+//!
+//! The deliberate difference between the two shapes is the **run loop**, not the
+//! spawn: buffered waits for one exit and formats a `ToolResult`, streaming feeds
+//! an emitter and can be cut short by its transport. Both loops live side by side
+//! in `crates/tools/src/handlers/shell.rs`, and both spawn through the same
+//! `build_shell_command` — so the process-group, scrubbed-environment and
+//! `killpg` invariants are one body of code, and a change to one shape cannot
+//! silently drift from the other across a crate boundary.
 
 pub mod cli;
 pub mod config;

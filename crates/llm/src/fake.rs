@@ -573,6 +573,9 @@ mod tests {
                 LlmEvent::TextDelta(_) => "text",
                 LlmEvent::ToolCallStart { .. } => "start",
                 LlmEvent::ToolCallArgsDelta { .. } => "args",
+                // The fake never retries, so a `Restart` here would be a bug;
+                // the label keeps the match exhaustive when the variant exists.
+                LlmEvent::Restart { .. } => "restart",
                 LlmEvent::Finished { .. } => "finished",
             })
             .collect::<Vec<_>>();

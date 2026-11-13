@@ -14,6 +14,17 @@
 //!
 //! The file holds no secrets (the keypair lives in `identity.json`, mode
 //! 0600), so it is written world-readable like any other config.
+//!
+//! # The default roots
+//!
+//! A node that never had a root configured still gets two: its workspace
+//! (read-write) and its **spill directory** (read-only). The second one exists
+//! because a `shell.exec` exit chunk names `<data>/spill/<inv>-stdout.log` when
+//! output went over the cap — and a path the bot cannot open is a broken
+//! promise, not a policy. It is read-only on purpose: reading your own output
+//! back is not permission to use that directory as scratch space, and a write
+//! there would bypass neither the ceiling nor the audit line but would make the
+//! spill dir a second, unaudited workspace.
 
 use std::path::{Path, PathBuf};
 
@@ -82,7 +93,9 @@ impl NodePaths {
     }
 
     /// Output beyond the per-stream cap is spilled here so a model can page it
-    /// instead of losing it.
+    /// instead of losing it. It is a **read-only root** by default: a bot may
+    /// read a spilled file back, never write here (see [`NodeConfig::default`]
+    /// and [`NodeConfig::new_in`]).
     pub fn spill(&self) -> PathBuf {
         self.data_dir.join("spill")
     }
@@ -171,14 +184,10 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         let data_dir = NodePaths::default_dir();
-        let workspace = data_dir.join("workspace");
         Self {
             label: hostname(),
             brain_url: None,
-            roots: vec![NodeRoot::read_write(
-                "workspace",
-                workspace.display().to_string(),
-            )],
+            roots: default_roots(&data_dir),
             deny: Vec::new(),
             ceilings: default_ceilings(),
             auto_approve_read_only: true,
@@ -199,6 +208,32 @@ pub fn default_ceilings() -> PolicyMap {
     map
 }
 
+/// The roots a node starts with when the owner configured none.
+///
+/// Two of them, in this order:
+///
+/// 1. `<data>/workspace`, **read-write** — and first, because
+///    [`NodeConfig::workspace`] and the hello roster both take the first
+///    read-write root as "where this node works";
+/// 2. `<data>/spill`, **read-only** — the directory a spilled `shell.exec`
+///    result names, so the bot can page its own output back with `fs.read`.
+///
+/// The spill root is read-only because the two capabilities are different: being
+/// able to re-read truncated output is a repair, while writing into that
+/// directory would make it a second workspace that the owner never granted.
+/// A write there is refused with `PathDenied { reason: "read-only root" }`.
+///
+/// An explicit `--root`/`--read-only-root` replaces these (the CLI is what the
+/// owner means *this run*); an owner who names roots themselves and still wants
+/// spilled output readable adds `--read-only-root <data>/spill`.
+fn default_roots(data_dir: &Path) -> Vec<NodeRoot> {
+    let paths = NodePaths::new(data_dir.to_path_buf());
+    vec![
+        NodeRoot::read_write("workspace", paths.workspace().display().to_string()),
+        NodeRoot::read_only("spill", paths.spill().display().to_string()),
+    ]
+}
+
 impl NodeConfig {
     /// The defaults rooted at one data dir, without reading a file. `load` is
     /// what the daemon uses; this is what a test (or an embedder that builds a
@@ -206,14 +241,10 @@ impl NodeConfig {
     /// at a `TempDir`.
     pub fn new_in(data_dir: impl Into<PathBuf>) -> NodeConfig {
         let data_dir = expand_tilde(data_dir.into());
-        let workspace = NodePaths::new(data_dir.clone()).workspace();
         NodeConfig {
             label: hostname(),
             brain_url: None,
-            roots: vec![NodeRoot::read_write(
-                "workspace",
-                workspace.display().to_string(),
-            )],
+            roots: default_roots(&data_dir),
             deny: Vec::new(),
             ceilings: default_ceilings(),
             auto_approve_read_only: true,
@@ -513,7 +544,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = NodeConfig::load(tmp.path()).expect("loads");
         assert_eq!(config.data_dir, tmp.path());
-        assert_eq!(config.roots.len(), 1, "the default workspace root");
+        // Two defaults since the spill dir became a root: the workspace the
+        // node works in, and the spill directory it may only read. This used to
+        // assert one; the count changed, the *behaviour* it protects (the first
+        // root is a read-write workspace) did not.
+        assert_eq!(
+            config.roots.len(),
+            2,
+            "the default workspace and read-only spill roots: {:?}",
+            config.roots
+        );
         assert_eq!(config.roots[0].mode, RootMode::ReadWrite);
         assert!(
             config.roots[0].path.ends_with("workspace"),
@@ -523,6 +563,75 @@ mod tests {
         assert!(config.shell_enabled);
         assert_eq!(config.heartbeat_secs, DEFAULT_HEARTBEAT_SECS);
         assert!(!config.label.is_empty());
+    }
+
+    #[test]
+    fn the_default_roots_are_the_workspace_then_a_read_only_spill_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = NodeConfig::new_in(tmp.path());
+        let paths = config.paths();
+
+        assert_eq!(config.roots.len(), 2, "{:?}", config.roots);
+        // Order matters: `workspace()` and the hello roster both read the first
+        // read-write root, and the spill root must never win that race.
+        assert_eq!(config.roots[0].id, "workspace");
+        assert_eq!(config.roots[0].mode, RootMode::ReadWrite);
+        assert_eq!(PathBuf::from(&config.roots[0].path), paths.workspace());
+        assert_eq!(config.roots[1].id, "spill");
+        assert_eq!(
+            config.roots[1].mode,
+            RootMode::ReadOnly,
+            "the spill dir is a read-back surface, not a second workspace"
+        );
+        assert_eq!(PathBuf::from(&config.roots[1].path), paths.spill());
+        assert_eq!(config.workspace(), paths.workspace());
+
+        // `Default` builds the same pair from the platform data dir.
+        let default = NodeConfig::default();
+        assert_eq!(default.roots.len(), 2, "{:?}", default.roots);
+        assert_eq!(default.roots[0].mode, RootMode::ReadWrite);
+        assert_eq!(default.roots[1].mode, RootMode::ReadOnly);
+        assert!(default.roots[1].path.ends_with("spill"));
+    }
+
+    #[test]
+    fn a_spilled_file_can_be_read_back_but_the_spill_directory_is_not_writable() {
+        // The bug this pins: the exit chunk names `<data>/spill/<inv>-stdout.log`,
+        // and with no root covering that directory the bot was handed a path it
+        // could not open. Reading it must work; writing there must not, or the
+        // spill dir becomes an ungranted workspace.
+        use swarmbot_contracts::ToolError;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = NodeConfig::load(tmp.path()).expect("loads");
+        let policy = config.path_policy();
+        let workspace = config.workspace();
+        let spill = config.paths().spill();
+        std::fs::create_dir_all(&spill).expect("spill dir");
+        let spilled = spill.join("inv-1-stdout.log");
+        std::fs::write(&spilled, b"the overflow").expect("write the spill file");
+
+        let read = policy
+            .resolve(&spilled, &workspace, false)
+            .expect("a spilled result must be readable back through fs.read");
+        assert!(
+            read.starts_with(spill.canonicalize().expect("canon")),
+            "{}",
+            read.display()
+        );
+
+        let denied = policy
+            .resolve(&spill.join("mine.txt"), &workspace, true)
+            .expect_err("the spill root is read-only");
+        match denied {
+            ToolError::PathDenied { reason, .. } => assert_eq!(reason, "read-only root"),
+            other => panic!("expected PathDenied, got {other:?}"),
+        }
+        // …and the read-only root does not weaken the workspace: a write there
+        // still resolves.
+        policy
+            .resolve(&workspace.join("notes.txt"), &workspace, true)
+            .expect("the workspace is still read-write");
     }
 
     #[test]

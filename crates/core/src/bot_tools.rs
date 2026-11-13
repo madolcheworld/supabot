@@ -50,6 +50,7 @@ use crate::approval::ApprovalService;
 use crate::bus::LiveHub;
 use crate::messaging::{Messaging, SendContext};
 use crate::runners::RunnerMap;
+use crate::session::MEMORY_INDEX_LIMIT_BYTES;
 use crate::tasks::BackgroundTasks;
 use crate::transcript::Transcript;
 
@@ -58,6 +59,10 @@ const MAX_LISTED_TASKS: usize = 30;
 /// How many of a task's steps `check_task` shows: enough to see what the task
 /// is doing, few enough to stay well under `TOOL_RESULT_LIMIT_BYTES`.
 const MAX_TASK_STEPS: usize = 20;
+/// How large one remembered fact may be. A single line is the shape; this only
+/// stops a model from pasting a whole document into a "fact" and crowding out
+/// everything it already knows.
+const MAX_MEMORY_FACT_BYTES: usize = 512;
 
 /// Everything the bot-facing tools share. Built once by the brain (the same
 /// services the runners use, so a tool call and the orchestration agree on
@@ -92,11 +97,12 @@ enum BotToolKind {
     CheckTask,
     UpdateTask,
     CancelTask,
+    Remember,
 }
 
 impl BotToolKind {
     /// All of them, in catalogue order.
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::MessageBot,
         Self::PostToGroup,
         Self::HandoffTask,
@@ -110,6 +116,7 @@ impl BotToolKind {
         Self::CheckTask,
         Self::UpdateTask,
         Self::CancelTask,
+        Self::Remember,
     ];
 
     /// The definition a model sees. Every schema is a plain object schema —
@@ -288,6 +295,26 @@ impl BotToolKind {
                 }),
                 Toolset::Task,
             ),
+            Self::Remember => ToolSpec::new(
+                "remember",
+                "Write one durable fact about your own work into your long-term memory \
+                 (`MEMORY.md` in your workspace), which is shown to you at the start of every \
+                 turn. Use it for things you will need again: a convention, a path, a decision \
+                 and its reason. It takes effect from your NEXT turn — the memory you were given \
+                 this turn does not change under you. Do not use it as a scratchpad; keep one \
+                 fact per call, and it must fit on one line.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "fact": {
+                            "type": "string",
+                            "description": "one durable fact, one line, no newlines"
+                        }
+                    },
+                    "required": ["fact"]
+                }),
+                Toolset::Bot,
+            ),
         }
     }
 }
@@ -322,6 +349,7 @@ impl ToolHandler for BotTool {
             BotToolKind::CheckTask => self.env.check_task(ctx, args),
             BotToolKind::UpdateTask => self.env.update_task(ctx, args),
             BotToolKind::CancelTask => self.env.cancel_task(ctx, args),
+            BotToolKind::Remember => self.env.remember(ctx, args),
         }
     }
 }
@@ -390,6 +418,11 @@ struct RequestApprovalArgs {
 struct StartTaskArgs {
     title: String,
     brief: String,
+}
+
+#[derive(Deserialize)]
+struct RememberArgs {
+    fact: String,
 }
 
 #[derive(Deserialize)]
@@ -892,6 +925,128 @@ impl BotToolEnv {
         };
         Ok(ToolResult::text(text))
     }
+
+    /// Append one durable fact to the bot's own `MEMORY.md`.
+    ///
+    /// The file is the bot's long-term memory: `runners::read_bot_memory` reads
+    /// it at the start of every turn and `instructions::memory_section` injects
+    /// it under "What you remember", capped at
+    /// [`crate::session::MEMORY_INDEX_LIMIT_BYTES`]. Before this tool nothing
+    /// ever wrote it, so "memory" was a file that could only ever be empty.
+    ///
+    /// Three properties are deliberate:
+    ///
+    /// * **one line per fact, deduplicated** — a memory is a set of things that
+    ///   are true, not an append-only log, so writing the same fact twice does
+    ///   not make it twice as true;
+    /// * **the file stays inside the prompt budget** — writing past the cap
+    ///   would be silently truncated out of the prompt, which is the kind of
+    ///   quiet loss this repository refuses. When the budget is full the oldest
+    ///   line is dropped and the result says so;
+    /// * **the change is visible next turn, not this one** — the prompt for the
+    ///   turn in flight was already rendered, and the result says that plainly
+    ///   rather than implying the bot can read back what it just wrote.
+    ///
+    /// The write is a read-modify-write, which is safe because a bot has
+    /// exactly one runner and therefore one turn at a time (D3.1). A bot with
+    /// `shell` could still race this from a command it runs itself; that is the
+    /// same class of race as any other file in its workspace, and the
+    /// deduplication makes the common case idempotent.
+    fn remember(&self, ctx: &ToolContext, args: Value) -> Result<ToolResult, ToolError> {
+        let args: RememberArgs = parse_args("remember", args)?;
+        let fact = args.fact.trim();
+        if fact.is_empty() {
+            return Err(ToolError::invalid(
+                "remember: `fact` is empty; write the thing you want to keep",
+            ));
+        }
+        let fact = fact.replace(['\n', '\r'], " ");
+        let fact = fact.trim().to_string();
+        if fact.len() > MAX_MEMORY_FACT_BYTES {
+            return Err(ToolError::invalid(format!(
+                "remember: the fact is {} bytes; keep one fact under {MAX_MEMORY_FACT_BYTES} bytes \
+                 (split it if it is really several facts)",
+                fact.len()
+            )));
+        }
+
+        let path = ctx.workspace.join("MEMORY.md");
+        // The workspace is the bot's own, but a bot with `shell` could have
+        // replaced `MEMORY.md` with a symlink to something outside it. Writing
+        // through that would let a model append to a file the path policy would
+        // have refused, so the write stops here instead.
+        if let Ok(metadata) = std::fs::symlink_metadata(&path)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(ToolError::failed(
+                "remember: MEMORY.md in your workspace is a symlink; refusing to write through it",
+            ));
+        }
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return Err(ToolError::failed(format!(
+                    "remember: cannot read {}: {err}",
+                    path.display()
+                )));
+            }
+        };
+
+        let mut lines: Vec<String> = existing
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        // Compare on the text, not the whole line: "- x" and "x" are the same
+        // fact, and a bot may write either shape.
+        let bare = |line: &str| -> String {
+            line.trim_start_matches(['-', '*', ' '])
+                .trim()
+                .to_lowercase()
+        };
+        if lines.iter().any(|line| bare(line) == bare(&fact)) {
+            return Ok(ToolResult::text(format!(
+                "Already remembered: {fact}\n(It is in your memory from your next turn on.)"
+            )));
+        }
+
+        lines.push(format!("- {fact}"));
+        // Drop the oldest lines until the whole file fits the budget the prompt
+        // renderer applies. The newest fact is last, so it is never the one
+        // dropped.
+        let mut dropped = 0usize;
+        while lines.len() > 1 && lines.join("\n").len() > MEMORY_INDEX_LIMIT_BYTES {
+            lines.remove(0);
+            dropped += 1;
+        }
+        let body = format!("{}\n", lines.join("\n"));
+        if body.len() > MEMORY_INDEX_LIMIT_BYTES {
+            // One fact larger than the whole budget: refuse rather than write a
+            // file the prompt would silently cut.
+            return Err(ToolError::invalid(format!(
+                "remember: this fact alone is larger than the {MEMORY_INDEX_LIMIT_BYTES}-byte \
+                 memory budget; shorten it"
+            )));
+        }
+        std::fs::write(&path, body).map_err(|err| {
+            ToolError::failed(format!("remember: cannot write {}: {err}", path.display()))
+        })?;
+
+        let mut text = format!(
+            "Remembered: {fact}\nIt is in your memory from your next turn on — the prompt for \
+             this turn was already built."
+        );
+        if dropped > 0 {
+            text.push_str(&format!(
+                "\nDropped the {dropped} oldest line(s) to stay inside the \
+                 {MEMORY_INDEX_LIMIT_BYTES}-byte memory budget."
+            ));
+        }
+        Ok(ToolResult::text(text))
+    }
 }
 
 // --- shared plumbing -----------------------------------------------------------
@@ -1101,7 +1256,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl NodeExecutor for NoNodes {
-        async fn exec(&self, node: &NodeId, _call: NodeCall) -> Result<ToolResult, ToolError> {
+        async fn exec(
+            &self,
+            node: &NodeId,
+            _invocation: &Invocation,
+            _call: NodeCall,
+        ) -> Result<ToolResult, ToolError> {
             Err(ToolError::failed(format!(
                 "node {node} cannot run anything in this test"
             )))
@@ -1231,6 +1391,174 @@ mod tests {
                 Err(err) => err.to_result(),
             }
         }
+    }
+
+    // --- remember --------------------------------------------------------------
+
+    /// A context whose workspace is a real temp directory, because `remember`
+    /// writes `MEMORY.md` and a test must not touch `/tmp` by name.
+    fn remember_ctx(rig: &Rig, workspace: &std::path::Path) -> ToolContext {
+        let mut ctx = rig.ctx(&rig.lead, &rig.lead.direct_conversation_id);
+        ctx.workspace = workspace.to_path_buf();
+        ctx.spool_dir = workspace.join(".spool");
+        ctx
+    }
+
+    #[tokio::test]
+    async fn remember_appends_one_line_and_is_idempotent() {
+        let rig = Rig::new();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ctx = remember_ctx(&rig, dir.path());
+
+        let first = rig
+            .call(
+                BotToolKind::Remember,
+                &ctx,
+                json!({"fact": "the build is `cargo build -p swarmbot-core`"}),
+            )
+            .await;
+        assert!(!first.is_error, "{}", first.text_only());
+        assert!(
+            first.text_only().contains("next turn"),
+            "{}",
+            first.text_only()
+        );
+
+        let memory = std::fs::read_to_string(dir.path().join("MEMORY.md")).expect("MEMORY.md");
+        assert_eq!(
+            memory.trim(),
+            "- the build is `cargo build -p swarmbot-core`"
+        );
+
+        // The same fact twice does not become two lines: memory is a set of
+        // things that are true, not a log.
+        let again = rig
+            .call(
+                BotToolKind::Remember,
+                &ctx,
+                json!({"fact": "the build is `cargo build -p swarmbot-core`"}),
+            )
+            .await;
+        assert!(!again.is_error);
+        assert!(
+            again.text_only().contains("Already remembered"),
+            "{}",
+            again.text_only()
+        );
+        let memory = std::fs::read_to_string(dir.path().join("MEMORY.md")).expect("MEMORY.md");
+        assert_eq!(memory.lines().count(), 1, "{memory:?}");
+    }
+
+    #[tokio::test]
+    async fn remember_keeps_one_fact_per_line() {
+        let rig = Rig::new();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ctx = remember_ctx(&rig, dir.path());
+        let result = rig
+            .call(
+                BotToolKind::Remember,
+                &ctx,
+                json!({"fact": "first thing\nsecond thing"}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.text_only());
+        let memory = std::fs::read_to_string(dir.path().join("MEMORY.md")).expect("MEMORY.md");
+        assert_eq!(
+            memory.lines().count(),
+            1,
+            "a newline would let one fact pose as two: {memory:?}"
+        );
+        assert!(memory.contains("first thing second thing"), "{memory:?}");
+    }
+
+    #[tokio::test]
+    async fn remember_refuses_an_empty_fact_and_an_oversized_one() {
+        let rig = Rig::new();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ctx = remember_ctx(&rig, dir.path());
+
+        let empty = rig
+            .call(BotToolKind::Remember, &ctx, json!({"fact": "   "}))
+            .await;
+        assert!(empty.is_error, "an empty fact is not a fact");
+
+        let huge = "x".repeat(MAX_MEMORY_FACT_BYTES + 1);
+        let oversized = rig
+            .call(BotToolKind::Remember, &ctx, json!({"fact": huge}))
+            .await;
+        assert!(oversized.is_error, "{}", oversized.text_only());
+        assert!(
+            !dir.path().join("MEMORY.md").exists(),
+            "a refused fact must not leave a file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_drops_the_oldest_lines_to_stay_inside_the_prompt_budget() {
+        // The renderer caps memory at MEMORY_INDEX_LIMIT_BYTES. Writing past
+        // that would be silently truncated from the prompt — the quiet loss
+        // this repository refuses — so the tool trims instead and says so.
+        let rig = Rig::new();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ctx = remember_ctx(&rig, dir.path());
+
+        let line = "y".repeat(400);
+        let mut last = None;
+        for i in 0..20 {
+            last = Some(
+                rig.call(
+                    BotToolKind::Remember,
+                    &ctx,
+                    json!({"fact": format!("fact {i} {line}")}),
+                )
+                .await,
+            );
+        }
+        let last = last.expect("a result");
+        assert!(!last.is_error, "{}", last.text_only());
+        assert!(
+            last.text_only().contains("Dropped the"),
+            "the result must say what it dropped: {}",
+            last.text_only()
+        );
+
+        let memory = std::fs::read_to_string(dir.path().join("MEMORY.md")).expect("MEMORY.md");
+        assert!(
+            memory.len() <= MEMORY_INDEX_LIMIT_BYTES,
+            "memory stays inside the prompt budget: {} bytes",
+            memory.len()
+        );
+        assert!(
+            memory.contains("fact 19"),
+            "the newest fact survives the trim: {memory:?}"
+        );
+        assert!(
+            !memory.contains("fact 0 "),
+            "the oldest facts are the ones dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_refuses_to_write_through_a_symlinked_memory_file() {
+        // A bot with `shell` could replace MEMORY.md with a symlink to a file
+        // the path policy would have refused. `remember` must not become the
+        // way around that.
+        let rig = Rig::new();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("outside.txt");
+        std::fs::write(&target, b"do not touch").expect("target");
+        std::os::unix::fs::symlink(&target, dir.path().join("MEMORY.md")).expect("symlink");
+        let ctx = remember_ctx(&rig, dir.path());
+
+        let result = rig
+            .call(BotToolKind::Remember, &ctx, json!({"fact": "leak"}))
+            .await;
+        assert!(result.is_error, "{}", result.text_only());
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target"),
+            "do not touch",
+            "the file behind the symlink is untouched"
+        );
     }
 
     // --- message_bot -----------------------------------------------------------
@@ -1809,6 +2137,7 @@ mod tests {
             "check_task",
             "update_task",
             "cancel_task",
+            "remember",
         ] {
             assert!(
                 by_name.contains_key(name),

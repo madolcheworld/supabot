@@ -118,13 +118,26 @@ impl ApprovalService {
     }
 
     /// The rule that decides this request, in the documented order.
+    ///
+    /// One thing overrides every rule: a **destructive shell command always
+    /// asks**. An `Allow` rule is a statement about ordinary work, and the
+    /// only thing a saved prefix can honestly promise is "the commands I
+    /// answered for" — it can never promise `rm -rf /`. Downgrading here (not
+    /// only when the rule is written) also repairs rules written by an older
+    /// build, which stored bare first-word prefixes.
     pub fn evaluate(&self, request: &RuntimeRequest) -> Evaluation {
         let rules = self.store.list_rules().unwrap_or_default();
+        let destructive = is_destructive_request(request);
         for scope in [ScopeFilter::Bot(&request.bot_id), ScopeFilter::Global] {
             for effect in [RuleEffect::Deny, RuleEffect::Ask, RuleEffect::Allow] {
                 if let Some(rule) = rules.iter().find(|rule| {
                     scope.matches(rule) && rule.effect == effect && rule.matches(request)
                 }) {
+                    let effect = if destructive && effect == RuleEffect::Allow {
+                        RuleEffect::Ask
+                    } else {
+                        effect
+                    };
                     return Evaluation {
                         effect,
                         rule_id: Some(rule.id.clone()),
@@ -142,12 +155,6 @@ impl ApprovalService {
     /// Ask, and wait for the answer or the expiry.
     pub async fn ask(&self, mut request: RuntimeRequest) -> Result<Outcome, DomainError> {
         let settings = self.settings.get();
-        if request.kind == swarmbot_contracts::request::RequestKind::Approval
-            && settings.auto_approve_read_only
-            && self.is_read_only(&request)
-        {
-            return Ok(Outcome::Allowed { rule_id: None });
-        }
 
         match self.evaluate(&request) {
             Evaluation {
@@ -170,7 +177,18 @@ impl ApprovalService {
             Evaluation {
                 effect: RuleEffect::Ask,
                 ..
-            } => {}
+            } => {
+                // Only now may convenience speak: a read-only action skips the
+                // card when nothing forbade it. This used to be checked before
+                // `evaluate`, which silently turned every `deny` rule for
+                // `read_file` into dead code.
+                if request.kind == swarmbot_contracts::request::RequestKind::Approval
+                    && settings.auto_approve_read_only
+                    && self.is_read_only(&request)
+                {
+                    return Ok(Outcome::Allowed { rule_id: None });
+                }
+            }
         }
 
         request.expires_at = Some(
@@ -255,15 +273,28 @@ impl ApprovalService {
         self.update_card(&request)?;
         self.hub.publish(Change::Request(request.clone()));
 
-        // "Always allow" is the moment a rule is born.
+        // "Always allow" is the moment a rule is born — except for a
+        // destructive command, where the answer covers this call and nothing
+        // else (see [`rule_from`]).
         if decision == Some(Decision::AllowAlways) {
-            let rule = rule_from(&request);
-            self.store.insert_rule(&rule)?;
-            let _ = self.transcript.event(
-                &request.conversation_id,
-                "rule-added",
-                format!("Always allowing {} for this bot", rule_description(&rule)),
-            );
+            match rule_from(&request) {
+                Some(rule) => {
+                    self.store.insert_rule(&rule)?;
+                    let _ = self.transcript.event(
+                        &request.conversation_id,
+                        "rule-added",
+                        format!("Always allowing {} for this bot", rule_description(&rule)),
+                    );
+                }
+                None => {
+                    let _ = self.transcript.event(
+                        &request.conversation_id,
+                        "rule-added",
+                        "Allowed this once: a destructive command never becomes a standing rule"
+                            .to_string(),
+                    );
+                }
+            }
         }
 
         let settled = settled_of(&request);
@@ -439,7 +470,6 @@ impl ApprovalService {
         use swarmbot_contracts::node::Surface;
         matches!(request.surface, Some(Surface::ReadFile))
     }
-
     // --- rules --------------------------------------------------------------
 
     pub fn rules(&self) -> Result<Vec<ApprovalRule>, DomainError> {
@@ -557,6 +587,10 @@ impl ApprovalGate for ApprovalBridge {
         let outcome = self.service.ask(request).await?;
         Ok(outcome.allowed())
     }
+
+    fn cancel_turn(&self, turn: &TurnId) -> Result<usize, DomainError> {
+        self.service.cancel_turn(turn)
+    }
 }
 
 /// The text a card shows.
@@ -580,12 +614,37 @@ fn card_body(request: &RuntimeRequest) -> String {
 
 /// The rule an "always allow" writes: as narrow as the request allows, so one
 /// yes does not become a blanket one.
-fn rule_from(request: &RuntimeRequest) -> ApprovalRule {
+///
+/// Returns `None` for a destructive shell command on purpose: no saved answer
+/// may authorise one. The owner can still allow that single call; the next
+/// `rm -rf` asks again. That is the honest reading of "always allow" — it
+/// cannot be a promise about commands nobody has seen.
+fn rule_from(request: &RuntimeRequest) -> Option<ApprovalRule> {
+    if is_destructive_request(request) {
+        return None;
+    }
     let mut rule = ApprovalRule::new(RuleScope::Bot(request.bot_id.clone()), RuleEffect::Allow);
     rule.surface = request.surface;
     rule.tool = request.tool.clone();
     rule.command_prefix = command_prefix_of(request);
-    rule
+    Some(rule)
+}
+
+/// True when this request is a shell command the destructive matcher flags.
+///
+/// The matcher is a heuristic, not a shell parser (`tools::is_destructive` says
+/// so itself); the direction of its error is what makes it safe here: a false
+/// positive only costs the owner one extra card, a false negative would be a
+/// silent permission.
+fn is_destructive_request(request: &RuntimeRequest) -> bool {
+    use swarmbot_contracts::node::Surface;
+    match request.surface {
+        Some(Surface::Shell) => request
+            .target
+            .as_deref()
+            .is_some_and(swarmbot_tools::is_destructive),
+        _ => false,
+    }
 }
 
 /// For a command, the first word: "always allow `cargo`" is useful, "always
@@ -722,7 +781,9 @@ mod tests {
     #[test]
     fn a_bots_deny_beats_its_allow_and_a_global_allow() {
         let rig = rig();
-        let request = approval(&rig, "rm -rf /tmp/x");
+        // An ordinary command on purpose: this test is about precedence, and a
+        // destructive one would (correctly) be downgraded to Ask regardless.
+        let request = approval(&rig, "cargo build");
 
         let mut allow = ApprovalRule::new(RuleScope::Bot(rig.bot.id.clone()), RuleEffect::Allow);
         allow.surface = Some(Surface::Shell);
@@ -737,7 +798,7 @@ mod tests {
         // A bot-scoped deny outranks both.
         let mut deny = ApprovalRule::new(RuleScope::Bot(rig.bot.id.clone()), RuleEffect::Deny);
         deny.surface = Some(Surface::Shell);
-        deny.command_prefix = Some("rm".into());
+        deny.command_prefix = Some("cargo".into());
         rig.store.insert_rule(&deny).unwrap();
         let evaluation = rig.service.evaluate(&request);
         assert_eq!(evaluation.effect, RuleEffect::Deny);
@@ -998,5 +1059,75 @@ mod tests {
         let bare = question(&rig);
         assert_eq!(card_body(&bare), "which environment?");
         assert_eq!(bare.kind, RequestKind::Question);
+    }
+
+    // -- the destructive floor -------------------------------------------------
+
+    #[test]
+    fn a_saved_allow_rule_cannot_authorise_a_destructive_command() {
+        // One "always allow `rm build/x`" stores the prefix `rm`. Before the
+        // boundary fix that rule matched `rm -rf /` and the destructive floor
+        // in the policy engine was undone by the gate.
+        let rig = rig();
+        let mut rule = ApprovalRule::new(RuleScope::Bot(rig.bot.id.clone()), RuleEffect::Allow);
+        rule.surface = Some(Surface::Shell);
+        rule.tool = Some("shell".into());
+        rule.command_prefix = Some("rm".into());
+        rig.store.insert_rule(&rule).unwrap();
+
+        let destructive = approval(&rig, "rm -rf /");
+        let evaluation = rig.service.evaluate(&destructive);
+        assert_eq!(
+            evaluation.effect,
+            RuleEffect::Ask,
+            "a destructive command always asks, whatever a saved rule says"
+        );
+
+        // The same rule still covers ordinary work under that prefix.
+        let ordinary = approval(&rig, "rm build/artifact.o");
+        assert_eq!(rig.service.evaluate(&ordinary).effect, RuleEffect::Allow);
+    }
+
+    #[test]
+    fn allow_always_on_a_destructive_command_writes_no_rule() {
+        let rig = rig();
+        let mut request = approval(&rig, "rm -rf /tmp/scratch");
+        rig.service.raise_async(&mut request).unwrap();
+        rig.service
+            .respond(
+                &request.id,
+                Some(Decision::AllowAlways),
+                None,
+                Responder::Owner,
+            )
+            .unwrap();
+
+        assert!(
+            rig.service.rules().unwrap().is_empty(),
+            "a destructive command is allowed once, never standing"
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_beats_auto_approve_read_only() {
+        // `auto_approve_read_only` defaults to true. It used to be checked
+        // before the rules, which made every `deny` rule for `read_file` dead
+        // code — the one lever an owner has to forbid reading something.
+        let rig = rig();
+        let mut rule = ApprovalRule::new(RuleScope::Bot(rig.bot.id.clone()), RuleEffect::Deny);
+        rule.surface = Some(Surface::ReadFile);
+        rig.store.insert_rule(&rule).unwrap();
+
+        let request = RuntimeRequest::approval(
+            rig.bot.id.clone(),
+            rig.conversation.id.clone(),
+            Surface::ReadFile,
+            "read_file",
+            "/etc/shadow",
+            Some("read a file".into()),
+        );
+        let evaluation = rig.service.evaluate(&request);
+        assert_eq!(evaluation.effect, RuleEffect::Deny);
+        assert!(evaluation.rule_id.is_some());
     }
 }

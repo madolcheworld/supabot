@@ -1,7 +1,7 @@
 //! The HTTP surface: router assembly, the auth gate, and the small helpers the
 //! route modules share.
 //!
-//! Two decisions here are load-bearing:
+//! Three decisions here are load-bearing:
 //!
 //! * **auth is a route layer, not a handler habit.** Every owner-only route is
 //!   registered on one router that carries [`require_auth`], so a route added
@@ -9,6 +9,12 @@
 //!   routes that must stay open (`POST /api/session`, which is how a token
 //!   becomes a cookie, and the node gateway, which a node reaches *before* it has
 //!   credentials) live on a separate router and are the whole list of exceptions.
+//! * **the internal listener reuses the same gate.** Its static `/mcp` route
+//!   serves the *whole* tool registry — `shell` and the fs tools included — so it
+//!   is on the owner's gate too; the only route that authenticates itself is the
+//!   turn-scoped `/mcp/t/{token}`, whose token *is* the credential. Being
+//!   loopback-only (enforced in [`crate::config`]) is defence in depth, never the
+//!   authorization.
 //! * **an unauthenticated request never learns whether a path exists.** The
 //!   fallback authenticates first and answers 404 second, so probing this API
 //!   without a token yields one answer for every path.
@@ -128,26 +134,49 @@ pub fn router(state: AppState) -> Router {
 
 use std::sync::Arc;
 
-/// The internal listener: loopback-only, for the MCP gateway the CLI harnesses
-/// connect to (M3). It carries no owner routes on purpose — a second path to the
-/// API would be a second place to get authorization wrong.
+/// The internal listener: the MCP gateway, and nothing else.
+///
+/// It carries no owner routes on purpose — a second path to the API would be a
+/// second place to get authorization wrong — but that does not make it
+/// unauthenticated:
+///
+/// * **`/mcp` serves the whole tool registry** (`shell`, the fs tools, every
+///   toolset) with no per-turn filter, so it sits behind the same
+///   [`require_auth`] gate as the public API. A listener that only binds
+///   loopback is defence in depth, not a credential: `internal_addr` is
+///   validated at resolve time ([`crate::config`]), but the route itself must
+///   not depend on that.
+/// * **`/mcp/t/{token}` authenticates with its own token.** The token is minted
+///   per turn, registered in the [`swarmbot_mcp::TurnMcpRegistry`], and the
+///   registry lookup *is* the check — a harness that only ever sees its own
+///   turn must not also need the owner token, and the owner token must never be
+///   put in a URL. It is not weaker than the static route; it is scoped to one
+///   turn's context and toolsets.
+/// * **`/health` stays open.** It reports a version and nothing else, and it is
+///   what a supervisor probes before any credential is known.
 pub fn internal_router(
+    state: AppState,
     mcp: Arc<swarmbot_mcp::McpHttpService>,
     turns: Arc<swarmbot_mcp::TurnMcpRegistry>,
 ) -> Router {
-    let static_routes = Router::new()
-        .route("/health", get(internal_health))
+    // `route_layer` applies to the routes above it and to nothing else, which is
+    // what keeps `/health` open without a second router to keep in sync.
+    let gated = Router::new()
         .route(
             "/mcp",
             post(node_gateway::mcp_handler)
                 .get(node_gateway::mcp_handler)
                 .delete(node_gateway::mcp_handler),
         )
+        .route_layer(middleware::from_fn_with_state(state, require_auth))
+        .with_state(Arc::clone(&mcp));
+    let open = Router::new()
+        .route("/health", get(internal_health))
         .with_state(mcp);
     let turn_routes = Router::new()
         .route("/mcp/t/{token}", any(node_gateway::turn_mcp_handler))
         .with_state(turns);
-    static_routes.merge(turn_routes)
+    gated.merge(open).merge(turn_routes)
 }
 
 async fn internal_health() -> axum::Json<serde_json::Value> {

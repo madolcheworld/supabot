@@ -8,6 +8,11 @@
 //! is what the owner asked for, and a hard failure here would turn a
 //! bookkeeping problem into a bot that cannot act. The flip side (a silently
 //! missing line) is why the error is logged loudly rather than ignored.
+//!
+//! What the file *is* is stated just as plainly: one JSON object per line,
+//! appended by whatever turns share this node, written 0600 into a 0700
+//! directory (the line records paths and command lines, which are the owner's
+//! business and nobody else's), and **not** fsynced — see [`AuditLog`].
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -175,10 +180,29 @@ impl AuditEntryBuilder {
 
 /// Appends [`AuditEntry`] lines to one JSONL file.
 ///
-/// Appends are single `write_all` calls on an `O_APPEND` handle, which the
-/// kernel keeps atomic for lines this small; concurrent turns therefore do
-/// not need a lock, and a crashed mid-write loses at most the line it was
-/// writing.
+/// What is actually guaranteed, since the earlier doc comment here claimed
+/// more than the code did:
+///
+/// * **One line per entry.** The entry and its newline are built into one
+///   buffer and handed to a single `write_all` on an `O_APPEND` handle. The
+///   kernel places a write of this size (a few hundred bytes, occasionally a
+///   few KiB) atomically at the end of the file, so concurrent turns cannot
+///   interleave *inside* a line. The previous two-call shape (line, then
+///   newline) had a scheduling point between the calls and produced lines
+///   with two JSON objects on them — see
+///   `concurrent_appends_keep_one_json_object_per_line`.
+/// * **No lock is needed** for that, and none is taken: a lock would only
+///   cover writers in this process, which is the smaller half of the problem
+///   (a daemon and a brain write to different files, but two turns do not).
+/// * **Not durable past the process.** There is no `fsync`: an fsync per tool
+///   call would put a disk round-trip on the critical path of every action,
+///   and this log is bookkeeping, not a ledger. A crash or power loss can
+///   therefore lose the last line(s) the OS had buffered; a torn tail line is
+///   possible and a reader should skip it rather than fail (the JSONL mirror
+///   in `store` follows the same rule).
+/// * **Not created world-readable.** New files are 0600 in a 0700 directory;
+///   an existing file keeps the mode it already has, because a mode is only
+///   applied at creation.
 #[derive(Clone, Debug)]
 pub struct AuditLog {
     path: PathBuf,
@@ -223,21 +247,96 @@ impl AuditLog {
 
     fn append(&self, line: &str) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_private_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        file.write_all(line.as_bytes())?;
-        file.write_all(b"\n")?;
+        // One buffer, one `write_all`: the newline travels with the JSON so
+        // there is no scheduling point between "the object" and "its line
+        // break" where another turn's line could land. `write_all` may issue a
+        // second `write` only after a short write (a signal interrupting a
+        // multi-page write), which a line this size does not produce.
+        let mut buffer = String::with_capacity(line.len() + 1);
+        buffer.push_str(line);
+        buffer.push('\n');
+        let mut file = open_append_private(&self.path)?;
+        file.write_all(buffer.as_bytes())?;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Private file creation
+// ---------------------------------------------------------------------------
+
+/// Create `dir` (and any missing parents) so that only its owner can enter it
+/// (0700 on unix).
+///
+/// The audit, spool and spill directories hold command lines, paths and
+/// command output — other people's data — so the process umask must not be
+/// what decides who may read them. `registry::spill` calls this too: the two
+/// places this crate creates a directory both want the same rule, and one
+/// helper is how they cannot drift.
+#[cfg(unix)]
+pub(crate) fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Non-unix builds have no mode bits to set here; the directory inherits the
+/// parent's ACL and there is nothing to tighten from this crate.
+#[cfg(not(unix))]
+pub(crate) fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// Write `bytes` to `path` as a file only its owner can read (0600 on unix).
+///
+/// Like [`open_append_private`], the mode applies when the file is *created*:
+/// an existing file keeps whatever mode it has, so this cannot loosen a file
+/// an operator tightened by hand — and it also cannot tighten a 0644 spill
+/// left behind by an older build.
+#[cfg(unix)]
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
+/// Open `path` for appending, creating it 0600 on unix. The audit line is
+/// 0600 for the same reason the directory is 0700: it names the paths and
+/// command lines somebody's bot acted on.
+#[cfg(unix)]
+fn open_append_private(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_append_private(path: &Path) -> std::io::Result<std::fs::File> {
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use swarmbot_contracts::{BotId, ConversationId};
     use tempfile::TempDir;
 
@@ -307,6 +406,65 @@ mod tests {
         assert_eq!(second["outcome"], "error");
     }
 
+    /// The append is two `write_all` calls unless the newline is folded into
+    /// the same buffer, and then a concurrent turn's line can land *between*
+    /// them: two JSON objects on one line, which is a corrupt audit log.
+    ///
+    /// Several threads appending long lines is what makes that reproduce: a
+    /// multi-kilobyte write holds the file's inode lock long enough that the
+    /// next thread is descheduled waiting for it, and the scheduling point
+    /// falls exactly between the two syscalls.
+    #[test]
+    fn concurrent_appends_keep_one_json_object_per_line() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 200;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let log = Arc::new(AuditLog::for_node(tmp.path(), &NodeId::local()));
+        // Padding so each line is a few KiB; the suffix keeps them distinct.
+        let padding = "p".repeat(2048);
+
+        let mut handles = Vec::new();
+        for thread in 0..THREADS {
+            let log = Arc::clone(&log);
+            let padding = padding.clone();
+            handles.push(std::thread::spawn(move || {
+                let inv = invocation();
+                for index in 0..PER_THREAD {
+                    log.record(
+                        AuditEntry::builder(&inv, "read_file")
+                            .surface("read_file")
+                            .target(format!("{padding}/{thread}/{index}"))
+                            .decision(AuditDecision::Run)
+                            .build(),
+                    );
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("an appending thread finishes");
+        }
+
+        let content = std::fs::read_to_string(log.path()).expect("the log exists");
+        let mut malformed = Vec::new();
+        for (number, line) in content.lines().enumerate() {
+            if let Err(error) = serde_json::from_str::<serde_json::Value>(line) {
+                malformed.push(format!("line {}: {error}", number + 1));
+            }
+        }
+        assert!(
+            malformed.is_empty(),
+            "{} line(s) are not one JSON object each: {:?}",
+            malformed.len(),
+            &malformed[..malformed.len().min(3)]
+        );
+        assert_eq!(
+            content.lines().count(),
+            THREADS * PER_THREAD,
+            "one line per entry: a missing line means two objects were merged"
+        );
+    }
+
     #[test]
     fn an_unwritable_path_never_fails_the_caller() {
         let tmp = TempDir::new().expect("tempdir");
@@ -317,6 +475,39 @@ mod tests {
         let log = AuditLog::new(blocker.join("audit").join("nod_local.jsonl"));
         log.record(AuditEntry::builder(&invocation(), "shell").build());
         // Reaching this line without a panic or an error return is the assertion.
+    }
+
+    /// The audit line names paths and command lines, so the file it lives in
+    /// is the owner's business: 0600 in a 0700 directory, not 0644/0755 by
+    /// umask.
+    #[cfg(unix)]
+    #[test]
+    fn the_audit_file_is_created_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let log = AuditLog::for_node(tmp.path(), &NodeId::local());
+        log.record(AuditEntry::builder(&invocation(), "read_file").build());
+
+        let mode = std::fs::metadata(log.path())
+            .expect("audit metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the audit log is readable by its owner only (mode {mode:o})"
+        );
+        let dir = log.path().parent().expect("an audit directory");
+        let dir_mode = std::fs::metadata(dir)
+            .expect("audit dir metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "the audit dir is owner-traversable only"
+        );
     }
 
     #[test]

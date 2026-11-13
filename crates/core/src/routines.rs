@@ -14,7 +14,7 @@ use swarmbot_contracts::delivery::Delivery;
 use swarmbot_contracts::error::{DomainError, not_found};
 use swarmbot_contracts::id::{BotId, RoutineId, RunId};
 use swarmbot_contracts::repo::Persistence;
-use swarmbot_contracts::routine::{Routine, RoutineRun, RoutineSchedule};
+use swarmbot_contracts::routine::{Routine, RoutineRun, RoutineSchedule, RunStatus};
 
 use crate::runners::RunnerMap;
 
@@ -99,6 +99,32 @@ impl RoutineScheduler {
         self.store.list_runs(routine_id, limit)
     }
 
+    /// Mark runs that have been `Running` for longer than `stale_after` as
+    /// failed. Called at boot, where the only runs still marked running are the
+    /// ones a crash cut off.
+    pub fn reap_stale_runs(
+        &self,
+        now: DateTime<Utc>,
+        stale_after: Duration,
+    ) -> Result<usize, DomainError> {
+        let cutoff =
+            now - chrono::Duration::from_std(stale_after).unwrap_or(chrono::Duration::zero());
+        let mut reaped = 0;
+        for routine in self.store.list_routines()? {
+            for mut run in self.store.list_runs(&routine.id, 64)? {
+                if run.status == RunStatus::Running && run.started_at < cutoff {
+                    run.fail(now, "the brain stopped before this run finished");
+                    self.store.update_run(&run)?;
+                    reaped += 1;
+                }
+            }
+        }
+        if reaped > 0 {
+            warn!(reaped, "reaped routine runs a restart cut off");
+        }
+        Ok(reaped)
+    }
+
     pub fn get_run(&self, run_id: &RunId) -> Result<Option<RoutineRun>, DomainError> {
         self.store.get_run(run_id)
     }
@@ -171,6 +197,44 @@ impl RoutineScheduler {
     }
 }
 
+/// Close the run a finished turn was executing, if any.
+///
+/// A free function rather than a method because the runner has the store
+/// and the finished deliveries but not the scheduler: threading the
+/// scheduler into `RunnerEnv` would make the runner depend on routines,
+/// when the dependency is the other way round.
+///
+/// `Ok(false)` means "this delivery was not a routine run", which is the
+/// common case and not an error.
+pub fn settle_delivery(
+    store: &dyn Persistence,
+    delivery: &Delivery,
+    ok: bool,
+    error: Option<&str>,
+) -> Result<bool, DomainError> {
+    let Some(routine_id) = &delivery.routine_id else {
+        return Ok(false);
+    };
+    // The run is the newest `Running` row of this routine whose delivery is
+    // this one; a routine that fired twice has two rows and they are
+    // distinguishable by delivery id.
+    let runs = store.list_runs(routine_id, 32)?;
+    let Some(mut run) = runs.into_iter().find(|run| {
+        run.delivery_id.as_ref() == Some(&delivery.id) && run.status == RunStatus::Running
+    }) else {
+        return Ok(false);
+    };
+    let now = Utc::now();
+    if ok {
+        run.complete(now);
+    } else {
+        run.fail(now, error.unwrap_or("the turn failed"));
+    }
+    store.update_run(&run)?;
+    debug!(run = %run.id, routine = %routine_id, ok, "routine run settled");
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +304,135 @@ mod tests {
         // Delete routine
         scheduler.delete_routine(&routine.id).unwrap();
         assert_eq!(scheduler.get_routine(&routine.id).unwrap(), None);
+    }
+
+    #[test]
+    fn a_fired_run_is_closed_when_its_turn_ends() {
+        // The bug this pins: a run was inserted as `Running` and nothing ever
+        // called `update_run`, so every run the API listed was a permanent lie
+        // and the table grew one dead row per tick.
+        let store = testing::memory_store();
+        let bot = testing::seed_bot(&store, "lead");
+        let scheduler = RoutineScheduler::new(store.clone(), RunnerMap::new());
+
+        let now = Utc::now();
+        let mut routine = scheduler
+            .create_routine(
+                bot.id.clone(),
+                "Nightly",
+                "check the build",
+                RoutineSchedule::Interval { every_secs: 60 },
+                now,
+            )
+            .unwrap();
+        routine.next_run_at = Some(now - Duration::seconds(1));
+        store.update_routine(&routine).unwrap();
+        assert_eq!(scheduler.fire_due(now).unwrap(), 1);
+
+        let delivery = store
+            .queued_deliveries(&bot.id)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.routine_id.as_ref() == Some(&routine.id))
+            .expect("the routine's delivery");
+        let run = scheduler.list_runs(&routine.id, 10).unwrap().remove(0);
+        assert_eq!(run.status, RunStatus::Running);
+
+        assert!(
+            settle_delivery(store.as_ref(), &delivery, true, None).unwrap(),
+            "a routine delivery must settle its run"
+        );
+        let run = scheduler.list_runs(&routine.id, 10).unwrap().remove(0);
+        assert_eq!(run.status, RunStatus::Success);
+        assert!(run.ended_at.is_some());
+
+        // Settling twice is a no-op, not a second write: a turn's deliveries
+        // can be walked more than once and a terminal row must stay terminal.
+        assert!(!settle_delivery(store.as_ref(), &delivery, false, None).unwrap());
+        let run = scheduler.list_runs(&routine.id, 10).unwrap().remove(0);
+        assert_eq!(run.status, RunStatus::Success);
+    }
+
+    #[test]
+    fn a_failed_routine_turn_records_why() {
+        let store = testing::memory_store();
+        let bot = testing::seed_bot(&store, "lead");
+        let scheduler = RoutineScheduler::new(store.clone(), RunnerMap::new());
+        let now = Utc::now();
+        let mut routine = scheduler
+            .create_routine(
+                bot.id.clone(),
+                "Nightly",
+                "check the build",
+                RoutineSchedule::Interval { every_secs: 60 },
+                now,
+            )
+            .unwrap();
+        routine.next_run_at = Some(now - Duration::seconds(1));
+        store.update_routine(&routine).unwrap();
+        scheduler.fire_due(now).unwrap();
+
+        let delivery = store
+            .queued_deliveries(&bot.id)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.routine_id.is_some())
+            .expect("delivery");
+        assert!(settle_delivery(store.as_ref(), &delivery, false, Some("backend 402")).unwrap());
+        let run = scheduler.list_runs(&routine.id, 10).unwrap().remove(0);
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error.as_deref(), Some("backend 402"));
+    }
+
+    #[test]
+    fn a_non_routine_delivery_settles_nothing() {
+        let store = testing::memory_store();
+        let bot = testing::seed_bot(&store, "lead");
+        let delivery =
+            Delivery::owner_message(bot.direct_conversation_id.clone(), bot.id.clone(), "hi");
+        assert!(!settle_delivery(store.as_ref(), &delivery, true, None).unwrap());
+    }
+
+    #[test]
+    fn a_run_a_crash_cut_off_is_reaped_at_boot() {
+        let store = testing::memory_store();
+        let bot = testing::seed_bot(&store, "lead");
+        let scheduler = RoutineScheduler::new(store.clone(), RunnerMap::new());
+        let now = Utc::now();
+        let mut routine = scheduler
+            .create_routine(
+                bot.id.clone(),
+                "Nightly",
+                "check the build",
+                RoutineSchedule::Interval { every_secs: 60 },
+                now,
+            )
+            .unwrap();
+        routine.next_run_at = Some(now - Duration::seconds(1));
+        store.update_routine(&routine).unwrap();
+        scheduler.fire_due(now).unwrap();
+
+        // Not stale yet: a run that just started is legitimately running.
+        assert_eq!(
+            scheduler
+                .reap_stale_runs(now, std::time::Duration::from_secs(6 * 3600))
+                .unwrap(),
+            0
+        );
+
+        let later = now + Duration::hours(7);
+        assert_eq!(
+            scheduler
+                .reap_stale_runs(later, std::time::Duration::from_secs(6 * 3600))
+                .unwrap(),
+            1
+        );
+        let run = scheduler.list_runs(&routine.id, 10).unwrap().remove(0);
+        assert_eq!(run.status, RunStatus::Failed);
+        assert!(
+            run.error.as_deref().unwrap_or_default().contains("stopped"),
+            "{:?}",
+            run.error
+        );
     }
 }

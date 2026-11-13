@@ -305,21 +305,121 @@ async fn tool_calls_assemble_per_index_even_out_of_order() {
     );
 }
 
+/// A stream that simply stops is **not** a complete answer.
+///
+/// This inverts the test that used to pin the opposite behaviour ("EOF is a
+/// normal end"): a proxy that closes mid-answer is byte-for-byte identical to a
+/// finished stream, so inferring `Stop` from EOF committed a half reply into the
+/// transcript that no retry could ever replace. A truncation must be a refusal
+/// that names what is missing, and it must not be retried — retrying a stream
+/// that looks complete burns money and cannot repair the answer.
 #[tokio::test]
-async fn done_keepalive_and_eof_without_done_are_tolerated() {
-    // A comment line, a stream that ends at EOF with no `data: [DONE]` and no
-    // finish_reason: the turn still assembles, and Stop is inferred.
+async fn a_stream_that_ends_without_done_or_finish_reason_is_refused() {
+    // A comment line, then two text deltas, then EOF with neither a
+    // `data: [DONE]` nor a finish_reason.
     let body = format!(
         "{}: keep-alive\n\n{}",
         sse_text([text_delta("split ")]),
         sse_text([text_delta("works")])
     );
-    let (backend, _) = scripted(vec![ScriptedResponse::sse(ragged_chunks(&body, 23))]);
+    let (backend, transport) = scripted(vec![ScriptedResponse::sse(ragged_chunks(&body, 23))]);
     let (result, events) = chat_collect(&backend, chat_request()).await;
-    let response = result.expect("EOF is a normal end");
-    assert_eq!(response.text, "split works");
+    match result {
+        Err(LlmError::Malformed { reason, .. }) => {
+            assert!(reason.contains("[DONE]"), "{reason}");
+            assert!(reason.contains("finish_reason"), "{reason}");
+            assert!(reason.contains("incomplete"), "{reason}");
+            assert!(reason.contains("was not used"), "{reason}");
+        }
+        other => panic!("a truncated stream must be refused, got {other:?}"),
+    }
+    // No `Finished`: a consumer that only acts on `Finished` sees nothing, so
+    // the half reply cannot be mistaken for a completed turn.
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Finished { .. })),
+        "{events:?}"
+    );
+    // Malformed is not retryable: exactly one attempt.
+    assert_eq!(transport.post_count(), 1, "a truncation is not retried");
+}
+
+/// An empty stream that ended without a terminator is a failure too — never an
+/// empty success. "The model produced nothing" and "the connection died before
+/// the model produced anything" are different facts, and only the first is a
+/// turn.
+#[tokio::test]
+async fn an_empty_truncated_stream_is_an_error_not_an_empty_success() {
+    let (backend, transport) = scripted(vec![ScriptedResponse::sse(Vec::<String>::new())]);
+    let (result, events) = chat_collect(&backend, chat_request()).await;
+    match result {
+        Err(LlmError::Malformed { reason, .. }) => {
+            assert!(reason.contains("[DONE]"), "{reason}");
+            assert!(reason.contains("finish_reason"), "{reason}");
+            assert!(reason.contains("no reply"), "{reason}");
+        }
+        other => panic!("an empty truncated stream must be refused, got {other:?}"),
+    }
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(transport.post_count(), 1);
+}
+
+/// The healthy path, pinned so the truncation refusal above cannot be satisfied
+/// by refusing everything: a stream that sends `[DONE]` is a complete turn.
+#[tokio::test]
+async fn a_stream_that_sends_done_is_a_complete_turn() {
+    let (backend, transport) = scripted(vec![sse([
+        text_delta("all "),
+        text_delta("there"),
+        finish_chunk("stop", Some((4, 2))),
+        done(),
+    ])]);
+    let (result, events) = chat_collect(&backend, chat_request()).await;
+    let response = result.expect("a terminated stream is a complete answer");
+    assert_eq!(response.text, "all there");
     assert_eq!(response.finish_reason, FinishReason::Stop);
+    assert_eq!(
+        response.usage,
+        Usage {
+            input_tokens: 4,
+            output_tokens: 2,
+            llm_calls: 1,
+            tool_calls: 0,
+        }
+    );
     assert!(matches!(events.last(), Some(LlmEvent::Finished { .. })));
+    // One attempt, and no attempt boundary: `Restart` marks a retry, never the
+    // start of the turn itself.
+    assert_eq!(transport.post_count(), 1);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::Restart { .. })),
+        "{events:?}"
+    );
+}
+
+/// `[DONE]` alone is a terminator: some servers omit `finish_reason` and rely on
+/// the [OI] sentinel, and that stream is complete (Stop is inferred).
+#[tokio::test]
+async fn done_alone_terminates_a_stream_without_a_finish_reason() {
+    let (backend, _) = scripted(vec![sse([text_delta("done-only"), done()])]);
+    let (result, _) = chat_collect(&backend, chat_request()).await;
+    let response = result.expect("[DONE] is a terminator");
+    assert_eq!(response.text, "done-only");
+    assert_eq!(response.finish_reason, FinishReason::Stop);
+}
+
+/// So is a `finish_reason` without a trailing `[DONE]`: the server said why it
+/// stopped, so the turn ended even though the socket then closed.
+#[tokio::test]
+async fn a_finish_reason_without_done_terminates_the_stream() {
+    let (backend, _) = scripted(vec![sse([text_delta("hi"), finish_chunk("length", None)])]);
+    let (result, _) = chat_collect(&backend, chat_request()).await;
+    let response = result.expect("a finish_reason is a terminator");
+    assert_eq!(response.text, "hi");
+    assert_eq!(response.finish_reason, FinishReason::Length);
 }
 
 #[tokio::test]
@@ -575,7 +675,8 @@ async fn a_mid_stream_reset_restarts_and_the_response_is_authoritative() {
     // The returned response carries ONLY the successful attempt.
     assert_eq!(response.text, "clean second attempt");
     // Deltas are best-effort: the failed attempt's delta was already emitted
-    // and the successful attempt's follows. Callers rely on the response.
+    // and the successful attempt's follows. The `Restart` between them is what
+    // tells a live consumer to discard the first — see the test below.
     let deltas = events
         .iter()
         .filter_map(|e| match e {
@@ -588,6 +689,81 @@ async fn a_mid_stream_reset_restarts_and_the_response_is_authoritative() {
         vec!["partial from attempt one", "clean second attempt"]
     );
     assert_eq!(transport.post_count(), 2);
+}
+
+/// The attempt boundary, at the exact place it matters: attempt one streams
+/// text and then the connection resets; the retry re-streams from zero. A
+/// consumer that rendered attempt one would otherwise append attempt two and
+/// read the two as one answer. `Restart` must arrive **after** attempt one's
+/// deltas and **before** attempt two's first byte.
+#[tokio::test(start_paused = true)]
+async fn a_retry_announces_the_attempt_boundary_before_it_streams() {
+    let partial = sse_text([text_delta("partial from attempt one")]);
+    let (backend, transport) = scripted(vec![
+        ScriptedResponse::stream_fail([partial], "connection reset"),
+        minimal_ok("clean second attempt"),
+    ]);
+    let (result, events) = chat_collect(&backend, chat_request()).await;
+    assert_eq!(
+        result.expect("the retry recovers").text,
+        "clean second attempt"
+    );
+
+    assert_eq!(
+        events,
+        vec![
+            LlmEvent::TextDelta("partial from attempt one".into()),
+            // The boundary: everything above is void.
+            LlmEvent::Restart { attempt: 1 },
+            LlmEvent::TextDelta("clean second attempt".into()),
+            LlmEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                usage: Usage {
+                    llm_calls: 1,
+                    ..Usage::default()
+                },
+                text: "clean second attempt".into(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+            },
+        ]
+    );
+    assert_eq!(transport.post_count(), 2);
+}
+
+/// One `Restart` per retry, numbered by retry ordinal (1, 2, …), each landing
+/// before the attempt it introduces. A first attempt never emits one: there is
+/// nothing to discard yet, so a consumer has no leading no-op to special-case.
+#[tokio::test(start_paused = true)]
+async fn restart_counts_retries_and_only_retries() {
+    let (backend, transport) = scripted(vec![
+        ScriptedResponse::status(500, "first"),
+        ScriptedResponse::status(503, "second"),
+        minimal_ok("third time"),
+    ]);
+    let (result, events) = chat_collect(&backend, chat_request()).await;
+    assert_eq!(result.expect("recovers").text, "third time");
+
+    let restarts = events
+        .iter()
+        .filter_map(|event| match event {
+            LlmEvent::Restart { attempt } => Some(*attempt),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(restarts, vec![1, 2], "{events:?}");
+    // The successful attempt's output follows the last boundary.
+    assert_eq!(
+        events
+            .iter()
+            .filter_map(|event| match event {
+                LlmEvent::TextDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["third time"]
+    );
+    assert_eq!(transport.post_count(), 3);
 }
 
 #[tokio::test]

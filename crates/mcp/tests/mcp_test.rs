@@ -24,7 +24,12 @@ impl ApprovalGate for DummyApproval {
 struct DummyExecutor;
 #[async_trait::async_trait]
 impl NodeExecutor for DummyExecutor {
-    async fn exec(&self, _node: &NodeId, _call: NodeCall) -> Result<ToolResult, ToolError> {
+    async fn exec(
+        &self,
+        _node: &NodeId,
+        _invocation: &Invocation,
+        _call: NodeCall,
+    ) -> Result<ToolResult, ToolError> {
         Ok(ToolResult::text("dummy exec"))
     }
 }

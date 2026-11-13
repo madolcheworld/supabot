@@ -1,22 +1,32 @@
 //! CLI-harness adapters: backends that drive an agent CLI instead of an HTTP
-//! API. This milestone ships the **skeleton** for `claude -p`; a later
-//! milestone finishes it. What the finished adapter will do:
+//! API. This milestone ships `claude -p` far enough to run a turn: `chat`
+//! spawns the harness, sends one stream-json user message, reads its NDJSON
+//! events back and returns the assembled reply. What it does **not** yet do is
+//! steer a running turn or carry a native session across a restart, so
+//! `capabilities()` says so (see the two flags below). What `chat` does today:
 //!
 //! * spawn
 //!   `claude -p --output-format stream-json --input-format stream-json --mcp-config <file> [--resume <id>]`
-//!   as a long-lived child with piped stdio;
-//! * write each turn as a stream-json user message on stdin (steering =
-//!   writing another message while the turn runs, which the harness
-//!   supports — hence `capabilities().steer == true`);
+//!   as a child with piped stdio, per turn;
+//! * write the turn as a stream-json user message on stdin and then **close
+//!   stdin** (`drop(stdin)` in `chat`). Steering would mean writing another
+//!   message while the turn runs, but `ChatRequest` has no channel to carry
+//!   one — the runner's steering is a queue-level delivery, not a model call —
+//!   so `capabilities().steer` is `false`. The flag must not be flipped
+//!   without both a steer channel in the port and an open stdin;
+//!   `steer_capability_matches_what_chat_does` pins the flag to the observed
+//!   stdin behaviour;
 //! * read the harness's NDJSON events from stdout and normalize them into
 //!   [`LlmEvent`]s: assistant text deltas, `thinking` blocks as
 //!   `ReasoningDelta`, `tool_use`/`tool_result` as informational events (the
 //!   harness executes tools itself through the MCP servers our
 //!   `mcp_config` points at), and the final `result` message as `Finished`;
 //! * keep the `session_id` from the harness's `init` message so the next turn
-//!   resumes with `--resume <id>` — that is what makes
-//!   `capabilities().survives_restart` true and what lands in
-//!   `BotSessionRecord::native_session_id`.
+//!   in *this process* resumes with `--resume <id>`. That id lives only in
+//!   this adapter's memory: nothing writes it to
+//!   `BotSessionRecord::native_session_id` and nothing replays it through
+//!   `extra_body["native_session_id"]`, so a brain restart starts a fresh
+//!   harness session — hence `capabilities().survives_restart == false`.
 //!
 //! The crucial capability invariant is already load-bearing today:
 //! `tool_calls == false`. The harness runs its **own** tool loop through our
@@ -25,10 +35,22 @@
 //! consumed. [`BackendKind::owns_tool_loop`] says the same thing from the
 //! config side.
 //!
-//! What already works in this milestone: construction from a
-//! [`BackendSpec`] and an honest [`LlmBackend::probe`] that checks the binary
-//! exists and answers `--version` — enough for the Settings screen to show
-//! "claude CLI installed / not found" before the adapter itself exists.
+//! Also real today: construction from a [`BackendSpec`] and an honest
+//! [`LlmBackend::probe`] that checks the binary exists and answers
+//! `--version`, so the Settings screen can show "claude CLI installed / not
+//! found" without spending a model call.
+//!
+//! Our tools reach the harness through MCP, not through the response:
+//! `crates/mcp` serves the registry, the brain writes
+//! `<data>/swarmbot-mcp.json` (owner token in an `Authorization` header), and
+//! this adapter passes `--mcp-config` when it can locate that file —
+//! `options.mcp_config_path`, then `<config_dir>/swarmbot-mcp.json`, then
+//! `options.data_dir/swarmbot-mcp.json`. The spec has to name one of those; the
+//! adapter does not guess the brain's data dir.
+//!
+//! Still missing, and therefore never claimed: a mid-turn steer channel in the
+//! port. Steering is a queue-level delivery today, so no `ChatRequest` can
+//! carry one.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -207,10 +229,23 @@ impl LlmBackend for ClaudeCli {
             tool_calls: false,
             // `thinking` blocks arrive in the NDJSON stream.
             reasoning: true,
-            // stream-json input accepts a new user message mid-turn.
-            steer: true,
-            // `--resume <session_id>` picks the session up after a restart.
-            survives_restart: true,
+            // NOT steered. `chat` writes the turn's user message and drops
+            // stdin before reading stdout, so a second message cannot reach the
+            // harness; and there is nowhere to get one from — `ChatRequest`
+            // carries no mid-turn channel, and the runner's steering is a
+            // queue-level delivery between rounds, not a model call. Claiming
+            // `true` here would advertise something nothing can exercise; the
+            // `steer_capability_matches_what_chat_does` test pins this flag to
+            // the stdin behaviour it depends on.
+            steer: false,
+            // NOT across a brain restart. `--resume <id>` works when a caller
+            // supplies the id, but the id lives only in this adapter's memory:
+            // nothing persists it into `BotSessionRecord::native_session_id`
+            // and nothing sends it back through
+            // `extra_body["native_session_id"]`, so a restarted brain starts a
+            // fresh harness session. Within one process the adapter's own map
+            // still bridges turns; that is not what this flag promises.
+            survives_restart: false,
         }
     }
 
@@ -366,6 +401,11 @@ impl LlmBackend for ClaudeCli {
                 reason: format!("failed to flush child stdin: {e}"),
             });
         }
+        // Closing stdin is what makes mid-turn steering impossible: a steer
+        // would be another line written here while stdout is being read. There
+        // is no channel to get one from (`ChatRequest` has none), so the pipe
+        // is closed and `capabilities().steer` is false. The two facts are
+        // pinned together by `steer_capability_matches_what_chat_does`.
         drop(stdin);
 
         let stdout = child.stdout.take().ok_or_else(|| LlmError::Unavailable {
@@ -533,15 +573,37 @@ impl LlmBackend for ClaudeCli {
                 accumulated_text = r.to_string();
                 let _ = emit(&events, LlmEvent::TextDelta(r.to_string())).await;
             }
-        } else if let Ok(status) = exit_status
-            && !status.success()
-        {
-            return Err(LlmError::Unavailable {
-                backend: self.spec.id.clone(),
-                reason: format!(
-                    "`{}` exited prematurely with status: {status}",
-                    self.binary.display()
-                ),
+        } else {
+            // No `result` message: the harness never said the turn was
+            // finished. A clean exit is not a terminator — every stream-json
+            // turn ends with a `result` object (it carries the usage and the
+            // session id this adapter already depends on), so its absence means
+            // the output was cut short: a wrapper swallowed the line, or the
+            // harness died after flushing what it had. Returning the text that
+            // did arrive would put half an answer in the transcript — the same
+            // lie `consume_sse` refuses for the HTTP adapter.
+            let backend = self.spec.id.clone();
+            return Err(match exit_status {
+                Ok(status) if !status.success() => LlmError::Unavailable {
+                    backend,
+                    reason: format!(
+                        "`{}` exited prematurely with status: {status}",
+                        self.binary.display()
+                    ),
+                },
+                Ok(status) => LlmError::Malformed {
+                    backend,
+                    reason: format!(
+                        "`{}` exited with status {status} without a `result` message: the \
+                         stream ended before the turn was finished, so the reply is incomplete \
+                         and was not used",
+                        self.binary.display()
+                    ),
+                },
+                Err(error) => LlmError::Unavailable {
+                    backend,
+                    reason: format!("cannot wait for `{}`: {error}", self.binary.display()),
+                },
             });
         }
 
@@ -682,6 +744,42 @@ mod tests {
         }
     }
 
+    /// One turn against a mock script, with the test-harness race handled.
+    ///
+    /// Why this exists: a mock harness is a script file the test writes and
+    /// immediately executes, while sibling tests spawn children in parallel. A
+    /// `fork` from a sibling can inherit the write fd of *this* script, and the
+    /// kernel then refuses our `exec` with `ETXTBSY` ("Text file busy"). That is
+    /// a property of running spawn tests inside one process, not of the
+    /// adapter, so the turn is retried — bounded (20 tries, 10 ms apart) and
+    /// only for that exact error, so every real failure still surfaces on the
+    /// first attempt.
+    async fn chat_turn(
+        harness: &ClaudeCli,
+        request: ChatRequest,
+    ) -> (Result<ChatResponse, LlmError>, Vec<LlmEvent>) {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let (tx, mut rx) = mpsc::channel(16);
+            let result = harness
+                .chat(request.clone(), tx, CancellationToken::new())
+                .await;
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            let busy = matches!(
+                &result,
+                Err(LlmError::Unavailable { reason, .. }) if reason.contains("Text file busy")
+            );
+            if !busy || attempt >= 20 {
+                return (result, events);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn probe_works_with_a_stand_in_binary() {
         // /bin/echo stands in for `claude`: the probe must only depend on
@@ -755,25 +853,18 @@ EOF
         options.insert("binary".into(), json!(script.display().to_string()));
         let harness = ClaudeCli::from_spec(spec_with_options(options)).expect("valid spec");
 
-        let (tx, mut rx) = mpsc::channel(16);
-        let response = harness
-            .chat(
-                ChatRequest::new("claude-sonnet", "You are helpful"),
-                tx,
-                CancellationToken::new(),
-            )
-            .await
-            .expect("chat completes");
+        let (result, received) = chat_turn(
+            &harness,
+            ChatRequest::new("claude-sonnet", "You are helpful"),
+        )
+        .await;
+        let response = result.expect("chat completes");
 
         assert_eq!(response.text, "Mock response!");
         assert_eq!(response.usage.input_tokens, 15);
         assert_eq!(response.usage.output_tokens, 4);
         assert_eq!(harness.last_session_id(), Some("mock-session-42".into()));
 
-        let mut received = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            received.push(event);
-        }
         assert_eq!(
             received,
             vec![
@@ -827,15 +918,8 @@ EOF
         let harness = ClaudeCli::from_spec(spec_with_options(options)).expect("valid spec");
         harness.set_last_session_id(Some("prior-session-123".into()));
 
-        let (tx, _rx) = mpsc::channel(16);
-        let resp = harness
-            .chat(
-                ChatRequest::new("claude-sonnet", ""),
-                tx,
-                CancellationToken::new(),
-            )
-            .await
-            .expect("chat completes");
+        let (result, _events) = chat_turn(&harness, ChatRequest::new("claude-sonnet", "")).await;
+        let resp = result.expect("chat completes");
 
         assert_eq!(resp.text, "Resumed turn!");
         assert_eq!(harness.last_session_id(), Some("mock-session-99".into()));
@@ -872,15 +956,8 @@ EOF
         options.insert("binary".into(), json!(script.display().to_string()));
         let harness = ClaudeCli::from_spec(spec_with_options(options)).expect("valid spec");
 
-        let (tx, _rx) = mpsc::channel(16);
-        let err = harness
-            .chat(
-                ChatRequest::new("claude-sonnet", ""),
-                tx,
-                CancellationToken::new(),
-            )
-            .await
-            .expect_err("should fail on is_error");
+        let (result, _events) = chat_turn(&harness, ChatRequest::new("claude-sonnet", "")).await;
+        let err = result.expect_err("should fail on is_error");
 
         match err {
             LlmError::Unavailable { reason, .. } => {
@@ -888,6 +965,57 @@ EOF
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+
+    /// A harness that exits cleanly after streaming part of an answer, without
+    /// the stream-json `result` message, did not finish the turn. Committing
+    /// what arrived is the same lie as accepting an SSE stream that never sent
+    /// `[DONE]`: half an answer in the transcript that no retry can replace.
+    #[tokio::test]
+    async fn a_turn_without_a_result_message_is_refused_not_half_saved() {
+        let temp = TempDir::new("no-result");
+        let script = temp.path().join("mock_no_result.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+cat << 'EOF'
+{"type":"system","subtype":"init","session_id":"cut-session"}
+{"type":"content_block_delta","delta":{"type":"text_delta","text":"half an ans"}}
+EOF
+exit 0
+"#,
+        )
+        .expect("write mock script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let mut options = serde_json::Map::new();
+        options.insert("binary".into(), json!(script.display().to_string()));
+        let harness = ClaudeCli::from_spec(spec_with_options(options)).expect("valid spec");
+
+        let (result, events) = chat_turn(&harness, ChatRequest::new("", "")).await;
+        match result {
+            Err(LlmError::Malformed { reason, .. }) => {
+                assert!(reason.contains("result"), "{reason}");
+                assert!(reason.contains("incomplete"), "{reason}");
+                assert!(reason.contains("was not used"), "{reason}");
+            }
+            other => panic!("a turn without a `result` message must be refused, got {other:?}"),
+        }
+        // The partial delta may have been streamed, but no `Finished` claims the
+        // turn is complete.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LlmEvent::Finished { .. })),
+            "{events:?}"
+        );
+        // Nothing was recorded as the session to resume.
+        assert_eq!(harness.last_session_id(), None);
     }
 
     #[tokio::test]
@@ -915,20 +1043,34 @@ sleep 10
         options.insert("binary".into(), json!(script.display().to_string()));
         let harness = ClaudeCli::from_spec(spec_with_options(options)).expect("valid spec");
 
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            cancel_clone.cancel();
-        });
+        // A sibling test's `fork` can inherit the fd of the mock script being
+        // executed, so the first spawn can fail with ETXTBSY before the
+        // cancellation ever matters. Retry that one error, exactly as
+        // `chat_turn` does, so this test measures cancellation rather than a
+        // fork race — the same bounded retry, never a blanket sleep.
+        let mut attempt = 0u32;
+        let err = loop {
+            attempt += 1;
+            let cancel = CancellationToken::new();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancel_clone.cancel();
+            });
+            let (tx, _rx) = mpsc::channel(16);
+            match harness.chat(ChatRequest::new("", ""), tx, cancel).await {
+                Ok(_) => panic!("a cancelled turn must not report success"),
+                Err(LlmError::Unavailable { reason, .. })
+                    if reason.contains("Text file busy") && attempt < 20 =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                Err(err) => break err,
+            }
+        };
 
-        let (tx, _rx) = mpsc::channel(16);
-        let err = harness
-            .chat(ChatRequest::new("claude-sonnet", ""), tx, cancel)
-            .await
-            .expect_err("should cancel");
-
-        assert!(matches!(err, LlmError::Cancelled));
+        assert!(matches!(err, LlmError::Cancelled), "got {err:?}");
     }
 
     #[test]
@@ -956,10 +1098,101 @@ sleep 10
         assert!(capabilities.streaming);
         // The load-bearing one: the runner must not drive a tool loop.
         assert!(!capabilities.tool_calls);
-        assert!(capabilities.steer);
-        assert!(capabilities.survives_restart);
+        // Neither of these is implemented by the port yet, so neither may be
+        // claimed: steering needs a mid-turn channel `ChatRequest` does not
+        // have (and `chat` closes stdin), and a restart loses the native
+        // session id because nothing persists it. The behaviour tests below
+        // pin both to what the adapter actually does.
+        assert!(!capabilities.steer);
+        assert!(!capabilities.survives_restart);
         assert_eq!(harness.kind(), BackendKind::ClaudeCli);
         assert!(BackendKind::ClaudeCli.owns_tool_loop());
+    }
+
+    /// The `steer` flag must equal what `chat()` can actually do. `chat` writes
+    /// the turn's user message and then drops stdin before reading stdout, so a
+    /// second (steering) message cannot reach the harness. The mock harness
+    /// reports which of the two happened; if someone keeps stdin open to
+    /// implement steering, this test fails until the flag (and the port) say
+    /// so — the flag may never be a lie in either direction.
+    #[tokio::test]
+    async fn steer_capability_matches_what_chat_does() {
+        let temp = TempDir::new("steer");
+        let script = temp.path().join("mock_steer_probe.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+# The adapter writes one user message and then either keeps stdin open for a
+# mid-turn steer or closes it. Report which, as the turn's answer.
+IFS= read -r first
+if IFS= read -r second; then
+  steer_state="open"
+else
+  steer_state="closed"
+fi
+printf '{"type":"system","subtype":"init","session_id":"steer-probe"}\n'
+printf '{"type":"result","result":"steer:%s","session_id":"steer-probe","usage":{"input_tokens":1,"output_tokens":1},"is_error":false}\n' "$steer_state"
+"#,
+        )
+        .expect("write mock script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let mut options = serde_json::Map::new();
+        options.insert("binary".into(), json!(script.display().to_string()));
+        let mut spec = spec_with_options(options);
+        // A harness that kept stdin open without ever closing it would hang on
+        // the second read; the timeout turns that into a failure instead of a
+        // hung suite.
+        spec.timeout_secs = 10;
+        let harness = ClaudeCli::from_spec(spec).expect("valid spec");
+
+        let (result, _events) = chat_turn(&harness, ChatRequest::new("", "")).await;
+        let response = result.expect("chat completes");
+
+        assert_eq!(
+            response.text, "steer:closed",
+            "chat must close stdin after the prompt"
+        );
+        assert!(
+            !harness.capabilities().steer,
+            "steer must stay false while chat() closes stdin and ChatRequest has no steer channel"
+        );
+    }
+
+    /// `survives_restart` means a *new* adapter (what a restarted brain builds)
+    /// picks the harness session back up. It cannot: the session id lives only
+    /// in the old adapter's memory, because nothing writes
+    /// `BotSessionRecord::native_session_id` and nothing replays it through
+    /// `extra_body["native_session_id"]`. This pins the claim to that fact.
+    #[test]
+    fn a_fresh_adapter_after_a_restart_has_no_session_to_resume() {
+        let temp = TempDir::new("restart");
+        let mut options = serde_json::Map::new();
+        options.insert("binary".into(), json!("/bin/echo"));
+        options.insert(
+            "config_dir".into(),
+            json!(temp.path().display().to_string()),
+        );
+
+        let before = ClaudeCli::from_spec(spec_with_options(options.clone())).expect("valid");
+        before.set_last_session_id(Some("session-before-restart".into()));
+        assert_eq!(
+            before.last_session_id().as_deref(),
+            Some("session-before-restart")
+        );
+
+        // The adapter a restarted brain constructs knows nothing about it.
+        let after_restart = ClaudeCli::from_spec(spec_with_options(options)).expect("valid");
+        assert_eq!(after_restart.last_session_id(), None);
+        assert!(
+            !after_restart.capabilities().survives_restart,
+            "no persisted session id means no native resume across a restart"
+        );
     }
 
     #[test]
@@ -1031,29 +1264,17 @@ EOF
         // Turn 1 for bot-a: must NOT resume global-leak-id.
         let mut req_a1 = ChatRequest::new("claude-sonnet", "");
         req_a1.cwd = Some(ws_a.clone());
-        let (tx, _rx) = mpsc::channel(4);
-        harness
-            .chat(req_a1, tx, CancellationToken::new())
-            .await
-            .expect("a1");
+        chat_turn(&harness, req_a1).await.0.expect("a1");
 
         // Turn 1 for bot-b: must NOT resume bot-a's sid-bot-a or global-leak-id.
         let mut req_b1 = ChatRequest::new("claude-sonnet", "");
         req_b1.cwd = Some(ws_b.clone());
-        let (tx, _rx) = mpsc::channel(4);
-        harness
-            .chat(req_b1, tx, CancellationToken::new())
-            .await
-            .expect("b1");
+        chat_turn(&harness, req_b1).await.0.expect("b1");
 
         // Turn 2 for bot-a: resumes bot-a's own sid-bot-a.
         let mut req_a2 = ChatRequest::new("claude-sonnet", "");
         req_a2.cwd = Some(ws_a.clone());
-        let (tx, _rx) = mpsc::channel(4);
-        harness
-            .chat(req_a2, tx, CancellationToken::new())
-            .await
-            .expect("a2");
+        chat_turn(&harness, req_a2).await.0.expect("a2");
 
         // Turn 3 for bot-a with explicit native_session_id: null forces fresh session.
         let mut req_a3 = ChatRequest::new("claude-sonnet", "");
@@ -1061,11 +1282,7 @@ EOF
         req_a3
             .extra_body
             .insert("native_session_id".into(), Value::Null);
-        let (tx, _rx) = mpsc::channel(4);
-        harness
-            .chat(req_a3, tx, CancellationToken::new())
-            .await
-            .expect("a3");
+        chat_turn(&harness, req_a3).await.0.expect("a3");
 
         let logged = fs::read_to_string(&log_file).expect("read log");
         let lines: Vec<&str> = logged.lines().collect();

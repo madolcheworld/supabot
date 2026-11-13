@@ -637,7 +637,10 @@ impl NodeHandler {
         }
 
         let node_id = self.runtime.identity.node_id().clone();
-        let result = self.runtime.executor.exec(&node_id, call).await;
+        // `inv` is the invocation that arrived with the request, so the executor
+        // runs the call under the caller's own attribution — the same one this
+        // handler audits the line against above.
+        let result = self.runtime.executor.exec(&node_id, &inv, call).await;
         match result {
             Ok(result) => {
                 let bytes = result.text_only().len();

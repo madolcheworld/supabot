@@ -22,7 +22,10 @@
 //! The node gateway speaks `swarmbot-node-protocol` v1: `POST /node/pair` redeems
 //! a single-use code for a node identity, and `GET /node` upgrades to the control
 //! socket only after a signature over a fresh nonce verifies. The MCP gateway on
-//! the internal listener serves `/mcp` and per-turn `/mcp/t/{token}` endpoints.
+//! the internal listener serves `/mcp` (the whole tool registry, behind the owner
+//! gate) and per-turn `/mcp/t/{token}` endpoints (whose token is the credential).
+//! The internal listener is loopback-only: `internal_addr` is refused at resolve
+//! time unless it names `127.0.0.0/8` or `::1`.
 //!
 //! # The boot sequence
 //!
@@ -209,10 +212,21 @@ impl Brain {
         if resolved.expiry_ticker {
             swarm.start_expiry_ticker();
             info!(step = "ticker", "unattended approval requests will expire");
+            // Routines and housekeeping ride the same switch: `--no-ticker` is
+            // the operator saying "nothing in this brain wakes itself up", and
+            // a scheduled routine that fires anyway would be exactly the
+            // surprise that flag exists to prevent.
+            swarm.start_routine_ticker();
+            swarm.start_housekeeping_ticker();
+            info!(
+                step = "ticker",
+                "routines fire on schedule; the live-event log is bounded"
+            );
         } else {
             warn!(
                 step = "ticker",
-                "--no-ticker: unattended approval requests will NOT expire"
+                "--no-ticker: unattended approval requests will NOT expire, \
+                 scheduled routines will NOT fire, and the live-event log will grow unbounded"
             );
         }
 

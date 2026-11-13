@@ -16,10 +16,13 @@
 //! * `cursor` is the newest [`LiveCursor`] seen; a reconnect resumes from it.
 //! * collections are upserted by id, so an event for an unknown id inserts
 //!   rather than being dropped on the floor.
+//! * a toast is **time-bounded**: `toast_at` records when it was set, and
+//!   [`AppState::expire_toast`] drops it once [`TOAST_TTL`] has passed. A
+//!   status line that outlives its cause is a lie about the present.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use swarmbot_client::{BackendProbe, BackendView, Health, PairingCode};
 use swarmbot_contracts::{
@@ -78,6 +81,14 @@ pub enum DeleteTarget {
     Bot { id: BotId, label: String },
     Group { id: ConversationId, title: String },
 }
+
+/// How long a toast stays on screen once it is set.
+///
+/// Long enough to read a failed send or a refused settings save, short enough
+/// that a stale success line cannot be mistaken for the current state. The
+/// ticker in `worker.rs` is what actually clears it; this constant is the one
+/// place the window is defined, so the reducer, the view and their tests agree.
+pub const TOAST_TTL: Duration = Duration::from_secs(6);
 
 /// Everything the app knows, plus the owner's navigation state.
 #[derive(Debug)]
@@ -168,6 +179,12 @@ pub struct AppState {
     pub spinner_phase: usize,
     /// A short status line for the last action ("sent", "stopped", an error).
     pub toast: Option<String>,
+    /// When `toast` was set, so the ticker can expire it ([`TOAST_TTL`]).
+    ///
+    /// `None` while no toast is showing. A view that writes `toast` directly
+    /// (the composer's optimistic refusal) leaves this `None`; the first tick
+    /// stamps it, so nothing can live forever (see [`AppState::expire_toast`]).
+    pub toast_at: Option<Instant>,
 
     // --- per-entry view state (collapsibles) ------------------------------
     /// Reasoning blocks and tool-call cards the owner has expanded.
@@ -235,6 +252,7 @@ impl AppState {
             login_error: None,
             spinner_phase: 0,
             toast: None,
+            toast_at: None,
             expanded: HashSet::new(),
             expanded_full: HashSet::new(),
             dismissed: HashSet::new(),
@@ -733,6 +751,59 @@ impl AppState {
         entries.dedup_by(|a, b| a.id == b.id);
         self.entries.insert(id, entries);
     }
+
+    // --- the transient status line ----------------------------------------
+
+    /// Set the one-line status message and stamp when it was set.
+    ///
+    /// The stamp is what lets the message expire: a "settings saved" that is
+    /// still on screen an hour later is a claim about the present that is no
+    /// longer true. Setting a new toast **restarts** the window instead of
+    /// inheriting the old one's clock, so a burst of failures stays readable.
+    pub fn set_toast(&mut self, message: impl Into<String>, now: Instant) {
+        self.toast = Some(message.into());
+        self.toast_at = Some(now);
+    }
+
+    /// Clear the toast once it has outlived [`TOAST_TTL`] at `now`; report
+    /// whether the state changed so the caller knows a redraw is owed.
+    ///
+    /// A toast with no stamp was written straight into the field by a view (the
+    /// composer's "offline — the message was not sent"); the first tick that
+    /// sees it stamps it rather than treating "no timestamp" as "never expires",
+    /// which is the bug this exists to prevent.
+    pub fn expire_toast(&mut self, now: Instant) -> bool {
+        match (self.toast.is_some(), self.toast_at) {
+            (false, _) => {
+                self.toast_at = None;
+                false
+            }
+            (true, None) => {
+                self.toast_at = Some(now);
+                false
+            }
+            (true, Some(at)) if now.saturating_duration_since(at) >= TOAST_TTL => {
+                self.toast = None;
+                self.toast_at = None;
+                true
+            }
+            (true, Some(_)) => false,
+        }
+    }
+
+    /// The toast text if it is still inside its window at `now`.
+    ///
+    /// An unstamped toast is visible: it was just written by a view and the
+    /// next tick stamps it (see [`AppState::expire_toast`]). An expired one is
+    /// hidden even before the ticker clears the field, so the view never shows
+    /// a message the state has already outlived.
+    pub fn visible_toast(&self, now: Instant) -> Option<&str> {
+        let text = self.toast.as_deref()?;
+        match self.toast_at {
+            Some(at) if now.saturating_duration_since(at) >= TOAST_TTL => None,
+            _ => Some(text),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -890,5 +961,69 @@ mod tests {
         assert_eq!(state.edit_group_title_seed.as_deref(), Some("Ops"));
         assert_eq!(state.edit_group_members, vec![b1, b2.clone()]);
         assert_eq!(state.edit_group_lead, Some(b2));
+    }
+
+    #[test]
+    fn a_toast_set_through_the_helper_is_stamped_and_expires_inside_its_window() {
+        let mut state = AppState::new("http://brain.test");
+        let set_at = Instant::now();
+        state.set_toast("send failed: transport", set_at);
+        assert_eq!(state.toast_at, Some(set_at));
+        assert_eq!(state.visible_toast(set_at), Some("send failed: transport"));
+
+        // Still inside the window: visible, and the ticker must not clear it.
+        let almost = set_at + TOAST_TTL - Duration::from_millis(1);
+        assert!(!state.expire_toast(almost));
+        assert_eq!(state.visible_toast(almost), Some("send failed: transport"));
+
+        // The window is over: the tick clears it and says so, so the caller
+        // knows to redraw the bar away.
+        let after = set_at + TOAST_TTL;
+        assert!(state.expire_toast(after), "the tick that clears it says so");
+        assert_eq!(state.toast, None);
+        assert_eq!(state.toast_at, None);
+        assert_eq!(state.visible_toast(after), None);
+    }
+
+    #[test]
+    fn a_toast_written_without_a_stamp_is_stamped_on_the_first_tick_and_then_expires() {
+        // A view may write the field directly (the composer's optimistic
+        // refusal). "No timestamp" must not mean "never expires".
+        let mut state = AppState::new("http://brain.test");
+        state.toast = Some("offline — the message was not sent".to_string());
+        let first_tick = Instant::now();
+        assert!(
+            state.visible_toast(first_tick).is_some(),
+            "it shows immediately, before the ticker has seen it"
+        );
+        assert!(
+            !state.expire_toast(first_tick),
+            "the first tick only stamps it"
+        );
+        assert_eq!(state.toast_at, Some(first_tick));
+        assert_eq!(
+            state.visible_toast(first_tick + Duration::from_secs(1)),
+            Some("offline — the message was not sent")
+        );
+        assert!(state.expire_toast(first_tick + TOAST_TTL));
+        assert_eq!(state.toast, None);
+    }
+
+    #[test]
+    fn a_second_toast_restarts_the_window_instead_of_inheriting_the_first() {
+        let mut state = AppState::new("http://brain.test");
+        let first = Instant::now();
+        state.set_toast("stopped", first);
+        // Two seconds later the owner hits something else; the new toast gets
+        // its own full window, not the first one's remainder.
+        let second = first + Duration::from_secs(2);
+        state.set_toast("nothing was running", second);
+        assert_eq!(state.toast.as_deref(), Some("nothing was running"));
+        assert_eq!(state.toast_at, Some(second));
+        // The first toast's deadline has passed; the second is still up.
+        assert!(!state.expire_toast(first + TOAST_TTL));
+        assert_eq!(state.toast.as_deref(), Some("nothing was running"));
+        assert!(state.expire_toast(second + TOAST_TTL));
+        assert_eq!(state.toast, None);
     }
 }

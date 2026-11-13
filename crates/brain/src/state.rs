@@ -71,6 +71,7 @@ impl AppState {
             swarm: Arc::downgrade(&swarm),
             turns: Arc::clone(&turn_mcp),
             internal_addr: Arc::clone(&internal_addr),
+            secrets: Arc::clone(&secrets),
         }));
         Self {
             swarm,
@@ -178,10 +179,13 @@ impl AppState {
 ///
 /// Holds a [`Weak`] back-reference to [`Swarm`] rather than an [`Arc`] because
 /// [`Swarm`] owns this provider via `mcp_provider`, avoiding a reference cycle.
+/// It holds the log scrubber's registry by value because the per-turn token is a
+/// credential that only this provider ever sees.
 struct BrainMcpProvider {
     swarm: Weak<Swarm>,
     turns: Arc<TurnMcpRegistry>,
     internal_addr: Arc<RwLock<Option<SocketAddr>>>,
+    secrets: Arc<SecretRegistry>,
 }
 
 impl McpTurnProvider for BrainMcpProvider {
@@ -220,10 +224,20 @@ impl McpTurnProvider for BrainMcpProvider {
             in_task: req.in_task,
         });
         let handle = self.turns.register_handle(server);
-        let url = format!("http://{addr}/mcp/t/{}", handle.token());
+        // The token is a bearer credential that travels in a URL *path*, and the
+        // access log renders paths verbatim. It is registered with the scrubber
+        // before the URL exists, and forgotten when the turn's registration
+        // drops: after that the registry refuses the token, so it authenticates
+        // nothing and keeping it in the scrubber set forever would only make
+        // every log line slower.
+        let token = handle.token().to_string();
+        self.secrets.register(token.clone());
+        let url = format!("http://{addr}/mcp/t/{token}");
         let specs = vec![McpServerSpec::http("swarmbot", url)];
+        let secrets = Arc::clone(&self.secrets);
         Ok(McpTurnRegistration::new(specs, move || {
             let _ = handle.unregister();
+            secrets.forget(&token);
         }))
     }
 }
@@ -373,6 +387,11 @@ mod tests {
             "without a bound internal listener, no MCP server URL can be advertised"
         );
         assert_eq!(state.turn_mcp.len(), 0);
+        assert_eq!(
+            state.secrets.len(),
+            0,
+            "an unbound registration mints no token to watch"
+        );
 
         let bound_addr: SocketAddr = "127.0.0.1:43210".parse().expect("valid addr");
         state.set_internal_addr(bound_addr);
@@ -391,11 +410,30 @@ mod tests {
             .strip_prefix("http://127.0.0.1:43210/mcp/t/")
             .expect("url includes /mcp/t/{token}");
         assert!(state.turn_mcp.get_service(token).is_some());
+        // The token travels in the URL path and the access log renders paths
+        // verbatim, so it is a watched secret for as long as the turn lives.
+        assert_eq!(
+            state.secrets.len(),
+            1,
+            "the per-turn token is registered with the log scrubber"
+        );
+        assert!(
+            !state
+                .secrets
+                .redact(&format!("GET /mcp/t/{token}"))
+                .contains(token),
+            "the scrubber would catch the token in a stray log line"
+        );
 
         drop(reg);
         assert!(
             state.turn_mcp.get_service(token).is_none(),
             "dropping McpTurnRegistration must unregister the turn endpoint"
+        );
+        assert_eq!(
+            state.secrets.len(),
+            0,
+            "and the dead token is forgotten rather than watched forever"
         );
         swarm.shutdown().await;
     }

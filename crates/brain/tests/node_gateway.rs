@@ -25,8 +25,9 @@ use std::time::Duration;
 use futures::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 
+use swarmbot_contracts::Invocation;
 use swarmbot_contracts::PROTOCOL_VERSION;
-use swarmbot_contracts::id::{BotId, NodeId};
+use swarmbot_contracts::id::{BotId, ConversationId, NodeId};
 use swarmbot_contracts::node::{
     Capabilities, NodeRoot, PairRequest, PairResponse, PolicyCeiling, ProtocolRange,
 };
@@ -48,6 +49,13 @@ use swarmbot_tools::NodeCall;
 
 /// How long a test waits for something that is already on its way.
 const BUDGET: Duration = Duration::from_secs(30);
+
+/// The invocation a test acts as when it drives the [`swarmbot_tools::NodeExecutor`]
+/// port itself rather than through a bot turn: these tests are the caller, so
+/// they say who they are instead of leaving the brain to infer it.
+fn as_caller() -> Invocation {
+    Invocation::new(BotId::new(), ConversationId::new())
+}
 
 // --- the node side -----------------------------------------------------------
 
@@ -829,6 +837,7 @@ async fn a_remote_call_crosses_the_socket_and_comes_back() {
         .nodes
         .exec(
             &id,
+            &as_caller(),
             NodeCall::FsStat {
                 path: "notes/todo.md".to_string(),
             },
@@ -860,6 +869,7 @@ async fn a_remote_call_crosses_the_socket_and_comes_back() {
         .nodes
         .exec(
             &id,
+            &as_caller(),
             NodeCall::FsStat {
                 path: "gone.txt".to_string(),
             },
@@ -879,6 +889,7 @@ async fn a_remote_call_crosses_the_socket_and_comes_back() {
         .nodes
         .exec(
             &id,
+            &as_caller(),
             NodeCall::FsRead {
                 path: "notes/todo.md".to_string(),
                 offset: None,
@@ -898,6 +909,7 @@ async fn a_remote_call_crosses_the_socket_and_comes_back() {
         .nodes
         .exec(
             &id,
+            &as_caller(),
             NodeCall::ShellExec {
                 command: "echo hello".to_string(),
                 cwd: None,
@@ -924,6 +936,7 @@ async fn a_remote_call_crosses_the_socket_and_comes_back() {
         .nodes
         .exec(
             &id,
+            &as_caller(),
             NodeCall::ShellExec {
                 command: "false".to_string(),
                 cwd: None,
@@ -948,6 +961,7 @@ async fn a_remote_call_crosses_the_socket_and_comes_back() {
         .nodes
         .exec(
             &id,
+            &as_caller(),
             NodeCall::FsStat {
                 path: "/etc/shadow".to_string(),
             },
@@ -982,6 +996,7 @@ async fn a_remote_call_crosses_the_socket_and_comes_back() {
         .nodes
         .exec(
             &id,
+            &as_caller(),
             NodeCall::ShellExec {
                 command: "true".to_string(),
                 cwd: None,
@@ -998,6 +1013,7 @@ async fn a_remote_call_crosses_the_socket_and_comes_back() {
         .nodes
         .exec(
             &id,
+            &as_caller(),
             NodeCall::FsStat {
                 path: ".".to_string(),
             },
@@ -1019,6 +1035,7 @@ async fn a_remote_call_crosses_the_socket_and_comes_back() {
         .nodes
         .exec(
             &NodeId::new(),
+            &as_caller(),
             NodeCall::FsStat {
                 path: ".".to_string(),
             },
@@ -1064,6 +1081,7 @@ async fn revoking_a_connected_node_closes_it_with_4401() {
         .nodes
         .exec(
             &id,
+            &as_caller(),
             NodeCall::FsStat {
                 path: ".".to_string(),
             },
@@ -1356,6 +1374,7 @@ async fn a_second_dial_replaces_the_first_connection() {
         .nodes
         .exec(
             &id,
+            &as_caller(),
             NodeCall::FsStat {
                 path: ".".to_string(),
             },

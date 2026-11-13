@@ -110,12 +110,22 @@ impl Transcript {
 
     fn write(&self, entry: &Entry) -> Result<(), DomainError> {
         self.store.upsert_entry(entry)?;
-        if let Some(mirror) = &self.mirror
-            && let Err(err) = mirror.append(&entry.conversation_id, entry)
-        {
-            // The database is authoritative; a mirror that cannot be written
-            // is a warning, not a failed turn.
-            warn!(error = %err, "cannot mirror the transcript to JSONL");
+        if let Some(mirror) = &self.mirror {
+            // The header goes in before the first entry of a conversation (and
+            // again if the row changed: a renamed group, an added member). It
+            // is what makes `JsonlMirror::rebuild` able to restore a store that
+            // can still be appended to — entries alone have nowhere to get the
+            // next sequence from. Idempotent, so this costs a stat per write.
+            if let Ok(Some(conversation)) = self.store.get_conversation(&entry.conversation_id)
+                && let Err(err) = mirror.ensure_header(&conversation)
+            {
+                warn!(error = %err, "cannot write the transcript header to JSONL");
+            }
+            if let Err(err) = mirror.append(&entry.conversation_id, entry) {
+                // The database is authoritative; a mirror that cannot be written
+                // is a warning, not a failed turn.
+                warn!(error = %err, "cannot mirror the transcript to JSONL");
+            }
         }
         self.hub.publish(Change::Entry(entry.clone()));
         Ok(())

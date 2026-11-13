@@ -20,13 +20,16 @@ use std::time::Instant;
 use jsonschema::Validator;
 use serde_json::Value;
 use swarmbot_contracts::{
-    Capabilities, InvocationId, TOOL_RESULT_LIMIT_BYTES, ToolCallRequest, ToolError, ToolResult,
-    ToolSpec, Toolset,
+    Capabilities, InvocationId, Surface, TOOL_RESULT_LIMIT_BYTES, ToolCallRequest, ToolError,
+    ToolResult, ToolSpec, Toolset,
 };
 
 use crate::audit::{AuditDecision, AuditEntry, AuditLog, AuditOutcome};
 use crate::handler::{ToolContext, ToolHandler};
-use crate::handlers::TOOL_SHELL;
+use crate::handlers::{
+    TOOL_EDIT_FILE, TOOL_GLOB, TOOL_GREP, TOOL_LIST_DIR, TOOL_READ_FILE, TOOL_SHELL,
+    TOOL_WRITE_FILE,
+};
 
 /// Task-management tools. A task's own session must not see them: a task that
 /// could start or cancel tasks would be one confused model away from a
@@ -261,14 +264,48 @@ impl ToolRegistry {
                 (result, decision)
             }
             Err(error) => {
-                // The error kind is itself the decision record for the two
-                // ways a call can be stopped by policy.
+                // The error kind is itself the decision record for the ways a
+                // call can be stopped by policy. A **path denial** belongs in
+                // that list: it is the most security-relevant refusal this
+                // layer produces ("that path is outside every root"), and it
+                // happens in `PathPolicy::resolve` *before* a handler reaches
+                // `gate_call`, so it arrives here as an `Err` that never
+                // stamped `meta`. Falling into the `_` arm recorded it as
+                // `decision: run` with an empty surface and target — an audit
+                // line saying the call executed, which is the opposite of
+                // what happened.
                 let decision = match &error {
-                    ToolError::PolicyRefused { .. } => AuditDecision::Refuse,
+                    ToolError::PolicyRefused { .. } | ToolError::PathDenied { .. } => {
+                        AuditDecision::Refuse
+                    }
                     ToolError::Denied { .. } => AuditDecision::Deny,
                     _ => AuditDecision::Run,
                 };
-                (error.to_result(), decision)
+                let mut result = error.to_result();
+                if let ToolError::PathDenied { path, .. } = &error {
+                    // Stamp the facts the handler never got to stamp, so the
+                    // audit line (and the UI card) name the surface that was
+                    // refused and the path that was refused.
+                    result.meta.insert(
+                        "decision".into(),
+                        Value::from(AuditDecision::Refuse.as_str()),
+                    );
+                    result.meta.insert(
+                        "surface".into(),
+                        Value::from(
+                            surface_for_tool(&request.name)
+                                .map(Surface::as_str)
+                                .unwrap_or(""),
+                        ),
+                    );
+                    result
+                        .meta
+                        .insert("target".into(), Value::from(path.as_str()));
+                    result
+                        .meta
+                        .insert("node".into(), Value::from(ctx.node_id.as_str()));
+                }
+                (result, decision)
             }
         }
     }
@@ -358,18 +395,52 @@ fn is_task_hidden(name: &str) -> bool {
     TASK_TOOLS.contains(&name) || ASK_TOOLS.contains(&name)
 }
 
+/// The safety surface a built-in tool acts on.
+///
+/// The authority is the handler's own `gate_call(… Surface::X …)`, and this
+/// table only exists for the one case where a handler never gets that far: a
+/// path denial, which happens while resolving the path, before the gate. The
+/// audit line still has to name the surface that was refused, so the mapping
+/// is mirrored here. It follows the table in `docs/tools.md` §3, and
+/// `every_builtin_tool_names_a_surface` fails when a new built-in is
+/// registered without an entry — a changed surface on an existing tool would
+/// not fail it, and that is deliberate: this table only has to be right about
+/// *which* surface a denial is filed under, and the handler remains the
+/// authority for everything that reaches the gate.
+///
+/// `None` (a non-node tool: messaging, tasks, a test stub) is honest: those
+/// have no surface, and their audit lines keep the empty string they always
+/// had.
+fn surface_for_tool(tool: &str) -> Option<Surface> {
+    match tool {
+        TOOL_SHELL => Some(Surface::Shell),
+        // The three walkers ask on `read_file`: they read, and the ceiling
+        // that governs reading is the one that governs them.
+        TOOL_READ_FILE | TOOL_LIST_DIR | TOOL_GLOB | TOOL_GREP => Some(Surface::ReadFile),
+        TOOL_WRITE_FILE => Some(Surface::WriteFile),
+        TOOL_EDIT_FILE => Some(Surface::EditFile),
+        _ => None,
+    }
+}
+
 /// Write the full text to `<spool_dir>/<tool>-<invocation>.txt`. The
 /// invocation id makes the name unique per call, so a turn that spills twice
 /// from the same tool keeps both files.
+///
+/// The spill is somebody's file contents or command output, and it is written
+/// where every other bot on the node can reach the directory — so the file is
+/// created 0600 in a 0700 directory rather than with whatever the process
+/// umask happens to be. `crate::audit`'s helpers hold that rule because the
+/// audit log, the spool and the node's spill dir all need the same one.
 fn spill(
     text: &str,
     tool: &str,
     invocation: &InvocationId,
     spool_dir: &Path,
 ) -> Result<std::path::PathBuf, std::io::Error> {
-    std::fs::create_dir_all(spool_dir)?;
+    crate::audit::create_private_dir_all(spool_dir)?;
     let path = spool_dir.join(format!("{tool}-{invocation}.txt"));
-    std::fs::write(&path, text)?;
+    crate::audit::write_private(&path, text.as_bytes())?;
     Ok(path)
 }
 
@@ -520,6 +591,58 @@ mod tests {
         assert!(text.contains("offset"), "{text}");
     }
 
+    /// A spill file holds file contents or command output, so it must not be
+    /// world-readable. Written with `std::fs::write` it was 0644 (umask), and
+    /// the spool directory 0755: anybody with an account on the node could
+    /// read what a bot had read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spilled_result_is_created_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let rig = Rig::new();
+        let registry = registry_from(&rig);
+        // The rig pre-creates the spool; remove it so this exercises the
+        // directory-creation path too (a mode is only applied at creation).
+        std::fs::remove_dir(&rig.spool).expect("an empty spool dir");
+
+        let content: String = (1..=2000)
+            .map(|i| format!("line {i:04} padding padding\n"))
+            .collect();
+        rig.write("big.txt", &content);
+        let result = registry
+            .dispatch(
+                &rig.ctx,
+                request("read_file", json!({"path": "big.txt", "limit": 2000})),
+            )
+            .await;
+
+        let spill_path = std::path::PathBuf::from(
+            result.meta["spill_path"]
+                .as_str()
+                .expect("a spill path in meta"),
+        );
+        let mode = std::fs::metadata(&spill_path)
+            .expect("spill metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "spilled output is readable by its owner only ({} mode {mode:o})",
+            spill_path.display()
+        );
+        let dir_mode = std::fs::metadata(&rig.spool)
+            .expect("spool metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "the spool is owner-traversable only"
+        );
+    }
+
     #[tokio::test]
     async fn results_under_the_cap_are_left_alone() {
         let rig = Rig::new();
@@ -642,6 +765,61 @@ mod tests {
         assert_eq!(line["decision"], "refuse");
         assert_eq!(line["outcome"], "error");
         assert_eq!(line["surface"], "write_file");
+    }
+
+    /// The most security-relevant refusal a node produces must not be filed as
+    /// a successful run. A path outside every root is refused by
+    /// `PathPolicy::resolve` before the handler reaches the gate, so it
+    /// arrives as an `Err` — and the registry used to map only
+    /// `PolicyRefused`/`Denied`, leaving `decision: run, surface: "",
+    /// target: ""`: an audit line that said the call executed, with nothing
+    /// saying *what* was refused.
+    #[tokio::test]
+    async fn a_path_denied_read_audits_as_refuse_with_the_refused_target() {
+        let rig = Rig::new();
+        let audit_path = rig.tmp.path().join("audit").join("nod_local.jsonl");
+        let registry = registry_from(&rig).with_audit(Arc::new(AuditLog::new(audit_path.clone())));
+
+        // Absolute and outside the rig's only root (`tmp.path()`): the refusal
+        // happens in the resolver, and nothing on disk is touched.
+        let outside = "/swarmbot-hardening-test/outside.txt";
+        let result = registry
+            .dispatch(&rig.ctx, request("read_file", json!({"path": outside})))
+            .await;
+        assert!(result.is_error, "{result:?}");
+        assert!(result.text_only().contains("path denied"), "{result:?}");
+        assert_eq!(result.meta["decision"], "refuse", "{:?}", result.meta);
+
+        let content = std::fs::read_to_string(&audit_path).expect("audit file");
+        let line: Value =
+            serde_json::from_str(content.lines().next().expect("a line")).expect("json");
+        assert_eq!(
+            line["decision"], "refuse",
+            "a path denial is a refusal, not a run: {line}"
+        );
+        assert_eq!(line["outcome"], "error");
+        assert_eq!(
+            line["surface"], "read_file",
+            "the audit line names the refused surface: {line}"
+        );
+        assert_eq!(
+            line["target"], outside,
+            "the audit line names the refused path: {line}"
+        );
+    }
+
+    /// `surface_for_tool` is the one place a tool name is mapped to a surface
+    /// without the handler's help, so it must cover every built-in: a new node
+    /// tool whose path is denied would otherwise audit with an empty surface.
+    #[test]
+    fn every_builtin_tool_names_a_surface() {
+        for spec in crate::handlers::builtin_specs() {
+            assert!(
+                surface_for_tool(&spec.name).is_some(),
+                "`{}` is a built-in tool with no entry in registry::surface_for_tool",
+                spec.name
+            );
+        }
     }
 
     #[tokio::test]

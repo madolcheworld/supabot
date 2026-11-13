@@ -19,6 +19,7 @@
 //! makes a node stop redialing permanently and tell its operator to re-pair.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -38,18 +39,60 @@ use swarmbot_node_protocol::PROTOCOL_VERSION;
 use swarmbot_node_protocol::auth::{
     CLOSE_HELLO_FAILED, CLOSE_REPLACED, VerifiedUpgrade, sign_hello,
 };
-use swarmbot_node_protocol::mux::{
-    BoxFuture, ChunkSink, Peer, PeerConfig, RpcHandler, Socket as _,
-};
+use swarmbot_node_protocol::mux::{BoxFuture, ChunkSink, Peer, PeerConfig, RpcHandler, Socket};
 use swarmbot_node_protocol::rpc::{
     self, ApprovalAnswer, Heartbeat, HelloParams, NodeEvent, NodeHello, RequestApproval,
 };
-use swarmbot_node_protocol::wire::TypedError;
+use swarmbot_node_protocol::wire::{ProtocolError, TypedError};
 
 use super::executor::unattributed;
 use super::socket::GatewaySocket;
 use super::{Connected, NodeGateway};
 use crate::state::AppState;
+
+/// How long a node has to answer `node.hello`.
+///
+/// A node that dials, keeps its socket alive with pings and never answers the
+/// handshake would otherwise hold its registry slot — and this session task —
+/// forever: the mux's liveness check only notices a *silent* socket, and a node
+/// that is pinging is not silent. Ten seconds is far more than a hello needs
+/// (the node's side is one signature check and one frame) and short enough that
+/// a stuck handshake is noticed while an operator is still watching.
+pub const HELLO_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Why `node.hello` did not succeed.
+#[derive(Debug)]
+enum HelloFailure {
+    /// The node did not answer within [`HELLO_DEADLINE`].
+    TimedOut,
+    /// The call failed for another reason.
+    Failed(ProtocolError),
+}
+
+/// Send `node.hello` and wait for the answer, with a deadline.
+///
+/// On expiry the call is withdrawn, so the node is asked to interrupt whatever
+/// it is doing and a late answer is ignored instead of settling a call nobody is
+/// waiting for any more.
+async fn ask_hello<S: Socket>(
+    peer: &Peer<S>,
+    node: &NodeId,
+    params: Value,
+) -> Result<Value, HelloFailure> {
+    let id = peer.next_id();
+    peer.call_with_id_deadline(
+        id,
+        rpc::NODE_HELLO,
+        params,
+        vec![(rpc::HEADER_NODE_ID.to_string(), node.to_string())],
+        HELLO_DEADLINE,
+    )
+    .await
+    .map_err(|error| match error {
+        ProtocolError::CallTimedOut { .. } => HelloFailure::TimedOut,
+        other => HelloFailure::Failed(other),
+    })
+}
 
 /// Serve one verified node connection until it ends.
 ///
@@ -171,18 +214,24 @@ async fn hello(
             return Err(());
         }
     };
-    let id = peer.next_id();
-    let answer = peer
-        .call_with_id(
-            id,
-            rpc::NODE_HELLO,
-            value,
-            vec![(rpc::HEADER_NODE_ID.to_string(), node.to_string())],
-        )
-        .await;
-    let value = match answer {
+    let value = match ask_hello(peer, node, value).await {
         Ok(value) => value,
-        Err(error) => {
+        Err(HelloFailure::TimedOut) => {
+            // The socket is alive — the node is pinging — but it never answered
+            // the handshake, so the slot is released instead of held forever.
+            warn!(
+                node = %node,
+                secs = HELLO_DEADLINE.as_secs(),
+                "the node did not answer node.hello in time; closing its control socket"
+            );
+            peer.close(
+                CLOSE_HELLO_FAILED,
+                "the node did not answer node.hello in time",
+            )
+            .await;
+            return Err(());
+        }
+        Err(HelloFailure::Failed(error)) => {
             // The node closes the socket itself for both of these (4426 for no
             // common protocol, 4403 for a signature it could not verify), so the
             // brain's job is to report which one happened and let the close land.
@@ -769,7 +818,75 @@ pub fn uniform_policy(ceiling: PolicyCeiling) -> PolicyMap {
 mod tests {
     use super::*;
     use chrono::TimeZone as _;
+    use serde_json::json;
     use swarmbot_contracts::id::RequestId;
+    use swarmbot_node_protocol::testing::duplex_pair;
+    use swarmbot_node_protocol::wire::{Frame, parse as parse_frame};
+
+    /// The defect this pins: a node that dials, keeps its socket alive with
+    /// pings and never answers `node.hello` held its registry slot (and this
+    /// session task) forever, because the liveness timeout only notices a
+    /// *silent* socket. The ask is bounded here, and the test's own outer bound
+    /// turns a missing deadline into a failure instead of a hang.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_that_never_answers_hello_does_not_hold_its_slot() {
+        let (sock, mut node_side) = duplex_pair(64 * 1024);
+        let peer = Peer::new(
+            sock,
+            PeerConfig {
+                // Timers that cannot fire inside the test: the point is that the
+                // *hello deadline*, not the liveness timeout, ends this.
+                ping_interval: Duration::from_secs(3600),
+                liveness_timeout: Duration::from_secs(3600),
+                ..PeerConfig::default()
+            },
+        );
+        let node = NodeId::new();
+        let ask = tokio::spawn({
+            let peer = peer.clone();
+            let node = node.clone();
+            async move {
+                ask_hello(
+                    &peer,
+                    &node,
+                    json!({ "protocol": { "min": 1, "max": 1 }, "brainVersion": "test" }),
+                )
+                .await
+            }
+        });
+
+        // The hello goes out and this node answers nothing, ever.
+        let request = node_side
+            .recv_text()
+            .await
+            .expect("a frame")
+            .expect("the hello request");
+        match parse_frame(&request).expect("parses") {
+            Frame::Request { method, .. } => assert_eq!(method, rpc::NODE_HELLO),
+            other => panic!("expected the hello request, got {other:?}"),
+        }
+
+        let outcome = tokio::time::timeout(HELLO_DEADLINE * 2, ask)
+            .await
+            .expect("node.hello must not wait forever")
+            .expect("the ask task finishes");
+        match outcome {
+            Err(HelloFailure::TimedOut) => {}
+            other => panic!("expected the hello deadline to fire, got {other:?}"),
+        }
+
+        // The withdrawal asks the node to stop, so a wedged node is interrupted
+        // rather than left running something nobody waits for.
+        let interrupt = node_side
+            .recv_text()
+            .await
+            .expect("a frame")
+            .expect("the interrupt frame");
+        assert!(matches!(
+            parse_frame(&interrupt).expect("parses"),
+            Frame::Interrupt { .. }
+        ));
+    }
 
     #[test]
     fn surfaces_are_the_names_the_node_sends() {

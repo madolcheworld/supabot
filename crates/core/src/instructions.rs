@@ -10,6 +10,7 @@
 //! specs, never from a hardcoded list, so a bot on a node without `shell@1` is
 //! not told it can run commands.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use swarmbot_contracts::bot::Bot;
@@ -25,8 +26,18 @@ use crate::session::MEMORY_INDEX_LIMIT_BYTES;
 /// How much of a bot's persona is quoted in another bot's roster line.
 const ROSTER_LINE_LIMIT: usize = 120;
 
+/// How much of a skill's body is injected. A skill is a procedure, not a
+/// document: past this the prompt spends its budget on one bot's playbook.
+pub const SKILL_BODY_LIMIT_BYTES: usize = 4 * 1024;
+
+/// How much of *all* its skills one bot may carry into a turn.
+pub const SKILLS_TOTAL_LIMIT_BYTES: usize = 12 * 1024;
+
 pub struct InstructionRenderer {
     store: Arc<dyn Persistence>,
+    /// Where the skill library lives (`<data>/skills`). `None` in a test or a
+    /// brain with no library, in which case a bot's skills are names only.
+    skills_root: Option<PathBuf>,
 }
 
 /// What is being rendered, beyond the bot itself.
@@ -47,7 +58,27 @@ pub struct RenderOptions<'a> {
 
 impl InstructionRenderer {
     pub fn new(store: Arc<dyn Persistence>) -> Arc<Self> {
-        Arc::new(Self { store })
+        Arc::new(Self {
+            store,
+            skills_root: None,
+        })
+    }
+
+    /// A renderer that also resolves skills from a library directory.
+    ///
+    /// A skill is a directory with a `SKILL.md` in it
+    /// (`<root>/<name>/SKILL.md`, or a flat `<root>/<name>.md`), and
+    /// `Bot.skills` names the ones a bot has. Before this the field was a list
+    /// of names nothing read, so "this bot knows rust" was a claim with no
+    /// content behind it.
+    pub fn with_skills_root(
+        store: Arc<dyn Persistence>,
+        skills_root: impl Into<PathBuf>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            skills_root: Some(skills_root.into()),
+        })
     }
 
     pub fn render(&self, bot: &Bot, options: RenderOptions<'_>) -> Result<String, DomainError> {
@@ -60,7 +91,7 @@ impl InstructionRenderer {
         }
 
         if !bot.skills.is_empty() {
-            sections.push(skills_section(&bot.skills));
+            sections.push(self.skills_section(&bot.skills));
         }
 
         sections.push(self.roster_section(bot, has_tools)?);
@@ -263,11 +294,90 @@ fn base_rules_for_tools(messaging_enabled: bool, has_tools: bool) -> String {
     rules
 }
 
-fn skills_section(skills: &[String]) -> String {
-    let mut sorted = skills.to_vec();
-    sorted.sort();
-    let lines: Vec<String> = sorted.into_iter().map(|s| format!("- {s}")).collect();
-    format!("## Your skills\n{}", lines.join("\n"))
+impl InstructionRenderer {
+    /// The bot's skills, with the body of each one it can actually resolve.
+    ///
+    /// A skill whose file is missing is still listed, with the honest note that
+    /// the library has no entry for it: hiding it would leave a bot wondering
+    /// why it was told it knows something, and inventing a body would be worse.
+    fn skills_section(&self, skills: &[String]) -> String {
+        let mut sorted = skills.to_vec();
+        sorted.sort();
+        let mut budget = SKILLS_TOTAL_LIMIT_BYTES;
+        let mut parts: Vec<String> = Vec::new();
+        for skill in &sorted {
+            match self.skill_body(skill) {
+                Some(body) => {
+                    if budget == 0 {
+                        parts.push(format!(
+                            "- {skill}: not included — the {SKILLS_TOTAL_LIMIT_BYTES}-byte \
+                             skill budget for this turn is already spent"
+                        ));
+                        continue;
+                    }
+                    let body = cap_bytes(&body, SKILL_BODY_LIMIT_BYTES.min(budget));
+                    budget = budget.saturating_sub(body.len());
+                    parts.push(format!("- **{skill}**\n{}", indent(&body, "  ")));
+                }
+                None => parts.push(format!(
+                    "- {skill} (the skill library has no entry for this one yet)"
+                )),
+            }
+        }
+        format!("## Your skills\n{}", parts.join("\n"))
+    }
+
+    /// The body of one skill, resolved from the library.
+    ///
+    /// The name is validated before it becomes a path: a skill name is a plain
+    /// file-name component, so `../../etc/passwd` cannot be a skill. That check
+    /// is what lets a *stored* field (set through the API) reach the
+    /// filesystem at all.
+    fn skill_body(&self, skill: &str) -> Option<String> {
+        let root = self.skills_root.as_ref()?;
+        let name = skill.trim();
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name == "."
+            || name == ".."
+            || name.starts_with('.')
+        {
+            return None;
+        }
+        let candidates = [
+            root.join(name).join("SKILL.md"),
+            root.join(format!("{name}.md")),
+        ];
+        for path in candidates {
+            if let Some(body) = read_skill(&path) {
+                return Some(body);
+            }
+        }
+        None
+    }
+}
+
+/// Read one skill file, or `None` when it does not exist or is unreadable.
+///
+/// A broken skill must not fail a turn: the prompt loses a paragraph, which is
+/// a smaller failure than the bot refusing to answer at all. The miss is
+/// visible in the section text instead.
+fn read_skill(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Indent a multi-line body so it reads as part of its bullet.
+fn indent(body: &str, prefix: &str) -> String {
+    body.lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn tools_section(tools: &[ToolSpec]) -> String {
@@ -330,12 +440,19 @@ mod tests {
     use swarmbot_contracts::tool::Toolset;
 
     fn renderer_with_team() -> (Arc<InstructionRenderer>, Bot) {
+        let (store, lead) = renderer_with_team_pair();
+        (InstructionRenderer::new(store), lead)
+    }
+
+    /// The seeded store and the lead, for a test that builds its own renderer
+    /// (the skills tests need a library directory).
+    fn renderer_with_team_pair() -> (Arc<dyn Persistence>, Bot) {
         let store = testing::memory_store();
         let lead = testing::seed_bot(&store, "lead");
         testing::seed_bot(&store, "scout");
         testing::seed_bot(&store, "dev");
         testing::seed_group(&store, "Team", &["lead", "scout", "dev"]);
-        (InstructionRenderer::new(store), lead)
+        (store, lead)
     }
 
     fn specs() -> Vec<ToolSpec> {
@@ -353,6 +470,159 @@ mod tests {
                 Toolset::Bot,
             ),
         ]
+    }
+
+    #[test]
+    fn a_skill_name_with_no_library_entry_says_so_instead_of_pretending() {
+        // `Bot.skills` was a stored list nothing read: "this bot knows rust"
+        // was a claim with no content behind it.
+        let (renderer, mut bot) = renderer_with_team();
+        bot.skills = vec!["rust".to_string()];
+        let text = renderer
+            .render(
+                &bot,
+                RenderOptions {
+                    tools: &specs(),
+                    messaging_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(text.contains("## Your skills"), "{text}");
+        assert!(text.contains("rust"), "{text}");
+        assert!(
+            text.contains("no entry"),
+            "a missing skill file is stated, not hidden: {text}"
+        );
+    }
+
+    #[test]
+    fn a_skill_file_is_injected_from_the_library() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let skill_dir = dir.path().join("rust");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "Run `cargo fmt` before every commit.\nNever unwrap outside tests.",
+        )
+        .expect("skill body");
+
+        let (store, mut bot) = renderer_with_team_pair();
+        let renderer = InstructionRenderer::with_skills_root(store, dir.path());
+        bot.skills = vec!["rust".to_string()];
+        let text = renderer
+            .render(
+                &bot,
+                RenderOptions {
+                    tools: &specs(),
+                    messaging_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(text.contains("## Your skills"), "{text}");
+        assert!(
+            text.contains("Run `cargo fmt` before every commit."),
+            "the skill body reaches the prompt: {text}"
+        );
+        assert!(
+            text.contains("Never unwrap outside tests."),
+            "all of it, not just the first line: {text}"
+        );
+    }
+
+    #[test]
+    fn a_flat_skill_file_is_found_too() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("git.md"), "Squash fixups before pushing.")
+            .expect("flat skill");
+        let (store, mut bot) = renderer_with_team_pair();
+        let renderer = InstructionRenderer::with_skills_root(store, dir.path());
+        bot.skills = vec!["git".to_string()];
+        let text = renderer
+            .render(
+                &bot,
+                RenderOptions {
+                    tools: &specs(),
+                    messaging_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(text.contains("Squash fixups before pushing."), "{text}");
+    }
+
+    #[test]
+    fn a_skill_name_can_never_be_a_path() {
+        // A skill name is a stored field set through the API; the moment it
+        // becomes a path, `../../etc/passwd` has to be refused.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let outside = dir.path().join("secret.md");
+        std::fs::write(&outside, "TOP SECRET").expect("secret");
+        let nested = dir.path().join("skills");
+        std::fs::create_dir_all(&nested).expect("skills dir");
+
+        let (store, mut bot) = renderer_with_team_pair();
+        let renderer = InstructionRenderer::with_skills_root(store, &nested);
+        for name in ["../secret", "../../etc/passwd", "a/b", ".hidden"] {
+            bot.skills = vec![name.to_string()];
+            let text = renderer
+                .render(
+                    &bot,
+                    RenderOptions {
+                        tools: &specs(),
+                        messaging_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert!(
+                !text.contains("TOP SECRET"),
+                "`{name}` escaped the library: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_skill_body_is_capped_so_one_playbook_cannot_eat_the_prompt() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let skill_dir = dir.path().join("huge");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "x".repeat(SKILL_BODY_LIMIT_BYTES * 3),
+        )
+        .expect("huge skill");
+
+        let (store, mut bot) = renderer_with_team_pair();
+        let renderer = InstructionRenderer::with_skills_root(store, dir.path());
+        bot.skills = vec!["huge".to_string()];
+        let text = renderer
+            .render(
+                &bot,
+                RenderOptions {
+                    tools: &specs(),
+                    messaging_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        // The skills section ends at the next `## ` heading, so measure only
+        // the playbook that was injected — not the roster that follows it.
+        let section = text
+            .split("## Your skills")
+            .nth(1)
+            .expect("a skills section");
+        let section = section.split("\n## ").next().unwrap_or(section);
+        let injected = section.matches('x').count();
+        assert!(
+            injected <= SKILL_BODY_LIMIT_BYTES,
+            "the body is capped at {SKILL_BODY_LIMIT_BYTES} bytes, got {injected}"
+        );
+        assert!(
+            injected > 0,
+            "the skill is still injected, only shorter: {text}"
+        );
     }
 
     #[test]

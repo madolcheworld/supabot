@@ -22,6 +22,7 @@
 //! `<data>/secrets.json` (mode 0600) or the process environment.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
@@ -331,6 +332,10 @@ impl Resolved {
         if let Some(origin) = &config.public_origin {
             validate_origin(origin)?;
         }
+        // The internal listener is a tool-execution surface. Refusing a
+        // non-loopback address here — before anything binds — is what turns an
+        // operator typo into a startup error instead of an open port.
+        normalize_internal_addr(&mut config)?;
 
         let roots = extra_roots(&cli.roots)?;
 
@@ -468,6 +473,58 @@ fn validate_origin(origin: &str) -> anyhow::Result<()> {
     }
     if !matches!(parsed.scheme(), "http" | "https") {
         bail!("public_origin `{origin}` must be http or https");
+    }
+    Ok(())
+}
+
+/// Decide the internal listener's fate: empty means "disabled", anything else
+/// has to be a loopback IP literal.
+///
+/// The empty-means-disabled rule is the command line's documented behaviour
+/// (`--internal-addr ""`), applied here to the config file too so one value
+/// cannot mean two things depending on where it was written.
+fn normalize_internal_addr(config: &mut BrainConfig) -> anyhow::Result<()> {
+    let Some(addr) = config.internal_addr.as_deref() else {
+        return Ok(());
+    };
+    if addr.trim().is_empty() {
+        config.internal_addr = None;
+        return Ok(());
+    }
+    validate_internal_addr(addr)
+}
+
+/// Refuse an internal listener address that is not loopback.
+///
+/// The internal listener carries the MCP gateway: the static `/mcp` route serves
+/// the *whole* tool registry (behind the owner token, but the whole registry
+/// nonetheless), and `/mcp/t/{token}` URLs put a turn's bearer credential in a
+/// path. `TcpListener::bind` would happily bind `0.0.0.0:8788`; this is the check
+/// that makes "loopback-only" an invariant rather than a hope, and it runs at
+/// resolve time so the failure names the address instead of surfacing as a port
+/// the network can reach.
+///
+/// Only an IP literal is accepted. `localhost` is refused on purpose: what a
+/// name resolves to is the system resolver's answer, not something this check
+/// can verify, and the whole point is that the bind address is known before the
+/// listener opens.
+pub fn validate_internal_addr(addr: &str) -> anyhow::Result<()> {
+    let trimmed = addr.trim();
+    let parsed: SocketAddr = trimmed.parse().map_err(|err| {
+        anyhow::anyhow!(
+            "internal_addr `{trimmed}` is not a host:port with an IP literal ({err}); the \
+             internal listener must bind a loopback address, so write `127.0.0.1:PORT` or \
+             `[::1]:PORT` — a hostname's resolution is not something this check can verify"
+        )
+    })?;
+    if !parsed.ip().is_loopback() {
+        bail!(
+            "internal_addr `{trimmed}` is not a loopback address: the internal listener carries \
+             the MCP gateway (the whole tool registry behind `/mcp`, and per-turn \
+             `/mcp/t/<token>` URLs whose token is a bearer credential), so binding `{trimmed}` \
+             would expose tool execution to the network. Use `127.0.0.1:PORT` or `[::1]:PORT`, \
+             or leave internal_addr out to disable the listener"
+        );
     }
     Ok(())
 }
@@ -1017,6 +1074,80 @@ mod tests {
         };
         let resolved = Resolved::load(&cli).expect("loads");
         assert_eq!(resolved.config.internal_addr, None);
+
+        // The config file spells "disabled" the same way the command line does:
+        // one value must not mean two things depending on where it was written.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("config.toml"), "internal_addr = \"\"\n").expect("write");
+        let cli = Cli {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..base_cli()
+        };
+        let resolved = Resolved::load(&cli).expect("loads");
+        assert_eq!(resolved.config.internal_addr, None);
+    }
+
+    #[test]
+    fn a_non_loopback_internal_addr_is_refused() {
+        // The internal listener carries the MCP gateway: the whole tool registry
+        // on `/mcp` and per-turn `/mcp/t/{token}` URLs whose token is a bearer
+        // credential. `0.0.0.0` here would be a remote shell; the check names the
+        // address and says why rather than binding it.
+        for refused in [
+            "0.0.0.0:8788",
+            "[::]:8788",
+            "192.168.1.5:8788",
+            "10.0.0.1:0",
+            "[::ffff:127.0.0.1]:8788",
+        ] {
+            let err = validate_internal_addr(refused).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains(refused.trim()),
+                "the address must be named in `{message}`"
+            );
+            assert!(
+                message.contains("loopback"),
+                "the reason must be in `{message}`"
+            );
+        }
+        // A hostname is refused: what it resolves to is the resolver's answer, and
+        // the invariant is that the bound address is known before the bind.
+        let err = validate_internal_addr("localhost:8788").unwrap_err();
+        assert!(err.to_string().contains("IP literal"), "{err}");
+        assert!(
+            validate_internal_addr("").is_err(),
+            "an empty host is not an address"
+        );
+
+        // Loopback is accepted on any port, including the ephemeral one the
+        // default uses.
+        for allowed in [
+            "127.0.0.1:0",
+            "127.0.0.1:8787",
+            "127.255.0.1:9",
+            "[::1]:8788",
+        ] {
+            validate_internal_addr(allowed).expect("loopback is allowed");
+        }
+    }
+
+    #[test]
+    fn a_non_loopback_internal_addr_stops_the_brain_before_it_binds() {
+        // The same refusal through the real resolve path, with no socket: a
+        // hand-written `Resolved` can still be composed by a test, but the daemon
+        // never gets that far.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let cli = Cli {
+            data_dir: Some(dir.path().to_path_buf()),
+            internal_addr: Some("0.0.0.0:8788".into()),
+            ..base_cli()
+        };
+        let err = Resolved::load(&cli).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("internal_addr"), "{message}");
+        assert!(message.contains("0.0.0.0:8788"), "{message}");
+        assert!(message.contains("loopback"), "{message}");
     }
 
     #[test]

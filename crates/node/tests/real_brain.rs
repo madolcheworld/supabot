@@ -76,6 +76,9 @@ const POLL: Duration = Duration::from_millis(25);
 
 /// The marker texts. Same file name, one per machine, different content: which
 /// string comes back is the proof of *where* the call ran.
+/// The backend id of the bot under test, so its script queue is its own.
+const NODE_BACKEND: &str = "fake-node";
+
 const NODE_MARKER: &str = "from the node";
 const BRAIN_MARKER: &str = "from the brain";
 
@@ -152,15 +155,23 @@ impl ChildGuard {
             })
     }
 
-    /// Wait until one logged line contains `needle`, and return it. The
-    /// failure message is the child's own log: a daemon that died early should
-    /// say so in the test output, not just "timed out".
+    /// Wait until one logged line's *message* contains `needle`, and return the
+    /// whole line. The failure message is the child's own log: a daemon that
+    /// died early should say so in the test output, not just "timed out".
+    ///
+    /// The match runs against [`message_of`] rather than the raw line on
+    /// purpose. The needles here are short numbers (`401`, `4401`) and a
+    /// tracing timestamp is arbitrary digits, so `2026-11-13T01:33:44.929401Z`
+    /// matched a needle of `401` and this helper returned the daemon's startup
+    /// line instead of waiting for the refusal it was asked about. That is the
+    /// whole of the "flaky under load" story: more log lines meant more chances
+    /// for the clock to answer the question.
     async fn wait_for_line(&self, needle: &str, budget: Duration) -> String {
         let deadline = tokio::time::Instant::now() + budget;
         loop {
             {
                 let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(line) = lines.iter().find(|line| line.contains(needle)) {
+                if let Some(line) = lines.iter().find(|line| message_of(line).contains(needle)) {
                     return line.clone();
                 }
             }
@@ -198,6 +209,26 @@ impl Drop for ChildGuard {
             let _ = self.child.as_mut().expect("checked above").start_kill();
             self.child = None;
         }
+    }
+}
+
+/// A captured log line without its tracing prefix: the part a test may match
+/// on without matching the clock.
+///
+/// `tracing` writes `<RFC 3339 timestamp> LEVEL target: message`, and the
+/// fractional seconds are arbitrary digits — `.929401` contains `401` and
+/// `4401` both. Matching the raw line therefore let a timestamp answer a
+/// question about a close code, which is a false positive that looks exactly
+/// like a flake when the machine is busy enough to emit more lines. The prefix
+/// ends at the first `Z` of a line that starts with a digit; a line that does
+/// not look like that is returned untouched.
+fn message_of(line: &str) -> &str {
+    if !line.starts_with(|c: char| c.is_ascii_digit()) {
+        return line;
+    }
+    match line.find('Z') {
+        Some(z) if z < 40 => line.get(z + 1..).map_or(line, str::trim_start),
+        _ => line,
     }
 }
 
@@ -254,7 +285,10 @@ impl Rig {
             public_addr: "127.0.0.1:0".into(),
             internal_addr: None,
             default_backend: "fake".into(),
-            backends: vec![BackendSpec::fake("fake")],
+            // Two scripted backends, not one: the demo team keeps `"fake"`, and
+            // the node-bound bot gets its own queue so a demo bot cannot pop a
+            // script meant for it. See `Rig::fake`.
+            backends: vec![BackendSpec::fake("fake"), BackendSpec::fake(NODE_BACKEND)],
             team: Some(BrainConfig::demo_team("fake")),
             ..BrainConfig::default()
         };
@@ -516,7 +550,7 @@ impl Rig {
                     "name": name,
                     "label": "Remote",
                     "instructions": "your tools run on another machine",
-                    "backend": "fake",
+                    "backend": NODE_BACKEND,
                     "node": node.to_string(),
                 }),
             )
@@ -555,13 +589,23 @@ impl Rig {
             .expect("the brain's decoy marker");
     }
 
-    /// The scripted fake backend every bot in this brain runs on.
+    /// The scripted backend the *node-bound* bot runs on.
+    ///
+    /// Deliberately not the demo team's `"fake"`. A scripted backend holds one
+    /// queue, and a queue shared with the four demo bots is a race: under load
+    /// another bot's turn can pop a script written for this one, and the test
+    /// then fails with a transcript that holds only the owner's message and no
+    /// tool call at all — a silent wrong-script failure with exit code 0. That
+    /// is the same shape D9.15 fixed for the CLI's `--script`, and this rig
+    /// builds its brain directly, so it never went through that fix. Giving the
+    /// bot under test its own backend removes the sharing instead of widening a
+    /// wait around it.
     fn fake(&self) -> Arc<FakeBackend> {
         self.brain
             .swarm
             .backends
             .registry()
-            .fake("fake")
+            .fake(NODE_BACKEND)
             .expect("the fake backend is always scriptable")
     }
 
@@ -1063,10 +1107,15 @@ async fn revoking_closes_the_real_child_with_4401_and_a_redial_is_refused() {
     // HTTP 401 before any upgrade, which the node reports as an unreachable
     // brain and retries with backoff — it never comes back online.
     let redial = rig.run_daemon("it-node", &[]);
-    let line = redial.wait_for_line("401", QUICK).await;
+    // Wait for the sentence, not the number. A bare `401` also matches the
+    // `4401` close code and — less obviously — a random hex id: this line is
+    // `cannot reach the brain at <url>: HTTP error: 401 Unauthorized`, and the
+    // URL or a node id in the same message can contain those three digits. The
+    // assertion below then reads the status *out of* the line it waited for.
+    let line = redial.wait_for_line("cannot reach the brain", QUICK).await;
     assert!(
-        line.contains("cannot reach the brain"),
-        "the refusal is a dial failure the node reports honestly: {line}"
+        line.contains("401"),
+        "the dial failure carries the status the brain answered with: {line}"
     );
     let row = rig.node_row(&node_id).await;
     assert_eq!(
@@ -1078,4 +1127,31 @@ async fn revoking_closes_the_real_child_with_4401_and_a_redial_is_refused() {
 
     redial.kill().await;
     rig.stop().await;
+}
+
+/// The matcher behind `wait_for_line`, pinned.
+///
+/// Without `message_of`, the first assertion below fails: `.929401` contains
+/// `401`, so a needle of `401` matched the startup line's timestamp and the
+/// test above reported "the refusal is a dial failure…" about a line that was
+/// not a refusal at all. This is the reproduction, kept cheap and deterministic.
+#[test]
+fn a_timestamp_is_never_mistaken_for_the_message() {
+    let startup = "2026-11-13T01:33:44.929401Z  INFO swarmbot-node starting node_id=nod_x";
+    assert!(
+        !message_of(startup).contains("401"),
+        "the timestamp is not part of the message"
+    );
+    assert!(message_of(startup).contains("starting node_id"));
+
+    let refusal = "2026-11-13T01:33:45.000001Z  INFO swarmbot-node redialing \
+                   last_error=\"cannot reach the brain at http://127.0.0.1:1: \
+                   HTTP error: 401 Unauthorized\"";
+    let message = message_of(refusal);
+    assert!(message.contains("401"), "{message}");
+    assert!(message.contains("cannot reach the brain"), "{message}");
+
+    // A line with no tracing prefix is its own message, not an empty string.
+    assert_eq!(message_of("plain output"), "plain output");
+    assert_eq!(message_of(""), "");
 }

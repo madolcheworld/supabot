@@ -11,13 +11,17 @@
 //!   printing what it spent.
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, WriteHalf, split};
+use tokio::io::{
+    AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf, split,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -60,25 +64,87 @@ enum Behavior {
     McpHttpSupported,
     /// `initialize` advertises `mcpCapabilities: { http: false, sse: false }`.
     McpHttpUnsupported,
+    /// The *first* `session/new` is never answered (so one turn's setup timeout
+    /// fires); later ones answer normally, and the prompt streams a keepalive
+    /// every 10 simulated seconds — resetting the idle clock — before answering
+    /// at 50s, long after the first turn's setup budget ran out.
+    SlowFirstSetup,
+    /// `initialize` is never answered: connection establishment hangs until the
+    /// setup budget expires.
+    SilentHandshake,
+    /// `session/new` is never answered, ever: every turn times out in setup, so
+    /// the connection accumulates unanswered setup calls and is eventually
+    /// replaced as wedged.
+    NeverAnswerSessionNew,
 }
 
 type Log = Arc<Mutex<Vec<Value>>>;
+
+/// The client's end of the agent's stdin, wrapped so the scripted agent can tell
+/// when the client closed it. A real child sees EOF on stdin and exits; an
+/// in-memory duplex does not, because the client still holds its own read half.
+/// Modelling the EOF is what makes the isolation test able to catch a connection
+/// being shut down: the agent exits, the pipe closes, and the reader on the
+/// client side reports "gone" exactly as it does for a killed process.
+struct ClosingStdin {
+    inner: WriteHalf<DuplexStream>,
+    closed: CancellationToken,
+}
+
+impl AsyncWrite for ClosingStdin {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Drop for ClosingStdin {
+    fn drop(&mut self) {
+        // stdin dropped = EOF for the child.
+        self.closed.cancel();
+    }
+}
 
 struct ScriptedAgentTransport {
     behavior: Behavior,
     log: Log,
     /// Set once the first agent hung up (see [`Behavior::DieAfterSession`]).
     died: Arc<AtomicBool>,
+    /// Whether `initialize` advertises `sessionCapabilities.close`. On by
+    /// default (a modern ACP agent); one test turns it off to pin the honest
+    /// "do not call an unadvertised optional method" behaviour.
+    advertise_session_close: bool,
 }
 
 impl ScriptedAgentTransport {
     fn new(behavior: Behavior) -> (Self, Log) {
+        Self::build(behavior, true)
+    }
+
+    /// An agent that does not advertise `session/close`.
+    fn without_session_close(behavior: Behavior) -> (Self, Log) {
+        Self::build(behavior, false)
+    }
+
+    fn build(behavior: Behavior, advertise_session_close: bool) -> (Self, Log) {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
                 behavior,
                 log: Arc::clone(&log),
                 died: Arc::new(AtomicBool::new(false)),
+                advertise_session_close,
             },
             log,
         )
@@ -89,16 +155,22 @@ impl ScriptedAgentTransport {
 impl AcpTransport for ScriptedAgentTransport {
     async fn spawn(&self, _launch: &AgentLaunch) -> Result<AgentHandle, String> {
         let (connection_side, agent_side) = tokio::io::duplex(64 * 1024);
+        let stdin_closed = CancellationToken::new();
         tokio::spawn(play_agent(
             agent_side,
             self.behavior,
             Arc::clone(&self.log),
             Arc::clone(&self.died),
+            self.advertise_session_close,
+            stdin_closed.clone(),
         ));
         let (agent_read, agent_write) = split(connection_side);
         Ok(AgentHandle {
             label: "scripted agent (in memory)".to_string(),
-            stdin: Box::new(agent_write),
+            stdin: Box::new(ClosingStdin {
+                inner: agent_write,
+                closed: stdin_closed,
+            }),
             stdout: Box::new(agent_read),
             stderr: None,
             kill: Arc::new(|| {}),
@@ -109,13 +181,29 @@ impl AcpTransport for ScriptedAgentTransport {
 
 /// The agent side of the duplex pipe: a minimal ACP agent that logs every
 /// line the client sends, so tests assert on the protocol itself.
-async fn play_agent(io: DuplexStream, behavior: Behavior, log: Log, died: Arc<AtomicBool>) {
+///
+/// Two exits, both faithful to a real child: EOF on stdin (the client closed
+/// the pipe) and the client's `kill` (a real transport group-kills the child).
+/// Either way the agent stops its turn tasks and shuts its write half, so the
+/// client's reader sees the EOF a dead process produces — otherwise a leaked
+/// task holding the write half would keep a shut-down connection looking alive
+/// and hide exactly the bug the isolation test is about.
+async fn play_agent(
+    io: DuplexStream,
+    behavior: Behavior,
+    log: Log,
+    died: Arc<AtomicBool>,
+    advertise_session_close: bool,
+    stdin_closed: CancellationToken,
+) {
     let (read_half, write_half) = split(io);
     let writer = Arc::new(tokio::sync::Mutex::new(write_half));
+    let closed = CancellationToken::new();
     let mut lines = BufReader::new(read_half).lines();
     let mut prompt_id: Option<u64> = None;
+    let mut sessions_created = 0u32;
 
-    while let Ok(Some(line)) = lines.next_line().await {
+    while let Some(line) = next_line(&mut lines, &stdin_closed).await {
         if line.trim().is_empty() {
             continue;
         }
@@ -135,16 +223,24 @@ async fn play_agent(io: DuplexStream, behavior: Behavior, log: Log, died: Arc<At
         };
         let id = value["id"].as_u64();
         match method {
+            "initialize" if behavior == Behavior::SilentHandshake => {
+                // The handshake is the setup call this agent never answers.
+            }
             "initialize" => {
-                let agent_capabilities = match behavior {
-                    Behavior::McpHttpSupported => json!({
-                        "mcpCapabilities": {"http": true, "sse": false},
-                    }),
-                    Behavior::McpHttpUnsupported => json!({
-                        "mcpCapabilities": {"http": false, "sse": false},
-                    }),
-                    _ => json!({}),
-                };
+                let mut agent_capabilities = json!({});
+                if advertise_session_close {
+                    agent_capabilities["sessionCapabilities"] = json!({"close": {}});
+                }
+                match behavior {
+                    Behavior::McpHttpSupported => {
+                        agent_capabilities["mcpCapabilities"] = json!({"http": true, "sse": false});
+                    }
+                    Behavior::McpHttpUnsupported => {
+                        agent_capabilities["mcpCapabilities"] =
+                            json!({"http": false, "sse": false});
+                    }
+                    _ => {}
+                }
                 respond(
                     &writer,
                     id,
@@ -157,6 +253,15 @@ async fn play_agent(io: DuplexStream, behavior: Behavior, log: Log, died: Arc<At
                 .await;
             }
             "session/new" => {
+                sessions_created += 1;
+                if behavior == Behavior::SlowFirstSetup && sessions_created == 1 {
+                    // The first session setup is the slow one: it is never
+                    // answered, so that turn's setup budget is what ends it.
+                    continue;
+                }
+                if behavior == Behavior::NeverAnswerSessionNew {
+                    continue;
+                }
                 let result = match behavior {
                     Behavior::ModelsWithSetModel | Behavior::ModelsNoSetModelMethod => json!({
                         "sessionId": "s-test",
@@ -191,6 +296,9 @@ async fn play_agent(io: DuplexStream, behavior: Behavior, log: Log, died: Arc<At
                     break;
                 }
             }
+            "session/close" => {
+                respond(&writer, id, json!({})).await;
+            }
             "session/set_model" => match behavior {
                 Behavior::ModelsNoSetModelMethod => {
                     respond_error(&writer, id, -32601, "no such method").await;
@@ -203,6 +311,44 @@ async fn play_agent(io: DuplexStream, behavior: Behavior, log: Log, died: Arc<At
             "session/prompt" => match behavior {
                 Behavior::AnswerAfterCancel => prompt_id = id,
                 Behavior::NeverAnswer => {}
+                // Streams keepalives, then answers: the concurrent turn whose
+                // setup times out must not take this one down with it, and the
+                // keepalives keep this turn's *idle* clock from firing first
+                // (D2.5: updates reset the idle timeout).
+                Behavior::SlowFirstSetup => {
+                    let Some(id) = id else { continue };
+                    let sid = value["params"]["sessionId"]
+                        .as_str()
+                        .unwrap_or("s-test")
+                        .to_string();
+                    let agent_writer = Arc::clone(&writer);
+                    let stopped = closed.clone();
+                    tokio::spawn(async move {
+                        for _ in 0..5 {
+                            tokio::select! {
+                                _ = stopped.cancelled() => return,
+                                _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                            }
+                            update(
+                                &agent_writer,
+                                &sid,
+                                json!({"sessionUpdate": "tool_call_update",
+                                       "toolCallId": "keepalive",
+                                       "title": "working",
+                                       "status": "in_progress"}),
+                            )
+                            .await;
+                        }
+                        update(
+                            &agent_writer,
+                            &sid,
+                            json!({"sessionUpdate": "agent_message_chunk",
+                                   "content": {"type": "text", "text": "still here"}}),
+                        )
+                        .await;
+                        respond(&agent_writer, Some(id), json!({"stopReason": "end_turn"})).await;
+                    });
+                }
                 // Only the *first* agent hangs up; after that the scenario
                 // plays a normal turn so the respawn can be asserted.
                 Behavior::DieAfterSession if !died.load(Ordering::SeqCst) => {}
@@ -213,6 +359,7 @@ async fn play_agent(io: DuplexStream, behavior: Behavior, log: Log, died: Arc<At
                         .unwrap_or("s-test")
                         .to_string();
                     let agent_writer = Arc::clone(&writer);
+                    let stopped = closed.clone();
                     tokio::spawn(async move {
                         update(
                             &agent_writer,
@@ -266,7 +413,13 @@ async fn play_agent(io: DuplexStream, behavior: Behavior, log: Log, died: Arc<At
                         .await;
                         // Let the client answer both before the turn ends, so
                         // the responses are on the wire deterministically.
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::select! {
+                            _ = stopped.cancelled() => return,
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        }
+                        if stopped.is_cancelled() {
+                            return;
+                        }
                         update(
                             &agent_writer,
                             &sid,
@@ -295,6 +448,23 @@ async fn play_agent(io: DuplexStream, behavior: Behavior, log: Log, died: Arc<At
             }
             other => respond_error(&writer, id, -32601, format!("unknown method {other}")).await,
         }
+    }
+    // EOF on stdin: the client closed the pipe, so this agent exits like a real
+    // child would. Stop whatever was streaming, then shut the write half so the
+    // client's reader really sees the end of the pipe.
+    closed.cancel();
+    let mut guard = writer.lock().await;
+    let _ = guard.shutdown().await;
+}
+
+/// Read one line, or `None` when the client closed the agent's stdin.
+async fn next_line(
+    lines: &mut tokio::io::Lines<BufReader<ReadHalf<DuplexStream>>>,
+    stdin_closed: &CancellationToken,
+) -> Option<String> {
+    tokio::select! {
+        line = lines.next_line() => line.ok().flatten(),
+        _ = stdin_closed.cancelled() => None,
     }
 }
 
@@ -654,6 +824,267 @@ async fn a_dead_agent_fails_the_turn_honestly_and_respawns_for_the_next_one() {
         .expect("the connection respawns");
     events.await.expect("joined");
     assert_eq!(response.text, "Hello world");
+}
+
+// ---------------------------------------------------------------------------
+// one shared backend, one slow turn: isolation between concurrent turns
+// ---------------------------------------------------------------------------
+
+/// The headline isolation test: a setup timeout is *that turn's* failure.
+///
+/// Both turns share one agent process (same connection key: no `model_env`, no
+/// per-bot cwd). The first turn's `session/new` is never answered, so its setup
+/// budget expires. The second turn is still in flight at that moment — it
+/// streams keepalives and answers at 50s, past the first turn's 30s setup
+/// budget — and it must survive to finish. With the old code the timeout shut
+/// the shared process down and this turn died with "agent died mid-turn".
+///
+/// The clock is paused and advanced by tokio's auto-advance: the test spends no
+/// real time, and the ordering (slow turn owns the first `session/new`) is
+/// pinned by the log rather than by sleeps.
+#[tokio::test(start_paused = true)]
+async fn one_slow_setup_fails_only_its_own_turn() {
+    let (transport, log) = ScriptedAgentTransport::new(Behavior::SlowFirstSetup);
+    let mut spec = acp_spec(Map::new());
+    // setup_timeout and the idle timeout are both 30s here, so the keepalives
+    // are what keep the surviving turn alive past the other turn's setup
+    // budget — which is exactly the production shape: a working agent streams.
+    spec.timeout_secs = 30;
+    let backend = Arc::new(
+        AcpAgent::with_transport(spec, None, Arc::new(transport)).expect("a valid spec builds"),
+    );
+
+    let (tx_slow, rx_slow) = mpsc::channel(8);
+    let events_slow = collect_events(rx_slow);
+    let slow = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move {
+            backend
+                .chat(request_with_history(), tx_slow, CancellationToken::new())
+                .await
+        })
+    };
+    // Wait until the slow turn's `session/new` is on the wire before starting
+    // the other turn: the scripted agent hangs the *first* session setup, so
+    // this is what makes the scenario ordered instead of raced.
+    wait_for_log(&log, "the first session/new", |entries| {
+        entries
+            .iter()
+            .filter(|entry| entry["method"].as_str() == Some("session/new"))
+            .count()
+            == 1
+    })
+    .await;
+
+    let (tx_live, rx_live) = mpsc::channel(8);
+    let events_live = collect_events(rx_live);
+    let live = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move {
+            backend
+                .chat(request_with_history(), tx_live, CancellationToken::new())
+                .await
+        })
+    };
+    // The second turn is now in flight: session created, prompt sent, waiting.
+    wait_for_log(&log, "the second turn's prompt", |entries| {
+        entries
+            .iter()
+            .filter(|entry| entry["method"].as_str() == Some("session/prompt"))
+            .count()
+            == 1
+    })
+    .await;
+
+    let slow_result = slow.await.expect("joined");
+    match slow_result {
+        Err(LlmError::Timeout { .. }) => {}
+        other => panic!("the slow turn must fail with its own timeout, got {other:?}"),
+    }
+
+    let live_result = live.await.expect("joined");
+    events_live.await.expect("joined");
+    let response = match live_result {
+        Ok(response) => response,
+        Err(error) => panic!("another turn's setup timeout killed this turn: {error}"),
+    };
+    assert_eq!(response.text, "still here");
+    events_slow.await.expect("joined");
+
+    // One process, one handshake: the timeout never respawned or shut down the
+    // agent the surviving turn was using.
+    let entries = logged(&log);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry["method"].as_str() == Some("initialize"))
+            .count(),
+        1,
+        "the shared agent must not be respawned by one turn's timeout: {entries:#?}"
+    );
+}
+
+/// A stopped turn must not wait out somebody else's connect.
+///
+/// A cold agent that never answers `initialize` holds establishment for the
+/// whole setup budget (30s floor). A second turn on the same backend that is
+/// stopped must leave at once — with the old code it queued behind the first
+/// turn's connect, and the stop only landed when that connect timed out.
+#[tokio::test(start_paused = true)]
+async fn a_stop_during_another_turns_handshake_returns_promptly() {
+    let (transport, log) = ScriptedAgentTransport::new(Behavior::SilentHandshake);
+    let backend = Arc::new(
+        AcpAgent::with_transport(acp_spec(Map::new()), None, Arc::new(transport))
+            .expect("a valid spec builds"),
+    );
+
+    let (tx_first, rx_first) = mpsc::channel(4);
+    drop(rx_first);
+    let first = {
+        let backend = Arc::clone(&backend);
+        tokio::spawn(async move {
+            backend
+                .chat(request_with_history(), tx_first, CancellationToken::new())
+                .await
+        })
+    };
+    wait_for_log(&log, "the handshake", |entries| {
+        find_request(entries, "initialize").is_some()
+    })
+    .await;
+
+    let cancel = CancellationToken::new();
+    let (tx_second, rx_second) = mpsc::channel(4);
+    drop(rx_second);
+    let second = {
+        let backend = Arc::clone(&backend);
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            backend
+                .chat(request_with_history(), tx_second, cancel)
+                .await
+        })
+    };
+    // Let the second turn reach the establishment gate, then stop it.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stopped_at = tokio::time::Instant::now();
+    cancel.cancel();
+    let error = second.await.expect("joined");
+    let waited = stopped_at.elapsed();
+    assert!(
+        waited < Duration::from_secs(2),
+        "a stopped turn waited {waited:?} for another turn's handshake"
+    );
+    match error {
+        Err(LlmError::Cancelled) => {}
+        other => panic!("a stopped turn must report cancellation, got {other:?}"),
+    }
+
+    // The first turn is still establishing: let it run out its budget so the
+    // test leaves nothing detached behind.
+    let first_result = first.await.expect("joined");
+    match first_result {
+        Err(LlmError::Timeout { .. }) => {}
+        other => panic!("the silent handshake must time out, got {other:?}"),
+    }
+}
+
+/// The lazy reap, and its bound: a *run* of unanswered setup calls is a wedged
+/// process, so the next turn replaces it — once. One turn's timeout is never
+/// allowed to respawn anything (that is the previous test); a process that has
+/// stopped answering setup calls is not kept forever either.
+#[tokio::test(start_paused = true)]
+async fn a_run_of_setup_timeouts_replaces_the_wedged_agent_once() {
+    let (transport, log) = ScriptedAgentTransport::new(Behavior::NeverAnswerSessionNew);
+    let backend = Arc::new(
+        AcpAgent::with_transport(acp_spec(Map::new()), None, Arc::new(transport))
+            .expect("a valid spec builds"),
+    );
+
+    // Each turn times out in setup; the handshake count is what shows whether
+    // the process was replaced.
+    for turn in 1..=4 {
+        let (tx, rx) = mpsc::channel(4);
+        drop(rx);
+        let error = backend
+            .chat(request_with_history(), tx, CancellationToken::new())
+            .await
+            .expect_err("an agent that never answers session/new times out");
+        assert!(
+            matches!(error, LlmError::Timeout { .. }),
+            "turn {turn}: {error}"
+        );
+        let handshakes = logged(&log)
+            .iter()
+            .filter(|entry| entry["method"].as_str() == Some("initialize"))
+            .count();
+        match turn {
+            // Three timeouts in a row are still the same process: replacing on
+            // the first one would be exactly the shared-shutdown bug again.
+            1..=3 => assert_eq!(handshakes, 1, "turn {turn} must reuse the process"),
+            // The fourth turn sees the run and starts a fresh agent, once.
+            _ => assert_eq!(handshakes, 2, "the wedged agent must be replaced once"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the session a turn opens is released when the turn ends
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_completed_turn_closes_its_acp_session() {
+    let (backend, log) = agent(Behavior::Normal);
+    let (tx, rx) = mpsc::channel(32);
+    let events = collect_events(rx);
+    backend
+        .chat(request_with_history(), tx, CancellationToken::new())
+        .await
+        .expect("the turn completes");
+    events.await.expect("joined");
+
+    let entries = wait_for_log(&log, "session/close", |entries| {
+        find_request(entries, "session/close").is_some()
+    })
+    .await;
+    let close = find_request(&entries, "session/close").expect("the turn released its session");
+    assert_eq!(close["params"]["sessionId"], "s-test");
+    // A request (the agent acknowledges it), not a fire-and-forget notification.
+    assert!(
+        close.get("id").is_some(),
+        "session/close must be a request: {close}"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_without_session_close_is_not_sent_one() {
+    // `session/close` is optional in ACP v1 and gated on the agent advertising
+    // `sessionCapabilities.close`. An agent that stayed silent must not receive
+    // a guess — its per-turn sessions live until the process exits, which is
+    // the limit stated in the module docs.
+    let (transport, log) = ScriptedAgentTransport::without_session_close(Behavior::Normal);
+    let backend = AcpAgent::with_transport(acp_spec(Map::new()), None, Arc::new(transport))
+        .expect("a valid spec builds");
+    let (tx, rx) = mpsc::channel(32);
+    let events = collect_events(rx);
+    backend
+        .chat(request_with_history(), tx, CancellationToken::new())
+        .await
+        .expect("the turn completes");
+    events.await.expect("joined");
+
+    // The turn is over, and a close would have been acknowledged before `chat`
+    // returned (it is a request the adapter awaits), so its absence here is
+    // deterministic.
+    let entries = logged(&log);
+    assert!(
+        find_request(&entries, "session/prompt").is_some(),
+        "the turn really ran: {entries:#?}"
+    );
+    assert!(
+        find_request(&entries, "session/close").is_none(),
+        "an unadvertised optional method must not be called: {entries:#?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

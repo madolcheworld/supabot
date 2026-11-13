@@ -9,21 +9,56 @@
 //! Routing is by id and nothing else: `nod_local` runs here, every other id has
 //! to be a connected node or the call fails. A failure is the honest answer —
 //! "that node is not connected" is infrastructure, not a denial.
+//!
+//! **Attribution is a fact, not an inference.** A forwarded call carries the
+//! caller's own [`Invocation`] — every handler already has it in
+//! [`swarmbot_tools::ToolContext::invocation`] — and this module puts it on the
+//! wire unchanged. It used to guess instead: scan `running_turns()`, and if
+//! exactly one turn belonged to a bot hosted on the node, call that the caller.
+//! That is wrong the moment two turns run on one node in parallel, and it was
+//! wrong out loud: the guess was abandoned for the [`unattributed`] sentinel, so
+//! both calls travelled as nobody and the node's audit line and approval card
+//! named nobody. The port carries the invocation now, and there is nothing left
+//! here to infer.
+//!
+//! **Every remote call has a deadline.** A node that keeps its socket alive
+//! (pings, heartbeats) while a handler hangs — `fs.read` on a dead network mount
+//! is the canonical case — would otherwise hold the bot's only turn forever: the
+//! mux's liveness check only notices a *silent* socket, and a hung handler is
+//! not silent. [`deadline_for`] picks the bound: an `fs.*` call gets
+//! [`FS_CALL_DEADLINE`], a shell command gets the caller's own `timeout_ms` plus
+//! [`SHELL_DEADLINE_GRACE`], because a command may legitimately run for minutes
+//! and the node enforces that timeout itself.
+//!
+//! On expiry the call is withdrawn (its pending entry removed, so a late answer
+//! is ignored) and the node is sent `@effect/rpc/Interrupt`, and the tool call
+//! fails with a [`ToolError::failed`] naming the node and the kind of call.
+//! **That is not a cancellation guarantee:** the interrupt *asks* the node to
+//! stop, and our own node answers it by dropping the handler future, which runs
+//! its `Drop` guards and kills the process group (`docs/node-protocol.md`
+//! §4.7/§5.1) — but the brain cannot kill a process on another machine, and a
+//! node that ignores the frame may still be running the command when this side
+//! has given up. The error says exactly that; nothing here reports a success, an
+//! empty result or a finished job it cannot vouch for.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tokio::task::JoinHandle;
+use tracing::debug;
 
 use swarmbot_contracts::Invocation;
-use swarmbot_contracts::id::{BotId, ConversationId, InvocationId, NodeId};
+use swarmbot_contracts::id::{BotId, ConversationId, NodeId};
 use swarmbot_contracts::repo::Persistence;
 use swarmbot_contracts::tool::{ToolError, ToolResult};
-use swarmbot_node_protocol::mux::Peer;
+use swarmbot_node_protocol::mux::{Peer, Socket};
 use swarmbot_node_protocol::rpc::{self, HEADER_NODE_ID, OutputStream, ShellChunk};
-use swarmbot_tools::{NodeCall, NodeExecutor};
+use swarmbot_tools::NodeCall;
+use swarmbot_tools::NodeExecutor;
+use swarmbot_tools::handlers::shell::DEFAULT_SHELL_TIMEOUT_MS;
 
 use super::NodeGateway;
 use super::socket::GatewaySocket;
@@ -38,21 +73,70 @@ const STREAM_BUFFER: usize = 64;
 /// How much of a failed stream's partial output is kept in the error message.
 const PARTIAL_OUTPUT_CHARS: usize = 4 * 1024;
 
-/// The bot and conversation a call is attributed to when the port gives the
-/// executor nothing to attribute it with. See [`NodeDispatcher::attribute`].
+/// How long a node has to answer an `fs.*` call.
+///
+/// A hung filesystem call is almost always a dead network mount or a stalled
+/// server, and those never answer, so the bound is what turns "forever" into an
+/// error a model can react to. Sixty seconds is long enough for a `fs.grep` over
+/// a large tree on a slow disk and short enough that a bot's single turn
+/// survives one stuck call.
+pub const FS_CALL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// What a streaming `shell.exec` gets on top of the caller's own `timeout_ms`.
+///
+/// A shell command can legitimately run for minutes, so the caller's timeout —
+/// not a brain constant — sets the scale: the wire already carries it
+/// (`rpc::ShellExec::timeout_ms`, defaulting to the local executor's
+/// [`DEFAULT_SHELL_TIMEOUT_MS`]). The grace covers what the node still has to do
+/// *after* that timeout fires: kill the process group, drain the pipes and send
+/// the `Exit` chunk. Without it, every command that ended by timing out would be
+/// reported as a node failure instead of as the timed-out run it was.
+pub const SHELL_DEADLINE_GRACE: Duration = Duration::from_secs(30);
+
+/// How long the chunk collector may take to finish once the call is over.
+///
+/// It normally resolves at once (the driver drops the chunk sink when the call
+/// settles or is withdrawn), and it is bounded anyway so that a driver wedged on
+/// a socket that is not draining cannot outlive the deadline above.
+const STREAM_COLLECT_GRACE: Duration = Duration::from_secs(5);
+
+/// The deadline for one call: the caller's own budget where it has one.
+pub fn deadline_for(call: &NodeCall) -> Duration {
+    match call {
+        NodeCall::ShellExec { timeout_ms, .. } => {
+            Duration::from_millis(timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS))
+                + SHELL_DEADLINE_GRACE
+        }
+        _ => FS_CALL_DEADLINE,
+    }
+}
+
+/// The bot and conversation a **node's approval ask** is placed in when nothing
+/// attributes it.
+///
+/// A forwarded call always carries its caller's [`Invocation`] now, so the
+/// dispatcher never invents one; this sentinel survives for the one path that
+/// still has to answer with no attribution at all — a node whose
+/// `node.requestApproval` arrives naming a bot this brain cannot place (see
+/// [`super::session`]). A card in the wrong conversation would be a lie about who
+/// asked, so the sentinel is used instead of a guess.
 pub const UNATTRIBUTED: &str = "unknown";
 
 /// Routes a call to the local machine or to a connected node.
-pub struct NodeDispatcher {
+///
+/// Generic over the socket only so its own tests can drive it over an in-memory
+/// pair instead of a WebSocket; production code always means
+/// [`GatewaySocket`], which is the default.
+pub struct NodeDispatcher<S: Socket = GatewaySocket> {
     local: Arc<dyn NodeExecutor>,
-    gateway: Arc<NodeGateway>,
+    gateway: Arc<NodeGateway<S>>,
     store: Arc<dyn Persistence>,
 }
 
-impl NodeDispatcher {
+impl<S: Socket> NodeDispatcher<S> {
     pub fn new(
         local: Arc<dyn NodeExecutor>,
-        gateway: Arc<NodeGateway>,
+        gateway: Arc<NodeGateway<S>>,
         store: Arc<dyn Persistence>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -62,65 +146,25 @@ impl NodeDispatcher {
         })
     }
 
-    /// The invocation a remote call travels with.
+    /// The invocation a forwarded call travels with: the caller's own, with the
+    /// target node stamped on it.
     ///
-    /// The [`NodeExecutor`] port hands an executor a node id and a call and
-    /// nothing else — no bot, no conversation, no turn — while a node audits every
-    /// call against the invocation it is given and echoes it back in
-    /// `node.requestApproval`. So the brain has to say *something*, and it says
-    /// something true or nothing at all:
+    /// The attribution is **not** worked out here any more. Every handler already
+    /// holds it in [`swarmbot_tools::ToolContext::invocation`], so the port hands
+    /// it over and this only records the one fact the caller could not know: which
+    /// machine the call ended up being sent to. The old code scanned
+    /// `running_turns()` and picked the single turn whose bot was hosted on this
+    /// node — an inference that gave up (and sent the [`UNATTRIBUTED`] sentinel)
+    /// as soon as two turns ran on one node, which is exactly the parallel case a
+    /// multi-bot runtime exists for.
     ///
-    /// * a tool call only happens inside a turn, and a bot runs one turn at a
-    ///   time, so when **exactly one** running turn belongs to a bot hosted on
-    ///   this node, that turn is the caller;
-    /// * anything else — nobody running, or two bots on one node mid-turn — gets
-    ///   the [`UNATTRIBUTED`] sentinel rather than a guess. A card in the wrong
-    ///   conversation would be a lie about who asked, and the gateway says so
-    ///   plainly when it has to answer one.
-    ///
-    /// Fixing this properly means widening the port (`exec` taking the
-    /// invocation); that is a `swarmbot-tools` change, not one this crate may
-    /// make from inside an adapter.
-    fn attribute(&self, node: &NodeId) -> Invocation {
-        let turns = match self.store.running_turns() {
-            Ok(turns) => turns,
-            Err(error) => {
-                warn!(%error, "cannot read the running turns; a remote call goes unattributed");
-                return unattributed();
-            }
-        };
-        let mut candidates = Vec::new();
-        for turn in turns {
-            let hosted_here = self
-                .store
-                .get_bot(&turn.bot_id)
-                .ok()
-                .flatten()
-                .is_some_and(|bot| &bot.host_node() == node);
-            if hosted_here {
-                candidates.push(turn);
-            }
-        }
-        let [turn] = candidates.as_slice() else {
-            if candidates.len() > 1 {
-                debug!(
-                    node = %node,
-                    candidates = candidates.len(),
-                    "more than one turn is running on this node; the call goes unattributed \
-                     rather than being blamed on a guess"
-                );
-            }
-            return unattributed();
-        };
-        Invocation {
-            id: InvocationId::new(),
-            bot_id: turn.bot_id.clone(),
-            conversation_id: turn.conversation_id.clone(),
-            turn_id: Some(turn.id.clone()),
-            task_id: turn.task_id.clone(),
-            tool_call_id: None,
-            node_id: Some(node.clone()),
-        }
+    /// `node_id` is overwritten rather than left as the caller set it: the wire's
+    /// invocation has to name the node the frame actually goes to, and `None` there
+    /// means "the bot's host node", which is a different claim from "this node".
+    fn invocation_for(&self, node: &NodeId, invocation: &Invocation) -> Invocation {
+        let mut stamped = invocation.clone();
+        stamped.node_id = Some(node.clone());
+        stamped
     }
 
     /// Why this node cannot run this call, or `None` when it can.
@@ -164,54 +208,97 @@ impl NodeDispatcher {
 
     async fn unary(
         &self,
-        peer: &Peer<GatewaySocket>,
+        peer: &Peer<S>,
         node: &NodeId,
         outgoing: &Outgoing,
         call: &NodeCall,
     ) -> Result<ToolResult, ToolError> {
         let id = peer.next_id();
-        debug!(method = outgoing.method, request = %id, %node, "a remote call goes out");
+        let deadline = deadline_for(call);
+        debug!(
+            method = outgoing.method,
+            request = %id,
+            %node,
+            deadline_ms = deadline.as_millis(),
+            "a remote call goes out"
+        );
         match peer
-            .call_with_id(id, outgoing.method, outgoing.params.clone(), headers(node))
+            .call_with_id_deadline(
+                id,
+                outgoing.method,
+                outgoing.params.clone(),
+                headers(node),
+                deadline,
+            )
             .await
         {
             Ok(value) => wire::decode_result(outgoing.method, call, value),
-            Err(error) => Err(wire::translate(outgoing.method, &error)),
+            Err(error) => Err(wire::translate(node, outgoing.method, &error)),
         }
     }
 
     /// A streaming call: chunks are collected on their own task, because the
     /// driver awaits the buffer and would stall the connection otherwise.
+    ///
+    /// The deadline covers the whole stream. On expiry the call is withdrawn,
+    /// which drops the chunk sink, so the collector finishes instead of waiting
+    /// for a stream that will never end — and whatever output *did* arrive is
+    /// kept in the error, because a command that printed half its diagnosis
+    /// before the node went quiet still said something worth reading.
     async fn stream(
         &self,
-        peer: &Peer<GatewaySocket>,
+        peer: &Peer<S>,
         node: &NodeId,
         outgoing: &Outgoing,
+        call: &NodeCall,
     ) -> Result<ToolResult, ToolError> {
         let (tx, rx) = mpsc::channel::<Value>(STREAM_BUFFER);
-        let collector = tokio::spawn(collect_stream(rx));
+        let mut collector = tokio::spawn(collect_stream(rx));
         let id = peer.next_id();
-        debug!(method = outgoing.method, request = %id, %node, "a remote stream goes out");
+        let deadline = deadline_for(call);
+        debug!(
+            method = outgoing.method,
+            request = %id,
+            %node,
+            deadline_ms = deadline.as_millis(),
+            "a remote stream goes out"
+        );
         let outcome = peer
-            .call_stream_with_id(
+            .call_stream_with_id_deadline(
                 id,
                 outgoing.method,
                 outgoing.params.clone(),
                 headers(node),
                 tx,
+                deadline,
             )
             .await;
-        let run = collector
-            .await
-            .map_err(|error| ToolError::failed(format!("the stream collector failed: {error}")))?;
+        let run = match collect_within(&mut collector).await {
+            Ok(run) => Some(run),
+            // The call is over but the driver has not let go of the sink yet (a
+            // socket that is not draining). The deadline is the promise this
+            // module makes, so the cleanup does not get to outlast it.
+            Err(CollectFailure::Wedged) => None,
+            Err(CollectFailure::Join(error)) => {
+                return Err(ToolError::failed(format!(
+                    "the stream collector failed: {error}"
+                )));
+            }
+        };
         match outcome {
-            Ok(()) => wire::shell_result(&run),
+            Ok(()) => match run {
+                Some(run) => wire::shell_result(&run),
+                // A settled stream releases the sink, so this is unreachable in
+                // practice — and still a typed failure rather than a fake
+                // success if it ever is not.
+                None => Err(ToolError::failed(
+                    "the node ended the shell stream but its output could not be collected in time",
+                )),
+            },
             Err(error) => {
-                let translated = wire::translate(outgoing.method, &error);
-                // Output that arrived before the failure is kept in the message:
-                // a command that printed half its diagnosis and then lost the
-                // socket still said something worth reading.
-                let partial = partial_output(&run);
+                let translated = wire::translate(node, outgoing.method, &error);
+                // Output that arrived before the failure is kept in the message.
+                let partial = run.as_ref().map(partial_output).unwrap_or_default();
                 if partial.is_empty() {
                     return Err(translated);
                 }
@@ -224,10 +311,19 @@ impl NodeDispatcher {
 }
 
 #[async_trait]
-impl NodeExecutor for NodeDispatcher {
-    async fn exec(&self, node: &NodeId, call: NodeCall) -> Result<ToolResult, ToolError> {
+impl<S: Socket> NodeExecutor for NodeDispatcher<S> {
+    /// Route one call. `invocation` is the caller's own and is forwarded as it
+    /// stands (with the node stamped on it) — the node audits against it and echoes
+    /// it in `node.requestApproval`, so it is never re-derived from "who looks like
+    /// they are running here".
+    async fn exec(
+        &self,
+        node: &NodeId,
+        invocation: &Invocation,
+        call: NodeCall,
+    ) -> Result<ToolResult, ToolError> {
         if node.is_local() {
-            return self.local.exec(node, call).await;
+            return self.local.exec(node, invocation, call).await;
         }
         // Refuse here rather than on the socket when the roster already knows the
         // answer: an unpaired, revoked or offline node, or one whose owner never
@@ -243,17 +339,16 @@ impl NodeExecutor for NodeDispatcher {
                 "node {node} is not connected: its control socket is gone"
             )));
         };
-        let invocation = self.attribute(node);
-        let outgoing = wire::encode(invocation, &call)?;
+        let outgoing = wire::encode(self.invocation_for(node, invocation), &call)?;
         if outgoing.streaming {
-            self.stream(&peer, node, &outgoing).await
+            self.stream(&peer, node, &outgoing, &call).await
         } else {
             self.unary(&peer, node, &outgoing, &call).await
         }
     }
 }
 
-impl std::fmt::Debug for NodeDispatcher {
+impl<S: Socket> std::fmt::Debug for NodeDispatcher<S> {
     /// Manual: the local executor and the store are trait objects.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeDispatcher")
@@ -288,9 +383,31 @@ pub fn unattributed() -> Invocation {
     )
 }
 
-/// Is this invocation the placeholder rather than a real bot?
-pub fn is_unattributed(invocation: &Invocation) -> bool {
-    invocation.bot_id.as_str() == BotId::from_suffix(UNATTRIBUTED).as_str()
+/// Why a stream collector did not produce a [`ShellRun`].
+enum CollectFailure {
+    /// The collector task itself failed.
+    Join(tokio::task::JoinError),
+    /// The chunk sink was still held after the call ended: a driver wedged on a
+    /// socket that is not draining.
+    Wedged,
+}
+
+/// Wait for a stream collector, but not forever.
+///
+/// The collector ends when the driver drops the chunk sink, which happens as
+/// soon as the call settles or is withdrawn — so this normally returns at once.
+/// The bound exists for the one case that has no other bound: a driver stuck
+/// writing to a socket that is not draining. Abandoning the collector is honest
+/// (its output is reported as missing) where waiting past the deadline would
+/// break the promise this module makes.
+async fn collect_within(collector: &mut JoinHandle<ShellRun>) -> Result<ShellRun, CollectFailure> {
+    match tokio::time::timeout(STREAM_COLLECT_GRACE, &mut *collector).await {
+        Ok(joined) => joined.map_err(CollectFailure::Join),
+        Err(_) => {
+            collector.abort();
+            Err(CollectFailure::Wedged)
+        }
+    }
 }
 
 /// Collect a stream into a [`ShellRun`].
@@ -375,9 +492,31 @@ pub fn method_of(call: &NodeCall) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use swarmbot_contracts::repo::{BotRepo as _, TurnRepo as _};
+    use chrono::Utc;
+    use swarmbot_contracts::id::InvocationId;
+    use swarmbot_contracts::node::{NodeInfo, NodeKind, PolicyCeiling, PolicyMap};
+    use swarmbot_contracts::repo::{BotRepo as _, NodeRepo as _, TurnRepo as _};
     use swarmbot_contracts::turn::{Turn, TurnInitiator};
+    use swarmbot_node_protocol::mux::PeerConfig;
+    use swarmbot_node_protocol::testing::{LineSocket, duplex_pair};
+    use swarmbot_node_protocol::wire::{Frame, Id, parse as parse_frame};
     use swarmbot_store::MemoryStore;
+
+    use crate::gateway::Connected;
+
+    /// The socket type these tests drive: an in-memory pair, no ports.
+    type TestSocket = LineSocket<tokio::io::DuplexStream>;
+
+    /// A peer config whose timers cannot fire inside a test: the liveness
+    /// timeout would otherwise close the very socket the test leaves silent, and
+    /// a ping would put frames between the ones the test asserts on.
+    fn quiet_config() -> PeerConfig {
+        PeerConfig {
+            ping_interval: Duration::from_secs(3600),
+            liveness_timeout: Duration::from_secs(3600),
+            ..PeerConfig::default()
+        }
+    }
 
     fn dispatcher_with(
         turns: Vec<Turn>,
@@ -397,14 +536,54 @@ mod tests {
         }
     }
 
+    /// A dispatcher with one *connected* node, plus the far end of its socket so
+    /// the test decides what the node answers — including nothing at all.
+    fn dispatcher_with_connected_node(
+        node: &NodeId,
+    ) -> (Arc<NodeDispatcher<TestSocket>>, TestSocket) {
+        let store = Arc::new(MemoryStore::default());
+        let mut info = NodeInfo::local(
+            "test node",
+            Vec::new(),
+            PolicyMap::uniform(PolicyCeiling::Always),
+        );
+        info.id = node.clone();
+        info.kind = NodeKind::Remote;
+        info.online = true;
+        store.insert_node(&info).expect("the node is stored");
+        let (mine, theirs) = duplex_pair(64 * 1024);
+        let gateway = NodeGateway::<TestSocket>::new("http://127.0.0.1:1");
+        let _ = gateway.register(Connected {
+            node_id: node.clone(),
+            peer: Peer::new(mine, quiet_config()),
+            generation: gateway.next_generation(),
+            connected_at: Utc::now(),
+            protocol: swarmbot_node_protocol::PROTOCOL_VERSION,
+            label: "test node".into(),
+        });
+        let dispatcher = NodeDispatcher::new(Arc::new(RecordingExecutor), gateway, store);
+        (dispatcher, theirs)
+    }
+
     /// An executor that never runs anything: these tests are about attribution.
     struct RecordingExecutor;
 
     #[async_trait]
     impl NodeExecutor for RecordingExecutor {
-        async fn exec(&self, _node: &NodeId, _call: NodeCall) -> Result<ToolResult, ToolError> {
+        async fn exec(
+            &self,
+            _node: &NodeId,
+            _invocation: &Invocation,
+            _call: NodeCall,
+        ) -> Result<ToolResult, ToolError> {
             Err(ToolError::failed("not used by these tests"))
         }
+    }
+
+    /// A caller's invocation, for the tests that only care that *something* was
+    /// attributed (the two-turn test builds its own, by hand).
+    fn test_invocation() -> Invocation {
+        Invocation::new(BotId::new(), ConversationId::new())
     }
 
     fn bot_on(node: &NodeId, name: &str) -> swarmbot_contracts::bot::Bot {
@@ -424,54 +603,148 @@ mod tests {
         )
     }
 
-    #[test]
-    fn a_single_running_turn_on_the_node_attributes_the_call() {
+    /// The defect the widened port removes: two turns on one node at the same
+    /// time. `attribute()` gave up as soon as it saw more than one candidate and
+    /// sent [`unattributed`] for both calls, so the node's audit line and any
+    /// approval card named nobody — for the exact concurrency a multi-bot runtime
+    /// exists to have. Now each call carries the invocation of the turn that made
+    /// it, and nothing on this side has to guess.
+    #[tokio::test]
+    async fn two_turns_on_one_node_each_carry_their_own_invocation_to_the_node() {
         let node = NodeId::new();
-        let bot = bot_on(&node, "dev");
-        let turn = running(&bot.id, &bot.direct_conversation_id);
-        let dispatcher = dispatcher_with(vec![turn.clone()], vec![bot.clone()]);
+        let (dispatcher, mut node_side) = dispatcher_with_connected_node(&node);
 
-        let invocation = dispatcher.attribute(&node);
-        assert_eq!(invocation.bot_id, bot.id);
-        assert_eq!(invocation.conversation_id, bot.direct_conversation_id);
-        assert_eq!(invocation.turn_id, Some(turn.id));
-        assert_eq!(invocation.node_id, Some(node.clone()));
-        assert!(!is_unattributed(&invocation));
-    }
-
-    #[test]
-    fn an_ambiguous_or_empty_node_is_never_guessed_at() {
-        let node = NodeId::new();
-        let one = bot_on(&node, "dev");
-        let two = bot_on(&node, "scout");
-        let elsewhere = bot_on(&NodeId::new(), "lead");
-
-        // Nobody running.
-        let dispatcher = dispatcher_with(vec![], vec![one.clone()]);
-        assert!(is_unattributed(&dispatcher.attribute(&node)));
-
-        // Two turns on one node: blaming either would be a guess.
-        let dispatcher = dispatcher_with(
-            vec![
-                running(&one.id, &one.direct_conversation_id),
-                running(&two.id, &two.direct_conversation_id),
-            ],
-            vec![one.clone(), two],
+        // Both bots are hosted here and both are mid-turn: the ambiguous case the
+        // old inference refused to answer.
+        let dev = bot_on(&node, "dev");
+        let scout = bot_on(&node, "scout");
+        for bot in [&dev, &scout] {
+            dispatcher.store.insert_bot(bot).expect("a bot is stored");
+        }
+        let dev_turn = running(&dev.id, &dev.direct_conversation_id);
+        let scout_turn = running(&scout.id, &scout.direct_conversation_id);
+        for turn in [&dev_turn, &scout_turn] {
+            dispatcher
+                .store
+                .insert_turn(turn)
+                .expect("a turn is stored");
+        }
+        assert_eq!(
+            dispatcher
+                .store
+                .running_turns()
+                .expect("the turns read")
+                .len(),
+            2,
+            "the premise of this test: two turns are running on one node"
         );
-        assert!(is_unattributed(&dispatcher.attribute(&node)));
 
-        // A turn running on a *different* node's bot does not count.
-        let dispatcher = dispatcher_with(
-            vec![running(&elsewhere.id, &elsewhere.direct_conversation_id)],
-            vec![elsewhere],
+        let caller = |bot: &swarmbot_contracts::bot::Bot, turn: &Turn| Invocation {
+            id: InvocationId::new(),
+            bot_id: bot.id.clone(),
+            conversation_id: bot.direct_conversation_id.clone(),
+            turn_id: Some(turn.id.clone()),
+            task_id: None,
+            tool_call_id: None,
+            node_id: None,
+        };
+        let dev_inv = caller(&dev, &dev_turn);
+        let scout_inv = caller(&scout, &scout_turn);
+
+        // Two remote calls in flight together, exactly as two bots' turns would
+        // be. Neither answers, so the frames are read while the calls wait.
+        let first = tokio::spawn({
+            let dispatcher = Arc::clone(&dispatcher);
+            let node = node.clone();
+            let invocation = dev_inv.clone();
+            async move {
+                dispatcher
+                    .exec(
+                        &node,
+                        &invocation,
+                        NodeCall::FsStat {
+                            path: "dev.txt".into(),
+                        },
+                    )
+                    .await
+            }
+        });
+        let second = tokio::spawn({
+            let dispatcher = Arc::clone(&dispatcher);
+            let node = node.clone();
+            let invocation = scout_inv.clone();
+            async move {
+                dispatcher
+                    .exec(
+                        &node,
+                        &invocation,
+                        NodeCall::FsStat {
+                            path: "scout.txt".into(),
+                        },
+                    )
+                    .await
+            }
+        });
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let text = node_side
+                .recv_text()
+                .await
+                .expect("a frame")
+                .expect("a request frame");
+            match parse_frame(&text).expect("parses") {
+                Frame::Request { params, .. } => seen.push(params),
+                other => panic!("expected a Request frame, got {other:?}"),
+            }
+        }
+        first.abort();
+        second.abort();
+
+        // Each frame is attributed to *its* caller, by bot, conversation and turn —
+        // matched on the call's path so this does not depend on frame order.
+        let attribution = |path: &str| {
+            let params = seen
+                .iter()
+                .find(|params| params["path"] == path)
+                .unwrap_or_else(|| panic!("no frame for {path}: {seen:?}"));
+            &params["inv"]
+        };
+        let dev_seen = attribution("dev.txt");
+        assert_eq!(dev_seen["bot_id"], Value::from(dev.id.to_string()));
+        assert_eq!(
+            dev_seen["conversation_id"],
+            Value::from(dev.direct_conversation_id.to_string())
         );
-        assert!(is_unattributed(&dispatcher.attribute(&node)));
+        assert_eq!(dev_seen["turn_id"], Value::from(dev_turn.id.to_string()));
+        assert_eq!(dev_seen["id"], Value::from(dev_inv.id.to_string()));
+
+        let scout_seen = attribution("scout.txt");
+        assert_eq!(scout_seen["bot_id"], Value::from(scout.id.to_string()));
+        assert_eq!(
+            scout_seen["conversation_id"],
+            Value::from(scout.direct_conversation_id.to_string())
+        );
+        assert_eq!(
+            scout_seen["turn_id"],
+            Value::from(scout_turn.id.to_string())
+        );
+
+        // And neither is the sentinel: the old code would have sent this for both.
+        for params in [dev_seen, scout_seen] {
+            assert_ne!(
+                params["bot_id"],
+                Value::from(format!("bot_{UNATTRIBUTED}")),
+                "a call that reached the node named nobody: {params}"
+            );
+        }
     }
 
     #[test]
     fn the_sentinel_is_recognisable_and_stable() {
+        // Kept for the one caller that still has no attribution to offer: a node's
+        // own `node.requestApproval` naming a bot this brain cannot place.
         let invocation = unattributed();
-        assert!(is_unattributed(&invocation));
         assert_eq!(invocation.bot_id.as_str(), "bot_unknown");
         assert_eq!(invocation.conversation_id.as_str(), "cnv_unknown");
         // Two sentinels differ in id, so a node's audit log can still tell two
@@ -486,6 +759,7 @@ mod tests {
         let error = dispatcher
             .exec(
                 &node,
+                &test_invocation(),
                 NodeCall::ShellExec {
                     command: "rm -rf /".into(),
                     cwd: None,
@@ -504,13 +778,151 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_filesystem_call_gets_the_short_deadline() {
+        for call in [
+            NodeCall::FsRead {
+                path: "a.txt".into(),
+                offset: None,
+                limit: None,
+                encoding: None,
+            },
+            NodeCall::FsStat {
+                path: "a.txt".into(),
+            },
+            NodeCall::FsGrep {
+                pattern: "todo".into(),
+                path: None,
+                glob: None,
+                ignore_case: None,
+                literal: None,
+                context_lines: None,
+                output_mode: None,
+                limit: None,
+            },
+        ] {
+            assert_eq!(deadline_for(&call), FS_CALL_DEADLINE);
+        }
+        // The bound is stated here so that changing it is a deliberate change:
+        // it has to be long enough for a big grep on a slow disk and short
+        // enough that a bot's single turn survives a stuck call.
+        assert!(FS_CALL_DEADLINE >= Duration::from_secs(30));
+        assert!(FS_CALL_DEADLINE <= Duration::from_secs(120));
+    }
+
+    #[test]
+    fn a_shell_call_is_bounded_by_its_own_timeout_not_by_the_fs_deadline() {
+        // The caller's `timeout_ms` is what a shell command is allowed to spend,
+        // so the deadline has to follow it — plus a grace for the node to kill
+        // the group, drain the pipes and send the `Exit` chunk.
+        let with_timeout = deadline_for(&NodeCall::ShellExec {
+            command: "cargo test".into(),
+            cwd: None,
+            timeout_ms: Some(5_000),
+            env: None,
+        });
+        assert_eq!(with_timeout, Duration::from_secs(5) + SHELL_DEADLINE_GRACE);
+        // Without one, the local executor's default is the budget — not the fs
+        // bound, which would cut a legitimate two-minute build in half.
+        let default = deadline_for(&NodeCall::ShellExec {
+            command: "true".into(),
+            cwd: None,
+            timeout_ms: None,
+            env: None,
+        });
+        assert_eq!(
+            default,
+            Duration::from_millis(DEFAULT_SHELL_TIMEOUT_MS) + SHELL_DEADLINE_GRACE
+        );
+        assert!(
+            default > FS_CALL_DEADLINE,
+            "a shell command must not be cut at the filesystem bound"
+        );
+    }
+
+    /// The defect this pins: a node that keeps its socket alive while a handler
+    /// hangs left the bot's only turn waiting forever, because nothing bounded a
+    /// call. Now the call fails with a typed error naming the node, and the
+    /// turn gets its model back.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_node_fails_the_call_with_a_typed_error_naming_the_node() {
+        let node = NodeId::new();
+        let (dispatcher, mut node_side) = dispatcher_with_connected_node(&node);
+        let call = tokio::spawn({
+            let dispatcher = Arc::clone(&dispatcher);
+            let node = node.clone();
+            async move {
+                dispatcher
+                    .exec(
+                        &node,
+                        &test_invocation(),
+                        NodeCall::FsRead {
+                            path: "notes.txt".into(),
+                            offset: None,
+                            limit: None,
+                            encoding: None,
+                        },
+                    )
+                    .await
+            }
+        });
+
+        // The request reaches the node; the node deliberately never answers.
+        let request = node_side
+            .recv_text()
+            .await
+            .expect("a frame")
+            .expect("the request frame");
+        assert!(matches!(
+            parse_frame(&request).expect("parses"),
+            Frame::Request { .. }
+        ));
+
+        // Before the deadline the call is still running: this is a deadline, not
+        // an instant failure.
+        tokio::time::advance(FS_CALL_DEADLINE - Duration::from_secs(1)).await;
+        assert!(!call.is_finished(), "the call failed before its deadline");
+
+        // After it, the tool call fails instead of holding the bot's turn.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let error = call
+            .await
+            .expect("the exec task finishes")
+            .expect_err("a node that never answers cannot produce a result");
+        match error {
+            ToolError::Failed { message } => {
+                assert!(message.contains(&node.to_string()), "{message}");
+                assert!(message.contains(rpc::FS_READ), "{message}");
+                assert!(message.contains("did not answer"), "{message}");
+            }
+            // A timeout is infrastructure breaking, never a policy denial the
+            // model could retry into a different answer.
+            other => panic!("a timeout is a failure, not a denial: {other:?}"),
+        }
+
+        // And the node was asked to stop, not merely abandoned.
+        let interrupt = node_side
+            .recv_text()
+            .await
+            .expect("a frame")
+            .expect("the interrupt frame");
+        match parse_frame(&interrupt).expect("parses") {
+            Frame::Interrupt { request_id } => assert_eq!(request_id, Id::Number(0)),
+            other => panic!("expected an Interrupt frame, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn a_local_call_never_touches_the_gateway() {
         let dispatcher = dispatcher_with(vec![], vec![]);
         // The recording executor proves the local branch was taken: the gateway is
         // empty, so a remote route would have failed with "not connected".
         let error = dispatcher
-            .exec(&NodeId::local(), NodeCall::FsStat { path: ".".into() })
+            .exec(
+                &NodeId::local(),
+                &test_invocation(),
+                NodeCall::FsStat { path: ".".into() },
+            )
             .await
             .expect_err("the recording executor always fails");
         assert!(

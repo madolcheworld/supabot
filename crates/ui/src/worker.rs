@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use swarmbot_client::{BrainClient, ClientError};
 use swarmbot_contracts::LiveCursor;
@@ -371,17 +371,24 @@ pub fn spawn_pump(cx: &mut App, state: Entity<AppState>, events: Receiver<Worker
     .detach();
 }
 
-/// A ticker that advances the spinner phase and re-renders — but only while
-/// something time-based is actually on screen (a busy bot, a pending card's
-/// countdown, or a recent resync), so an idle window stays cheap on llvmpipe.
+/// A ticker that advances the spinner phase and expires a stale toast, and
+/// re-renders — but only while something time-based is actually on screen (a
+/// busy bot, a pending card's countdown, a recent resync, or a toast inside its
+/// window), so an idle window stays cheap on llvmpipe.
 pub fn spawn_ticker(cx: &mut App, state: Entity<AppState>) {
     cx.spawn(async move |cx: &mut AsyncApp| {
         loop {
             cx.background_executor().timer(TICK_INTERVAL).await;
             let _ = cx.update(|app| {
                 state.update(app, |state, cx| {
-                    if should_animate(state) {
+                    // The one place a toast is dropped: the reducer records when
+                    // it was set, and this tick is the clock that acts on it.
+                    let expired = state.expire_toast(Instant::now());
+                    let animate = should_animate(state);
+                    if animate {
                         state.spinner_phase = state.spinner_phase.wrapping_add(1);
+                    }
+                    if expired || animate {
                         cx.notify();
                     }
                 });
@@ -394,6 +401,11 @@ pub fn spawn_ticker(cx: &mut App, state: Entity<AppState>) {
 /// Whether a periodic redraw would change anything the user can see.
 fn should_animate(state: &AppState) -> bool {
     if state.any_busy() {
+        return true;
+    }
+    // A toast is on a clock: the tick that expires it has to run even when
+    // nothing else is moving, so the message cannot outlive its cause.
+    if state.toast.is_some() {
         return true;
     }
     // A pending card with an expiry needs its countdown to tick.
@@ -472,5 +484,30 @@ mod tests {
     fn stop_is_a_control_signal_with_no_result() {
         let brain = ScriptedBrain::new();
         assert!(run_command(&brain, Command::Stop).is_none());
+    }
+
+    /// The ticker is the only clock a toast has. If a toast stopped counting as
+    /// "something on screen", the tick would stop and the message would sit
+    /// there forever — the bug this wiring exists to prevent.
+    #[test]
+    fn a_visible_toast_keeps_the_ticker_running_until_it_expires() {
+        use crate::state::TOAST_TTL;
+
+        let mut state = AppState::new("http://brain.test");
+        assert!(
+            !should_animate(&state),
+            "a quiet, idle window is not redrawn"
+        );
+
+        let set_at = Instant::now();
+        state.set_toast("settings saved", set_at);
+        assert!(
+            should_animate(&state),
+            "a toast is time-bounded, so the tick that expires it must keep running"
+        );
+
+        // Once the window is over the tick clears it and the ticker can rest.
+        assert!(state.expire_toast(set_at + TOAST_TTL));
+        assert!(!should_animate(&state));
     }
 }
