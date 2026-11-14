@@ -128,6 +128,13 @@ auto_approve_read_only = true
 transcript_mirror = true          # append every entry to transcripts/*.jsonl
 compact_at_fraction = 0.6         # compact a session past 60% of its context
 
+# Token budgets, in tokens as the backends report them (this workspace has no
+# price table). Omit a key for no cap — `0` is not a spelling of "unlimited".
+# The per-turn cap stops new model rounds; the per-day cap refuses new turns
+# once the rolling 24 h window `GET /api/usage` shows has spent this much.
+# max_tokens_per_turn = 250_000
+# max_tokens_per_day = 5_000_000
+
 # Brain-side ceilings. A node's own ceiling always wins by minimum, so this can
 # only ever tighten what a remote machine does.
 [settings.safety]

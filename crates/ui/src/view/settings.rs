@@ -1,8 +1,8 @@
 //! The Settings screen: the backend list with a **Probe** button that shows the
 //! result verbatim (including a gateway's own message, e.g. an inferhub 402 bid
 //! line), and the brain-wide [`Settings`] the owner can change — the bot
-//! messaging kill switch, hop/tool-round limits, auto-approve for read-only, and
-//! the safety ceiling.
+//! messaging kill switch, hop/tool-round limits, the per-turn and per-day token
+//! caps, auto-approve for read-only, and the safety ceiling.
 //!
 //! Editing happens on a draft ([`AppState::settings_draft`]); **Save** diffs it
 //! against the last-saved settings ([`diff`]) and PATCHes only the keys that
@@ -19,6 +19,17 @@ use crate::proto::Command;
 use crate::state::AppState;
 use crate::theme;
 use crate::widgets::bits::{self, Tone};
+
+/// Tokens per click of a token-cap stepper. A budget is spent in thousands, so a
+/// step of one would need five million clicks to cross the clamp and make the
+/// control useless in practice; ten thousand is about one model round trip.
+const TOKEN_CAP_STEP: i64 = 10_000;
+
+/// The largest cap this screen offers. Above this the number stops meaning
+/// anything an owner can reason about, and an attempted `u64::MAX` would show a
+/// value cell nobody can read. A config file may still set a larger cap; the
+/// stepper then leaves it alone rather than shrinking it.
+const TOKEN_CAP_MAX: u64 = 5_000_000;
 
 /// The keys Save will PATCH, computed by diffing `saved` against `draft`. Only
 /// changed scalar keys and a changed `safety` map are included; an unchanged
@@ -43,6 +54,22 @@ pub fn diff(saved: &Settings, draft: &Settings) -> Value {
     if saved.transcript_mirror != draft.transcript_mirror {
         map.insert("transcript_mirror".into(), json!(draft.transcript_mirror));
     }
+    // A token cap is sent as a number or as `null` (no cap). Zero is not a value
+    // the brain accepts — it is an error, never "unlimited" — so a stray `Some(0)`
+    // is normalised to `null` here as a second line of defence behind the
+    // stepper, which already cannot produce it.
+    if saved.max_tokens_per_turn != draft.max_tokens_per_turn {
+        map.insert(
+            "max_tokens_per_turn".into(),
+            json!(draft.max_tokens_per_turn.filter(|tokens| *tokens > 0)),
+        );
+    }
+    if saved.max_tokens_per_day != draft.max_tokens_per_day {
+        map.insert(
+            "max_tokens_per_day".into(),
+            json!(draft.max_tokens_per_day.filter(|tokens| *tokens > 0)),
+        );
+    }
     if saved.safety != draft.safety {
         map.insert(
             "safety".into(),
@@ -50,6 +77,43 @@ pub fn diff(saved: &Settings, draft: &Settings) -> Value {
         );
     }
     Value::Object(map)
+}
+
+/// One click of a token-cap stepper, as the value to store in the draft.
+///
+/// `None` is the *only* representation of "no cap": the brain rejects `Some(0)`
+/// as an error rather than reading it as unlimited, so a step that lands on or
+/// below zero has to come back as `None`. That is the whole reason this is a
+/// function with a test instead of an inline `clamp`, which would happily
+/// produce `Some(0)`.
+///
+/// `+` never lowers a cap that a config file set above [`TOKEN_CAP_MAX`]: a
+/// control that shrinks the number it is asked to raise is a lie, so the current
+/// value is the ceiling in that one case.
+fn stepped_token_cap(cap: Option<u64>, delta: i64) -> Option<u64> {
+    let current = cap.map_or(0, |tokens| i64::try_from(tokens).unwrap_or(i64::MAX));
+    let step = delta.saturating_mul(TOKEN_CAP_STEP);
+    let next = if step > 0 {
+        current
+            .saturating_add(step)
+            .min((TOKEN_CAP_MAX as i64).max(current))
+    } else {
+        current.saturating_add(step).max(0)
+    };
+    // `next` is non-negative by construction, so this cast cannot lose a sign.
+    match next as u64 {
+        0 => None,
+        tokens => Some(tokens),
+    }
+}
+
+/// A token cap as its row shows it: `off` for no cap, the token count otherwise.
+/// Never `0` — zero is a value the brain refuses, not "unlimited".
+fn token_cap_label(cap: Option<u64>) -> String {
+    match cap {
+        None => "off".to_string(),
+        Some(tokens) => tokens.to_string(),
+    }
 }
 
 pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::Div {
@@ -477,6 +541,22 @@ fn settings_section(
                 d.max_tool_rounds = (d.max_tool_rounds as i64 + delta).clamp(1, 256) as u32;
             },
         ))
+        .child(token_cap_row(
+            "token cap / turn",
+            draft.max_tokens_per_turn,
+            state,
+            |d, delta| {
+                d.max_tokens_per_turn = stepped_token_cap(d.max_tokens_per_turn, delta);
+            },
+        ))
+        .child(token_cap_row(
+            "token cap / day",
+            draft.max_tokens_per_day,
+            state,
+            |d, delta| {
+                d.max_tokens_per_day = stepped_token_cap(d.max_tokens_per_day, delta);
+            },
+        ))
         .child(ceiling_row(draft.safety.default, state));
 
     // Save: PATCH only what changed.
@@ -554,6 +634,31 @@ fn stepper_row<F>(label: &str, value: i64, state: &Entity<AppState>, setter: F) 
 where
     F: Fn(&mut Settings, i64) + Clone + 'static,
 {
+    stepper_row_text(label, value.to_string(), 48.0, state, setter)
+}
+
+/// A token-cap row: the same stepper as [`stepper_row`], but its value cell says
+/// `off` for no cap and is wider, because a cap is six or seven digits.
+fn token_cap_row<F>(label: &str, cap: Option<u64>, state: &Entity<AppState>, setter: F) -> gpui::Div
+where
+    F: Fn(&mut Settings, i64) + Clone + 'static,
+{
+    stepper_row_text(label, token_cap_label(cap), 72.0, state, setter)
+}
+
+/// The row itself: label, −/+ pair, and the rendered value. `shown` is separate
+/// from the number the setter works on because a token cap's "no cap" is a word,
+/// not a number.
+fn stepper_row_text<F>(
+    label: &str,
+    shown: String,
+    value_width: f32,
+    state: &Entity<AppState>,
+    setter: F,
+) -> gpui::Div
+where
+    F: Fn(&mut Settings, i64) + Clone + 'static,
+{
     let state_dec = state.clone();
     let state_inc = state.clone();
     let setter_dec = setter.clone();
@@ -585,11 +690,11 @@ where
         )
         .child(
             div()
-                .w(px(48.0))
+                .w(px(value_width))
                 .text_center()
                 .text_sm()
                 .text_color(rgb(theme::TEXT))
-                .child(value.to_string()),
+                .child(shown),
         )
         .child(
             bits::button("+", Tone::Ghost)
@@ -698,6 +803,86 @@ mod tests {
         // The kill switch and limits are untouched, so they stay out.
         assert!(patch.get("bot_messaging").is_none());
         assert!(patch.get("max_hops").is_none());
+    }
+
+    #[test]
+    fn a_changed_daily_budget_is_patched_alone() {
+        let saved = Settings::default();
+        let mut draft = saved.clone();
+        draft.max_tokens_per_day = Some(250_000);
+        let patch = diff(&saved, &draft);
+        let keys: Vec<&str> = patch
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["max_tokens_per_day"],
+            "only the budget that moved is sent"
+        );
+        assert_eq!(patch["max_tokens_per_day"], json!(250_000));
+        assert!(
+            patch.get("max_tokens_per_turn").is_none(),
+            "the untouched per-turn cap stays out of the patch"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_budget_is_not_patched() {
+        let saved = Settings {
+            max_tokens_per_turn: Some(100_000),
+            max_tokens_per_day: Some(5_000_000),
+            ..Settings::default()
+        };
+        let draft = saved.clone();
+        let patch = diff(&saved, &draft);
+        assert!(patch.get("max_tokens_per_turn").is_none());
+        assert!(patch.get("max_tokens_per_day").is_none());
+        assert!(
+            patch.as_object().expect("object").is_empty(),
+            "a budget equal to the saved one is not rewritten"
+        );
+    }
+
+    #[test]
+    fn stepping_a_budget_never_lands_on_zero() {
+        let from_off = stepped_token_cap(None, 1);
+        assert_eq!(
+            from_off,
+            Some(TOKEN_CAP_STEP as u64),
+            "off (no cap) + one step is a real cap"
+        );
+        assert_ne!(from_off, Some(0), "a step up from off never yields 0");
+        assert_eq!(
+            token_cap_label(None),
+            "off",
+            "no cap renders as `off`, not `0`"
+        );
+        assert_eq!(token_cap_label(Some(10_000)), "10000");
+
+        // Down from the smallest positive cap is `off`, not a zero the brain
+        // rejects; stepping down from `off` stays `off`.
+        let smallest = from_off.expect("a cap");
+        assert_eq!(stepped_token_cap(Some(smallest), -1), None);
+        assert_eq!(stepped_token_cap(None, -1), None);
+        assert_eq!(
+            stepped_token_cap(Some(1), -1),
+            None,
+            "a sub-step cap steps off rather than to Some(0)"
+        );
+        // `+` at the clamp holds the clamp (never wraps), and a config-set cap
+        // above the clamp is not lowered by a `+` click.
+        assert_eq!(
+            stepped_token_cap(Some(TOKEN_CAP_MAX), 1),
+            Some(TOKEN_CAP_MAX)
+        );
+        assert_eq!(
+            stepped_token_cap(Some(TOKEN_CAP_MAX * 2), 1),
+            Some(TOKEN_CAP_MAX * 2),
+            "a config file's larger cap is not shrunk by pressing +"
+        );
     }
 
     #[test]

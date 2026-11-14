@@ -760,3 +760,93 @@ what it is holding back.
   first bot-authored text was the *reasoning* entry, not the message. The test now
   waits for a `kind: "message"` entry with `post: "posted"` **and** the bot's own
   status back at `idle`, which is what the product means by "the turn ended".
+- **D9.27 A token budget is a brake in the unit the backends report, not a bill in
+  a currency this runtime cannot compute.** `Settings` gains two optional caps,
+  `max_tokens_per_turn` and `max_tokens_per_day` — both `Option<u64>`, both
+  `null`/absent by default — and they are enforced at two different moments
+  because the honest promise each can make is different.
+  * **per turn, after the round trip.** `execute_turn` checks
+    `Settings::cap_reached` on the turn's cumulative usage immediately after
+    `turn.usage.merge(response.usage)`, not before the request: input tokens are
+    only known once the backend has reported them. The guarantee is therefore
+    "no *further* round trip once the cap is reached", never "never exceed it".
+    The reply that crosses the cap is kept — discarding it would throw away work
+    the owner paid for — the turn still ends `Completed` (nothing broke; the bot
+    was cut off), and a warning notice names the spend and the cap.
+    `a_turn_stops_calling_the_model_once_it_reaches_its_token_cap` asserts the
+    machine, not the prose: with a cap of 100 and three scripted round trips, the
+    third is never asked for, and the stored turn records the 120 tokens it
+    actually spent rather than rounding down to the cap.
+  * **per day, before a turn exists.** `BotRunner::run` calls
+    `daily_budget_refusal()` between `take_batch` and `run_turn`, over the same
+    window `GET /api/usage` shows by default
+    (`contracts::turn::DEFAULT_WINDOW_HOURS`, 24 h, rolling). A refused turn
+    spends nothing, writes no `Turn` row and never calls the backend — pinned by
+    `a_spent_day_refuses_the_turn_before_the_model_is_ever_called`
+    (the backend was never asked and no new `Turn` row was written).
+    `refuse_batch` then closes what the batch
+    carried so nothing is left looking as if it ran: its deliveries are `Dropped`
+    (left `Pending`, boot recovery would replay them into the same refusal), a
+    task it carried is settled `Failed` with the budget's own sentence
+    (`a_spent_day_fails_a_task_instead_of_leaving_it_running`), and a routine's
+    run row is failed through `routines::settle_delivery` instead of sitting
+    `Running` in the Routines screen forever. Each affected conversation gets one
+    warning notice naming the spend and the cap. If the store cannot be asked for
+    the spend, the turn runs and the failure is logged `error!` — a budget is a
+    guard rail, not a lock, and a database hiccup must not stop the team; the log
+    line is the record that the cap was not enforced for that turn. All three
+    rows are pinned, because all three leak the same way — a permanent "in
+    flight" that starves what is queued behind it: deliveries and no `Turn` row
+    in `a_spent_day_refuses_the_turn_before_the_model_is_ever_called`, the task in
+    `a_spent_day_fails_a_task_instead_of_leaving_it_running`, and the routine run
+    in `a_spent_day_fails_a_routine_run_instead_of_leaving_it_running` (which
+    fires the routine through `fire_due`, the same path the ticker uses, and
+    asserts the run lands `Failed` with the budget's sentence rather than
+    `Running`).
+  * **tokens, not money, because there is no rate to convert them with.**
+    `UsageReport`'s own doc says there is deliberately no cost-per-token table in
+    this workspace: turning tokens into money needs the owner's per-model rates,
+    and inventing them would be "a lie with a decimal point". A cap in a
+    currency the runtime cannot compute would enforce that guess as policy, so the
+    cap is in the unit every backend already reports, and the owner converts it —
+    or reads the bill.
+  * **rolling 24 hours, not a calendar day.** A calendar day needs the owner's
+    timezone, and a brain that reset its budget at somebody else's midnight is a
+    bug nobody finds for a month. The rolling window is also the one
+    `GET /api/usage` answers by default, so the number an owner reads and the
+    number the runner refuses against come from one function over one span.
+  * **no cap by default.** A limit nobody set would stop a team mid-work and look
+    like a bug, so both fields default to `None`; `no_cap_means_no_cap` spends all
+    three scripted round trips when neither cap is set. Zero is not a second
+    spelling of unlimited: `Settings::validate` refuses `Some(0)` for either key,
+    and it is **one** implementation reached by **both** ways in — a TOML file
+    through `BrainConfig::validate`, a `PATCH /api/settings` through
+    `brain::config::validate_settings`, which delegates. That is not incidental:
+    the two paths each had a copy of these rules, a file could load
+    `max_tokens_per_turn = 0` that the API answered 400 to, and a zero daily cap
+    read that way refuses every turn forever (`0 >= 0`). `Settings::validate`
+    lives in `contracts`, beside the fields it guards, and
+    `a_config_file_and_the_api_refuse_the_same_settings` fails on a future split.
+    So `null`/absent is the only way to say "no cap", and a `0` that silently meant
+    either "spend nothing" or "spend anything" cannot be discovered in a bill.
+    `null` clears one cap without touching the other
+    (`a_budget_can_be_set_in_tokens_and_cleared_with_null`), the defaults stay
+    `None` (`no_budget_is_the_default_and_a_settings_row_without_one_still_loads`),
+    the API refuses a zero with a 400 rather than a guess
+    (`a_budget_of_zero_is_a_400_rather_than_a_guess`), and the live route is
+    walked over HTTP in `settings_merge_one_key_at_a_time` — `null` by default,
+    one cap set without the other, `null` clearing exactly one, and a `0` answered
+    `400 invalid_input` — and exactly reaching the cap counts as spent
+    (`reaching_the_cap_counts_as_spent`) — the cap is what may be spent, so a
+    budget of 100 that spent 100 stops.
+  * **what it does not do, stated rather than glossed.** The per-turn cap is a
+    brake *between* round trips, not a hard ceiling: the answer that crosses it is
+    kept, and the tool calls in that crossing reply are not executed (nothing is
+    left half-run, but a round that would have used tools is cut at the cap). The
+    daily check is a check before a turn, not an atomic reservation, so turns
+    already running can cross it together. And both numbers are only as complete
+    as each backend's `Usage`: the `fake` backend and the ACP adapter report
+    `llm_calls: 1` and zero tokens, so their turns look free and the budget cannot
+    see what the model did not count — the same honesty as `UsageReport`'s doc
+    comment, which carries `turns` so "nothing ran" stays distinguishable from
+    "turns ran, nothing reported".

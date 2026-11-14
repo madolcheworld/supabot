@@ -757,29 +757,14 @@ pub fn merge_settings(base: &Settings, patch: &Value) -> Result<Settings, Domain
 
 /// The settings half of [`BrainConfig::validate`], for a value that never
 /// travels through a whole config.
+///
+/// Delegates to [`Settings::validate`] rather than repeating the rules: a
+/// TOML file reaches them through `BrainConfig::validate` and a `PATCH` through
+/// here, and two copies of "a budget of zero is not a budget" would drift with
+/// only one of them tested. (They did: before this existed, a config file could
+/// set `max_tokens_per_turn = 0` and load, while the API refused the same value.)
 pub fn validate_settings(settings: &Settings) -> Result<(), DomainError> {
-    if settings.max_hops == 0 {
-        return Err(DomainError::invalid("max_hops must be at least 1"));
-    }
-    if settings.max_tool_rounds == 0 {
-        return Err(DomainError::invalid("max_tool_rounds must be at least 1"));
-    }
-    if settings.max_running_tasks_per_bot == 0 {
-        return Err(DomainError::invalid(
-            "max_running_tasks_per_bot must be at least 1",
-        ));
-    }
-    if settings.approval_expiry_secs == 0 {
-        return Err(DomainError::invalid(
-            "approval_expiry_secs must be at least 1",
-        ));
-    }
-    if !(0.05..=0.95).contains(&settings.compact_at_fraction) {
-        return Err(DomainError::invalid(
-            "compact_at_fraction must be between 0.05 and 0.95",
-        ));
-    }
-    Ok(())
+    settings.validate()
 }
 
 /// Parse a possibly partial config file by merging it over the defaults.

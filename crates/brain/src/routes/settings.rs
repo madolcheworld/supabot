@@ -93,4 +93,34 @@ mod tests {
         assert_eq!(merged.max_hops, 3);
         assert_eq!(merged.max_tool_rounds, Settings::default().max_tool_rounds);
     }
+
+    #[test]
+    fn a_budget_can_be_set_in_tokens_and_cleared_with_null() {
+        let merged = merge_settings(
+            &Settings::default(),
+            &json!({"max_tokens_per_turn": 250_000, "max_tokens_per_day": 5_000_000}),
+        )
+        .expect("merges");
+        assert_eq!(merged.max_tokens_per_turn, Some(250_000));
+        assert_eq!(merged.max_tokens_per_day, Some(5_000_000));
+
+        // `null` is the one spelling of "no cap", and clearing one must not
+        // clear the other.
+        let cleared = merge_settings(&merged, &json!({"max_tokens_per_day": null}))
+            .expect("null clears the cap");
+        assert_eq!(cleared.max_tokens_per_day, None);
+        assert_eq!(cleared.max_tokens_per_turn, Some(250_000));
+    }
+
+    #[test]
+    fn a_budget_of_zero_is_a_400_rather_than_a_guess() {
+        for key in ["max_tokens_per_turn", "max_tokens_per_day"] {
+            let error = merge_settings(&Settings::default(), &json!({ key: 0 }))
+                .expect_err("zero is not a budget");
+            assert!(
+                error.to_string().contains(key) && error.to_string().contains("null"),
+                "{key}: {error}"
+            );
+        }
+    }
 }

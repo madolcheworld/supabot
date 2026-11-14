@@ -127,7 +127,10 @@ Inside the runner (`crates/core/src/runners.rs`, one tokio task per bot):
 
 ```
 run loop: next_delivery → take_batch (background deliveries of the SAME
-          conversation join this turn, each attributed) → run_turn
+          conversation join this turn, each attributed)
+          daily token budget spent? → refuse_batch (deliveries Dropped, a task
+          Failed, a routine run Failed, one warning notice) → next delivery
+          → run_turn
 run_turn: load bot + conversation + settings + task
           Turn::start → insert_turn → publish BotStatus::Working{activity}
           mark deliveries running (so a restart can tell them from leftovers)
@@ -151,6 +154,8 @@ execute_turn:
           while the text is still a prefix of NO_REPLY
           backend.chat(request, events, turn_cancel.child_token())
           merge usage → finalize_reply (empty or NO_REPLY → no entry at all)
+          turn spend reached `max_tokens_per_turn`? → warning notice, keep the
+          reply, stop starting rounds (the turn still completes)
           no tool calls → break (a Length finish writes a warning notice)
           else: push the assistant message, then per call run_tool_call:
                 ToolCallId::from_suffix(stable_id(call.id)) → idempotency lookup in
@@ -172,6 +177,19 @@ run_turn tail: turn complete/abort/fail (+notice on failure) → update_turn →
                publish Change::Turn → deliveries marked done →
                task turn → hooks.settle_task → BotStatus::Idle → next delivery
 ```
+
+Two token budgets sit at those two points, each checked where it can be honest
+(D9.27). `max_tokens_per_turn` is applied **after** the round trip, because input
+tokens exist only once the backend reported them: it stops the *next* round trip,
+keeps the answer that crossed it, and leaves the turn `Completed` with a warning
+notice. `max_tokens_per_day` is applied **before** `run_turn`, over the same
+rolling 24 hours `GET /api/usage` reports by default
+(`contracts::turn::DEFAULT_WINDOW_HOURS`), so a refused turn writes no `Turn` row
+and never reaches a backend; `refuse_batch` drops its deliveries and settles a task
+or routine run it carried as failed, since none of those rows may be left looking
+as if they ran. Both numbers are what the backends reported, so a backend that
+reports nothing contributes nothing — the `UsageReport` doc says so, and the
+per-turn cap is a brake between round trips, not a hard ceiling.
 
 The CLI reaches this in one of two ways, and both end at the same `Orchestrator`:
 `--brain URL` drives a remote daemon over REST + `/ws/live` through
@@ -328,6 +346,34 @@ the in-memory brain (the CLI's embedded mode, `--offline`, every test). After it
 `PATCH /api/settings` wins and a restart does not undo it; both halves are pinned by
 tests.
 
+**The two token budgets are ordinary settings, not policy-engine rules** (D9.27):
+`max_tokens_per_turn` and `max_tokens_per_day` live in the same `Settings` row as
+the hop limit, are read through `SettingsHandle` every turn, and a
+`PATCH /api/settings` takes effect on the next turn without a restart. The per-turn
+cap is checked after each model round trip; the per-day cap before a turn is
+created, over the same rolling 24 hours `/api/usage` answers with when no `since=`
+is given.
+
+Their rules — including "a budget of zero is not a budget" — have **one**
+implementation, `Settings::validate` in `contracts`, beside the fields it guards.
+Both ways in go through it: a TOML file via `BrainConfig::validate`, and the API via
+`brain::config::validate_settings`, which delegates. That is a fix rather than a
+tidy-up: each path used to carry its own copy, so a file could load a cap of `0`
+that the API answered `400` to, and a zero daily cap read that way refuses every
+turn forever (`0 >= 0`). `a_config_file_and_the_api_refuse_the_same_settings` drives
+both paths over the same bad values and fails if they ever split again.
+
+The two caps are also described in the two front ends, from values the brain would
+accept rather than from formatting invented per screen: the CLI prints one budget
+line in **both** modes (`swarmbot config show` embedded and `--brain`) from the
+shared `budget_line` helper in `crates/cli/src/config.rs`, and the desktop Settings
+screen has two steppers ("token cap / turn", "token cap / day") built on
+`stepped_token_cap`. Both print **`off`** for no cap and neither can emit `0`,
+because `0` is a value the brain refuses rather than a synonym for unlimited —
+pinned by `the_budget_line_says_off_rather_than_zero`,
+`stepping_a_budget_never_lands_on_zero`, `a_changed_daily_budget_is_patched_alone`
+and `an_unchanged_budget_is_not_patched`.
+
 **Boot recovery** is one free function over the port
 (`contracts::repo::recover(&dyn Persistence, now)`), so both stores recover
 identically and one test covers both: running turns → `Interrupted`, pending
@@ -398,9 +444,9 @@ is the protocol's own order — a single-use ten-minute code for `/node/pair`, a
 | `GET /api/tasks`, `GET /api/tasks/{id}`, `POST /api/tasks/{id}/cancel` | the delegation graph's data |
 | `GET /api/nodes`, `POST /api/nodes/pairing-codes`, `DELETE /api/nodes/{id}` | the node roster, a pairing code, revocation |
 | `GET`/`POST /api/rules`, `DELETE /api/rules/{id}` | approval rules |
-| `GET`/`PATCH /api/settings` | the kill switch, hop limit, ceilings |
+| `GET`/`PATCH /api/settings` | the kill switch, hop limit, ceilings, and the two token caps (D9.27). A cap is a number of tokens or `null` for **no cap**; `0` is a `400 invalid_input`, not a second spelling of unlimited, and clearing one cap leaves the other alone |
 | `GET /api/backends`, `GET /api/backends/probe` | the backend list (redacted) and `probe()` results |
-| `GET /api/usage?since=…` | a `UsageReport`: what the window's turns spent, per bot and in total, **as the backends reported it**. Default window 24 h, `since` inclusive and RFC 3339; a malformed or future `since` is a 400, not zeros |
+| `GET /api/usage?since=…` | a `UsageReport`: what the window's turns spent, per bot and in total, **as the backends reported it**. Default window 24 h, `since` inclusive and RFC 3339; a malformed or future `since` is a 400, not zeros. The same rolling 24 h is the window `max_tokens_per_day` is measured over (D9.27) |
 | `POST /api/shutdown` | ask the daemon to stop; the CLI's `shutdown` then polls `/api/health` for up to 10 s and says whether it actually went down |
 | `GET /ws/live` | the live event socket (§6), cookie or bearer, `Origin` allow-listed |
 | `POST /node/pair`, `GET /node` | the node gateway: redeem a pairing code; serve the signed control socket (§8 of this doc's sibling, [`node-protocol.md`](node-protocol.md)) |

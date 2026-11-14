@@ -39,7 +39,9 @@ use swarmbot_contracts::node::{NodeInfo, PolicyMap};
 use swarmbot_contracts::repo::{Persistence, ToolCallRecord};
 use swarmbot_contracts::task::Task;
 use swarmbot_contracts::tool::{Invocation, ToolCallRequest, ToolResult, ToolSpec, Toolset};
-use swarmbot_contracts::turn::{Turn, TurnInitiator, TurnStatus};
+use swarmbot_contracts::turn::{
+    DEFAULT_WINDOW_HOURS, Turn, TurnInitiator, TurnStatus, UsageReport,
+};
 use swarmbot_llm::{
     ChatMessage, ChatRequest, ChatResponse, FinishReason, LlmBackend, LlmEvent, Role,
 };
@@ -649,6 +651,17 @@ impl BotRunner {
                 break;
             };
             let batch = self.take_batch(first);
+
+            // The daily budget is checked **before** a turn exists, so a refused
+            // turn spends nothing, writes no `Turn` row and leaves nothing for
+            // `wait_for_idle` to wait on. `refuse_batch` then settles what the
+            // batch carried — a task or a routine run must not be left `Running`
+            // by a turn that never started.
+            if let Some(reason) = self.daily_budget_refusal().await {
+                self.refuse_batch(batch, &reason).await;
+                continue;
+            }
+
             let steer: Arc<Mutex<VecDeque<Delivery>>> = Arc::new(Mutex::new(VecDeque::new()));
 
             let turn = run_turn(
@@ -811,6 +824,114 @@ impl BotRunner {
         self.publish_status(BotStatus::Queued {
             count: self.queue.len() as u32,
         });
+    }
+
+    /// Why this bot must not start a turn right now, when the day's token
+    /// budget is spent.
+    ///
+    /// `None` means "go ahead", and it covers three cases that are deliberately
+    /// answered the same way: no cap was set, the spend is under the cap, and
+    /// **the store could not be asked**. A budget is a guard rail, not a lock —
+    /// a database hiccup must not stop the team from working — so the failure
+    /// mode is "run the turn and log loudly", never "silently stop" and never
+    /// "silently run". The `error!` line is the record that the cap was not
+    /// enforced for that turn; without it this would be the kind of bypass
+    /// `AGENTS.md` forbids.
+    ///
+    /// The window is the rolling 24 hours `GET /api/usage` shows by default, so
+    /// the number an owner reads in the UI is the number this compares.
+    async fn daily_budget_refusal(&self) -> Option<String> {
+        let settings = self.env.settings.get();
+        let cap = settings.max_tokens_per_day?;
+        let until = chrono::Utc::now();
+        let since = until - chrono::Duration::hours(DEFAULT_WINDOW_HOURS);
+        let store = AsyncStore::new(Arc::clone(&self.env.store));
+        let report = store
+            .read(move |store| UsageReport::window(store, since, until))
+            .await;
+        match report {
+            Ok(report) => {
+                let spent = report.totals.total_tokens();
+                Settings::cap_reached(Some(cap), spent).then(|| {
+                    format!(
+                        "Token budget spent: {spent} token(s) in the last \
+                         {DEFAULT_WINDOW_HOURS} hours, at the cap of {cap}. No new turn \
+                         was started. Raise `max_tokens_per_day`, or set it to null to \
+                         remove the cap."
+                    )
+                })
+            }
+            Err(error) => {
+                tracing::error!(
+                    bot = %self.bot_id,
+                    %error,
+                    "cannot read the day's spend; the daily token budget is NOT enforced for \
+                     this turn"
+                );
+                None
+            }
+        }
+    }
+
+    /// Settle a batch the budget refused. Nothing ran, so nothing may be left
+    /// looking as if it did.
+    ///
+    /// Three rows would otherwise lie. The delivery would stay `Pending` forever
+    /// (and boot recovery would replay it into another refusal). A task it carried
+    /// would stay `Running`, holding its per-bot slot and starving the queue —
+    /// the same leak shape as D9.20, one layer up. A routine's run would stay
+    /// `Running` in the Routines screen as a permanent "in flight". Each gets the
+    /// budget's own words as its reason, because "the turn failed" would send the
+    /// next reader looking for a model error that does not exist.
+    async fn refuse_batch(&mut self, batch: Vec<Delivery>, reason: &str) {
+        let count = batch.len();
+        let store = AsyncStore::new(Arc::clone(&self.env.store));
+        let mut conversations: Vec<ConversationId> = Vec::new();
+        for delivery in &batch {
+            let mut record = delivery.clone();
+            record.mark_dropped(chrono::Utc::now());
+            let written = record.clone();
+            let _ = store
+                .write(move |store| store.update_delivery(&written))
+                .await;
+
+            if !conversations.contains(&delivery.conversation_id) {
+                conversations.push(delivery.conversation_id.clone());
+            }
+            if let Err(error) =
+                crate::routines::settle_delivery(store.blocking(), delivery, false, Some(reason))
+            {
+                warn!(
+                    error = %error,
+                    delivery = %delivery.id,
+                    "cannot settle a routine run the budget refused"
+                );
+            }
+            if let Some(task_id) = &delivery.task_id {
+                self.env.hooks.settle_task(task_id, reason, true);
+            }
+        }
+
+        for conversation in &conversations {
+            let _ = self.env.transcript.notice(
+                conversation,
+                if count == 1 {
+                    reason.to_string()
+                } else {
+                    format!("{reason} ({count} queued item(s) were dropped.)")
+                },
+                NoticeLevel::Warning,
+            );
+        }
+
+        let status = if self.queue.is_empty() {
+            BotStatus::Idle
+        } else {
+            BotStatus::Queued {
+                count: self.queue.len() as u32,
+            }
+        };
+        self.publish_status(status);
     }
 
     fn after_turn(&mut self, outcome: Result<(TurnOutcome, Turn), DomainError>) {
@@ -1285,6 +1406,27 @@ async fn execute_turn(
             turn.id.clone(),
             dm_addressed_to.clone(),
         )?;
+
+        // The per-turn cap is checked **after** this round trip, because the
+        // tokens it spent are only known once the backend reported them. So the
+        // promise is "no further round trip once the cap is reached", not "never
+        // spend more than the cap": one answer can cross it. The reply that was
+        // already produced is kept — discarding it would throw away work the
+        // owner paid for — and the stop is recorded as a notice so the transcript
+        // says why the bot went quiet.
+        if Settings::cap_reached(settings.max_tokens_per_turn, turn.usage.total_tokens()) {
+            let cap = settings.max_tokens_per_turn.unwrap_or_default();
+            let _ = env.transcript.notice(
+                &conversation.id,
+                format!(
+                    "Stopped: this turn has spent {} token(s), reaching its cap of {cap}. \
+                     Raise `max_tokens_per_turn` in the settings to allow longer turns.",
+                    turn.usage.total_tokens()
+                ),
+                NoticeLevel::Warning,
+            );
+            break;
+        }
 
         if response.tool_calls.is_empty() {
             if !response.text.is_empty() && !outcome.silent {

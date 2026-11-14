@@ -4,12 +4,12 @@
 cooperate: the roster, the transcripts, the delegation graph, and the cards that
 need a human.
 
-**Current state: the app is built.** 8,797 lines across 22 modules, 39 tests, one
-window with a sidebar, a transcript, a composer, a delegation-graph panel, cards,
-a nodes screen, a settings screen and a command palette. It is a pure client of
-the brain's REST + `/ws/live` API, so it needs a brain to talk to — and
-`--offline --spawn-brain` starts one with the scripted `fake` backend, which is a
-genuine zero-credential demo (§5, §7).
+**Current state: the app is built.** 16,613 lines across 29 source files, **85
+tests**, one window with a sidebar, a transcript, a composer, a delegation-graph
+panel, cards, a nodes screen, a routines screen, a usage screen, a settings screen
+and a command palette. It is a pure client of the brain's REST + `/ws/live` API, so
+it needs a brain to talk to — and `--offline --spawn-brain` starts one with the
+scripted `fake` backend, which is a genuine zero-credential demo (§5, §7).
 
 Several modules cite this document by section number (`view/cards.rs` → §3,
 `widgets/*` → §4, `brain.rs` → §6, `reducer.rs` → §3). Those numbers are
@@ -64,11 +64,11 @@ Rules that follow from the split:
 | Fact | Consequence |
 | --- | --- |
 | `gpui` is published on crates.io; the workspace pins `=0.2.2` exactly | pre-1.0 with frequent breaking changes, so an upgrade is a decision, not a `cargo update` (D8.4) |
-| built `default-features = false, features = ["font-kit", "wayland"]` | gpui's Linux default also enables `x11`; this box has the `libxkbcommon-x11` **runtime** but not the dev symlink, so the `x11` feature would not link. The session is Wayland (KDE Plasma, `WAYLAND_DISPLAY=wayland-0`) |
+| built `default-features = false, features = ["font-kit", "wayland"]` | gpui's Linux default also enables `x11`; this box has the `libxkbcommon-x11` **runtime** but not the dev symlink, so the `x11` feature would not link. The session is Wayland (`WAYLAND_DISPLAY=wayland-1` on 2026-11-14, running Hyprland; an earlier note said KDE Plasma / `wayland-0` — the compositor is whatever the owner is logged into, so do not treat either name as fixed) |
 | `pkg-config xkbcommon-x11` missing, `libxkbcommon-x11.so.0` present | `scripts/env.sh` creates `.cargo-home/link-shim/libxkbcommon-x11.so` → the runtime `.so.0` and exports `LIBRARY_PATH`. `LIBRARY_PATH` (unlike `RUSTFLAGS`) does not invalidate the cargo cache, so only the final link is redone. The clean fix is `sudo dnf install libxkbcommon-x11-devel` |
 | `gpui`'s build script runs `bindgen`; `libclang.so.22.1` exists without an unversioned `libclang.so` | `scripts/env.sh` exports `LIBCLANG_PATH=/usr/lib64` |
 | `gpui → gpui_http_client → zed-async-tar → xattr 0.2`, and `xattr 0.2.3` no longer compiles against modern `libc` (`ENOATTR` is `ENODATA` on Linux); it is an optional dep enabled by a default feature a downstream workspace cannot turn off | `vendor/xattr` is the crate with a one-line patch, wired in by `[patch.crates-io]` in the root `Cargo.toml`. See [`../vendor/xattr/VENDORED.md`](../vendor/xattr/VENDORED.md) |
-| no `/dev/dri`, no `/dev/nvidia*` from this session; `nvidia-smi` cannot reach the driver (GPU is a GTX 1660 SUPER) | **As re-checked on 2026-11-13 this is now a hard blocker, not a slow path.** `/usr/share/vulkan/icd.d/` holds only `nvidia_icd.json` (unusable without `/dev/nvidia0`) and `vulkan-swrast` is not installed, so **no ICD enumerates and `swarmbot-ui` panics with `Unable to init GPU context: NoSupportedDeviceFound` before it can open a window**. It used to render through llvmpipe here; the software Vulkan driver has since gone missing from the machine. `scripts/env.sh` now says so on stderr instead of leaving `VK_ICD_FILENAMES` unset and letting the panic look like an app bug. Fix on the box: `sudo pacman -S vulkan-swrast` (or the distro's Mesa software-Vulkan package). Everything except painting — the reducer, the views' logic, `cargo test` — runs without it |
+| **The GPU works (re-checked 2026-11-14).** `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-modeset`, `/dev/nvidia-uvm`, `/dev/dri/card1` and `/dev/dri/renderD128` all exist; `nvidia-smi` reports a GTX 1660 SUPER on driver 615.78.08; `nvidia_icd.json` is the ICD in use | `./target/debug/swarmbot-ui --selftest` **opens 11 windows and exits 0**, with `vulkan/renderer: icd=/usr/share/vulkan/icd.d/nvidia_icd.json`. The *render total* it prints is not stable — 22, 54, 55, 57 and 58 across five runs of one binary — so assert on the 11 windows and on `ok=true`, never on a render count. The 2026-11-13 entry here said the opposite (`NoSupportedDeviceFound` panic, no usable ICD) and that was true then; it is not true now. `scripts/env.sh` still prefers llvmpipe *when that ICD exists* and still warns on stderr when none does — a headless-box fallback, not a statement about this machine |
 | `pkg-config vulkan` missing, `libvulkan.so.1` present | enough: blade loads the Vulkan library at runtime |
 | the crate has a `runtime_shaders` feature (off by default) | enables it for shader iteration without a build-time shader toolchain; leave it off for normal builds |
 | `swarmbot-ui` is **not** in the workspace `default-members` | plain `cargo build`/`cargo test` skip it (its dependency chain is minutes long); `--workspace`, `scripts/check.sh` include it, `scripts/check.sh --fast` excludes it again |
@@ -91,7 +91,7 @@ id → hue → `#rrggbb`) unless the roster names one.
 | Delegation graph | `view/graph.rs` | the tree of work: `handoff_task` / `start_task` nodes with status, hop depth, owner, requester, and the line back to the origin conversation; click to jump | `TaskUpsert` (`parent_task_id`, `requester`, `origin` are the edges) |
 | Cards | `view/cards.rs` | approval (Allow once / Always allow / Deny, reason, expiry countdown), question (`ask_user` fields), handoff (Done / Skip) | `RequestUpsert` → `POST /api/requests/:id/respond` |
 | Nodes | `view/nodes.rs` | an 8-character pairing code (large, copyable, 10-minute TTL), the node list (label, platform, roots, effective capabilities = declared ∩ approved, ceiling, online), Revoke, the `swarmbot-node pair …` line to copy | `NodeUpsert`, `NodePresence` |
-| Settings | `view/settings.rs` | per-bot backend (base url, model, `extra_body` / `extra_headers` for a gateway's own parameters such as an inferhub bid, a masked key field), a **Probe** button showing `BackendStatus` verbatim, safety ceilings, the `bot_messaging` kill switch, `max_hops`, `max_tool_rounds`, the roster | `Snapshot`, settings RPCs |
+| Settings | `view/settings.rs` | per-bot backend (base url, model, `extra_body` / `extra_headers` for a gateway's own parameters such as an inferhub bid, a masked key field), a **Probe** button showing `BackendStatus` verbatim, safety ceilings, the `bot_messaging` kill switch, `max_hops`, `max_tool_rounds`, the two token caps (`token cap / turn`, `token cap / day`, showing `off` for no cap), the roster | `Snapshot`, settings RPCs |
 | Usage | `view/usage.rs` | `GET /api/usage` for a 24h / 7d / 30d window: totals (tokens, model calls, tool calls), a per-bot table with the biggest spender first, and the turn count. Read-only; three states kept apart (`not fetched`, `failed` with a retry, `a report`) | — (REST only; spend is not a live event) |
 | Palette | `view/palette.rs` | `ctrl-k`: jump to a bot, conversation or screen | — |
 
@@ -280,18 +280,21 @@ are the same code.
 
 ## 10. What is not verified
 
-* **Painting, at all, on this machine as of 2026-11-13.** The window used to open
-  and paint through llvmpipe; §2 records that the software Vulkan driver is now
-  missing, so `--selftest` compiles, drives the reducer, and then cannot open a
-  window. Every screen's *logic* is covered by `cargo test -p swarmbot-ui`; no
-  screen's *pixels* were seen in this round. Anything below that says "renders"
-  was true when it was written and has not been re-checked since.
-* **Frame rates under llvmpipe.** Even when it rendered (§2), this session has no
-  GPU device nodes, so nobody has measured the app on a real GPU — or under a
-  long transcript on a software rasterizer.
+* **What the pixels look like.** The windowing half is verified: on 2026-11-14,
+  `--selftest` opened 11 windows, rendered every screen, and exited 0 on the
+  NVIDIA ICD (§2). The number of render calls it reports differs per run (frames
+  are timing-dependent), so it is evidence that painting happened, not a figure
+  to quote. What that does **not** prove is that any of it
+  looks right — and on 2026-11-14 the desktop session was locked, so a screenshot
+  captured the lock screen rather than the app. Read `selftest: window N drew
+  screen=…` as "a root view rendered", never as "this screen is correct".
+* **Frame rate.** Nobody has measured frames per second, on this GPU or under a
+  software rasterizer, with a long transcript on screen.
 * **A real brain round trip from this app.** The tests use the scripted `Brain`
   double; `--offline --spawn-brain` exercises the real client against a real brain,
-  but only by hand.
+  but only by hand. It does work: a 2026-11-14 run printed `brain reachable and
+  authenticated (version 0.1.0, epoch 1)` and `GET /api/bots` served the
+  `config/team.waypoint.toml` roster through it.
 * **The tty token prompt** (the CLI's, not this app's) needs a real terminal; the
   UI has no prompt at all — it reads the four sources in §7 and says so when none
   produced a token.

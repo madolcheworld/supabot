@@ -552,9 +552,10 @@ sebagai potret keadaan saat itu, bukan sebagai daftar hidup:
   Tiga keadaan dijaga terpisah: belum dimuat, gagal (dengan alasan verbatim dan
   Retry), dan sebuah laporan — karena "fetch gagal" dan "tidak ada turn" sama-sama
   nol dan hanya salah satunya benar. Yang tetap tidak terverifikasi: angka dari
-  backend sungguhan (semua angka di gate berasal dari `FakeBackend`), dan piksel
-  layarnya, karena ICD Vulkan software di mesin ini hilang (lihat
-  [`ui.md`](ui.md) §2 dan §10).
+  backend sungguhan (semua angka di gate berasal dari `FakeBackend`), dan rupa
+  piksel layarnya. *(Catatan 2026-11-14: klaim "ICD Vulkan hilang" di sini sudah
+  tidak berlaku — GPU-nya jalan dan `--selftest` merender; yang belum ada hanyalah
+  orang yang melihat layarnya. Lihat [`ui.md`](ui.md) §2 dan §10.)*
 * **`codex app-server`: dihapus, bukan dibangun** (D9.19). Variannya hanya pernah
   ada sebagai `Unavailable` yang tetap bisa dipilih pemilik, dan Codex sudah
   terjangkau sebagai `codex-acp` lewat adapter ACP. Config lama yang memakai

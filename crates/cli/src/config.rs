@@ -17,8 +17,27 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value as JsonValue;
 use swarmbot_contracts::bot::normalize_name;
-use swarmbot_contracts::config::{BackendKind, BackendSpec, BrainConfig, TeamSpec};
+use swarmbot_contracts::config::{BackendKind, BackendSpec, BrainConfig, Settings, TeamSpec};
 use swarmbot_contracts::node::NodeRoot;
+
+/// One line describing the token budget, in the words the rest of the CLI uses.
+///
+/// `off` rather than `0` on purpose: zero is refused by the brain's validation
+/// (there is one spelling of "no cap", and it is `null`), so printing `0` here
+/// would suggest a value the API rejects. Shared by the embedded and the remote
+/// `config show` so the two modes cannot describe the same brain differently.
+pub(crate) fn budget_line(settings: &Settings) -> String {
+    let label = |cap: Option<u64>| match cap {
+        Some(tokens) => format!("{tokens} tokens"),
+        None => "off".to_string(),
+    };
+    format!(
+        "budget: per_turn={} per_day={} (rolling {}h)\n",
+        label(settings.max_tokens_per_turn),
+        label(settings.max_tokens_per_day),
+        swarmbot_contracts::turn::DEFAULT_WINDOW_HOURS,
+    )
+}
 
 /// Where the effective config came from — `config show` says so honestly.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -541,6 +560,7 @@ pub fn show(loaded: &Loaded) -> String {
         settings.approval_expiry_secs,
         settings.auto_approve_read_only,
     ));
+    out.push_str(&budget_line(settings));
     let secrets_path = loaded.data_dir.join("secrets.json");
     if secrets_path.exists() {
         // Key *names* only. Printing the values would defeat the 0600.
@@ -579,6 +599,24 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, text).expect("write");
         path
+    }
+
+    #[test]
+    fn the_budget_line_says_off_rather_than_zero() {
+        // `0` is refused by the brain's validation, so printing it would
+        // advertise a value the API rejects; `off` is the only honest word for
+        // "no cap", and a set cap prints in the unit it is measured in.
+        let mut settings = Settings::default();
+        assert_eq!(
+            budget_line(&settings),
+            "budget: per_turn=off per_day=off (rolling 24h)\n"
+        );
+        settings.max_tokens_per_turn = Some(250_000);
+        settings.max_tokens_per_day = Some(5_000_000);
+        assert_eq!(
+            budget_line(&settings),
+            "budget: per_turn=250000 tokens per_day=5000000 tokens (rolling 24h)\n"
+        );
     }
 
     #[test]

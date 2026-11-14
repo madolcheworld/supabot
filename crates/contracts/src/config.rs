@@ -265,6 +265,96 @@ pub struct Settings {
     /// Compact a bot's session once its history passes this fraction of the
     /// backend's context window.
     pub compact_at_fraction: f32,
+    /// Tokens one turn may spend before the brain stops starting new model
+    /// rounds. `None` is **no cap**, and the API reports it as such.
+    ///
+    /// Tokens, not money, and the reason is in [`crate::turn::UsageReport`]:
+    /// there is no price table in this workspace, so a cap in a currency would
+    /// have to invent the rate that converts it. Tokens are what the backends
+    /// actually report, so this is the largest budget that can be enforced
+    /// without guessing.
+    ///
+    /// The cap is checked **after** each round trip, because input tokens are
+    /// only known once the backend has counted them. The guarantee is therefore
+    /// "no *further* round trip after the cap is reached" — one answer may cross
+    /// it, and [`Settings::cap_reached`] is what decides "at or past".
+    #[serde(default)]
+    pub max_tokens_per_turn: Option<u64>,
+    /// Tokens the whole brain may spend in a **rolling 24 hours** — the same
+    /// window `GET /api/usage` shows by default, so the two numbers an owner
+    /// compares are measured over one span.
+    ///
+    /// Not a calendar day on purpose: a calendar day needs the owner's timezone,
+    /// and a brain that reset its budget at somebody else's midnight would be a
+    /// bug nobody would find for a month. Checked before a turn starts, so a
+    /// refused turn spends nothing at all.
+    ///
+    /// A store that cannot answer the spend question does **not** block work —
+    /// the turn runs and the failure is logged — because a budget is a guard
+    /// rail, not a lock, and a database hiccup must not stop the team. That
+    /// choice is written down here so nobody "fixes" it into a silent bypass:
+    /// the log line is `error!` on purpose.
+    #[serde(default)]
+    pub max_tokens_per_day: Option<u64>,
+}
+
+impl Settings {
+    /// True when `spent` has reached `cap` — the one comparison every enforcement
+    /// point uses.
+    ///
+    /// Here rather than in `core` so a test, the runner and a future UI badge
+    /// cannot disagree about whether a budget of 100 that spent 100 is spent. It
+    /// is: the cap is the amount a turn or a day *may* spend, so reaching it
+    /// stops the next one.
+    pub fn cap_reached(cap: Option<u64>, spent: u64) -> bool {
+        cap.is_some_and(|cap| spent >= cap)
+    }
+
+    /// The checks a settings value has to pass before a brain runs with it.
+    ///
+    /// One implementation for both ways in — a TOML file at load and a
+    /// `PATCH /api/settings` at runtime — because two copies of a rule like
+    /// "a budget of zero is not a budget" drift, and the copy that drifts is the
+    /// one nobody tests. It lives here, beside the fields, so it cannot be
+    /// forgotten when a field is added.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.max_hops == 0 {
+            return Err(DomainError::invalid("max_hops must be at least 1"));
+        }
+        if self.max_tool_rounds == 0 {
+            return Err(DomainError::invalid("max_tool_rounds must be at least 1"));
+        }
+        if self.max_running_tasks_per_bot == 0 {
+            return Err(DomainError::invalid(
+                "max_running_tasks_per_bot must be at least 1",
+            ));
+        }
+        if self.approval_expiry_secs == 0 {
+            return Err(DomainError::invalid(
+                "approval_expiry_secs must be at least 1",
+            ));
+        }
+        if !(0.05..=0.95).contains(&self.compact_at_fraction) {
+            return Err(DomainError::invalid(
+                "compact_at_fraction must be between 0.05 and 0.95",
+            ));
+        }
+        // A budget of zero is refused rather than read as "unlimited": there is
+        // exactly one spelling of "no cap" (`null`/absent), and a `0` that
+        // silently meant either "spend nothing" or "spend anything" is the kind
+        // of ambiguity that gets discovered in a bill.
+        if self.max_tokens_per_turn == Some(0) {
+            return Err(DomainError::invalid(
+                "max_tokens_per_turn must be at least 1, or null for no cap",
+            ));
+        }
+        if self.max_tokens_per_day == Some(0) {
+            return Err(DomainError::invalid(
+                "max_tokens_per_day must be at least 1, or null for no cap",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for Settings {
@@ -283,6 +373,10 @@ impl Default for Settings {
             auto_approve_read_only: true,
             transcript_mirror: true,
             compact_at_fraction: 0.6,
+            // No cap by default: a limit nobody asked for would stop a team
+            // mid-work and look like a bug. The owner sets one deliberately.
+            max_tokens_per_turn: None,
+            max_tokens_per_day: None,
         }
     }
 }
@@ -423,18 +517,9 @@ impl BrainConfig {
                 }
             }
         }
-        if self.settings.max_hops == 0 {
-            return Err(DomainError::invalid("max_hops must be at least 1"));
-        }
-        if self.settings.max_tool_rounds == 0 {
-            return Err(DomainError::invalid("max_tool_rounds must be at least 1"));
-        }
-        if !(0.05..=0.95).contains(&self.settings.compact_at_fraction) {
-            return Err(DomainError::invalid(
-                "compact_at_fraction must be between 0.05 and 0.95",
-            ));
-        }
-        Ok(())
+        // One settings rule for both ways in (a config file and the API): the
+        // checks live on `Settings` so neither path can grow its own copy.
+        self.settings.validate()
     }
 
     /// The four-bot team used by the demo and by `swarmbot demo --offline`.
@@ -720,5 +805,70 @@ mod tests {
         let back: BrainConfig = serde_json::from_value(json).unwrap();
         assert_eq!(back, config);
         back.validate().unwrap();
+    }
+
+    #[test]
+    fn no_budget_is_the_default_and_a_settings_row_without_one_still_loads() {
+        let settings = Settings::default();
+        assert_eq!(settings.max_tokens_per_turn, None);
+        assert_eq!(settings.max_tokens_per_day, None);
+        assert!(!Settings::cap_reached(
+            settings.max_tokens_per_day,
+            u64::MAX
+        ));
+
+        // A row written by a build that predates the budget has no such keys.
+        // Reading it must not fail — a brain that refuses to boot because its
+        // own settings row is old is worse than an unbudgeted brain.
+        let mut old = serde_json::to_value(&settings).unwrap();
+        let object = old.as_object_mut().unwrap();
+        object.remove("max_tokens_per_turn");
+        object.remove("max_tokens_per_day");
+        let loaded: Settings = serde_json::from_value(old).unwrap();
+        assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn a_config_file_and_the_api_refuse_the_same_settings() {
+        // The regression this pins: `BrainConfig::validate` (the TOML path) and
+        // `brain::config::validate_settings` (the `PATCH` path) each used to
+        // carry their own copy of these rules, so a budget of zero could load
+        // from a file while the API answered 400 to the same value. One
+        // implementation now serves both, and both paths are checked here so a
+        // future split has to fail a test rather than a bill.
+        for mutate in [
+            |s: &mut Settings| s.max_tokens_per_turn = Some(0),
+            |s: &mut Settings| s.max_tokens_per_day = Some(0),
+            |s: &mut Settings| s.max_hops = 0,
+            |s: &mut Settings| s.compact_at_fraction = 2.0,
+        ] {
+            let mut settings = Settings::default();
+            mutate(&mut settings);
+            let direct = settings.validate();
+            let via_config = BrainConfig {
+                settings: settings.clone(),
+                ..BrainConfig::default()
+            }
+            .validate();
+            assert!(
+                direct.is_err(),
+                "{settings:?} is not a valid settings value"
+            );
+            assert!(via_config.is_err(), "{settings:?} loaded from a file");
+        }
+        assert!(BrainConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn reaching_the_cap_counts_as_spent() {
+        // Exactly at the cap is spent, not "one more free turn": the cap is what
+        // may be spent, so a budget of 100 that spent 100 must stop.
+        assert!(Settings::cap_reached(Some(100), 100));
+        assert!(Settings::cap_reached(Some(100), 101));
+        assert!(!Settings::cap_reached(Some(100), 99));
+        assert!(
+            !Settings::cap_reached(None, u64::MAX),
+            "no cap is not a cap"
+        );
     }
 }

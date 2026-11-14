@@ -34,13 +34,25 @@ symlink), builds the `libxkbcommon-x11.so` link shim and exports `LIBRARY_PATH`,
 and pins `VK_ICD_FILENAMES` to llvmpipe **when that ICD exists**. Without it a
 `cargo build -p swarmbot-ui` fails in three different ways.
 
-As of 2026-11-13 the llvmpipe Vulkan ICD is **not** installed on this machine
-(only `nvidia_icd.json`, and there is no `/dev/nvidia0`), so `env.sh` now prints
-that on stderr and `swarmbot-ui` panics with `Unable to init GPU context:
-NoSupportedDeviceFound`. That is a missing driver, not a code bug: install the
-distro's Mesa software-Vulkan package (`vulkan-swrast` on Arch). `cargo build`,
-`cargo test` and the whole gate still pass without it — only opening a window
-fails.
+**The GPU works again, as re-checked on 2026-11-14.** The NVIDIA driver is up
+(`/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-modeset`, `/dev/nvidia-uvm`,
+`/dev/dri/card1`, `/dev/dri/renderD128`; `nvidia-smi` reports a GTX 1660 SUPER on
+driver 615.78.08) and `nvidia_icd.json` is the ICD in use. `swarmbot-ui
+--selftest` therefore opens **11 windows** and exits 0 — the window count is
+deterministic and is the number to assert on. The **total render count is not**:
+it was 22, 54, 55, 57 and 58 across five runs of the same binary, because it
+counts frames and frames depend on timing. Quote the window count, or say
+"renders"; do not quote a render total as if it were a fact. The
+2026-11-13 note that stood here ("llvmpipe ICD missing, `NoSupportedDeviceFound`
+panic") described that day, not this one — do not resurrect it without running
+`./target/debug/swarmbot-ui --selftest` first. `scripts/env.sh` still prefers
+llvmpipe **when that ICD exists** and still says so on stderr when no ICD is
+found; that fallback is for headless boxes, not a claim about this one.
+
+What is *still* not proven is the pixels: `--selftest` proves a window opened and
+the root view rendered, not that anything looked right. On 2026-11-14 the desktop
+session was locked, so a screenshot showed the lock screen — say "renders", not
+"looks correct", unless somebody actually looked at an unlocked screen.
 
 Cargo builds share `./target`. `Blocking waiting for file lock on build directory`
 is other people working, not a hang: wait it out. Do not invent a second target
@@ -265,6 +277,23 @@ them.
   (`node_protocol::ensure_crypto_provider`, called by both endpoints) so copies
   cannot drift, and a TLS test is not proven until it has passed as part of the
   whole suite, in a fresh process.
+* **One "`check.sh` hung" was not reproducible, and the honest entry is "unexplained"
+  until it is.** A full gate run sat in `cli`'s
+  `script::tests::the_shipped_example_runs_a_real_delegation_end_to_end` for over
+  30 minutes, with the process in `__futex_wait` (0 % CPU: parked, not spinning)
+  and no way to take a backtrace (`ptrace_scope=1`, no permission). The same test
+  alone passes in **0.33 s**, ten times in a row, and the whole `swarmbot` test
+  binary passes in 2.4 s; an immediate clean full gate passed in 54 s. Two things
+  were different in the failing run and both are plausible rather than proven:
+  another agent was rewriting `crates/core/src/runners.rs` and
+  `crates/core/tests/budget.rs` while that build was in flight, and a
+  `swarmbot-ui` I had started offline was still running with its own brain on
+  port 8799. **Do not call this a flake without the state in hand** — the same
+  rule as the `real_brain` entries above. If it recurs, do not wait it out:
+  `timeout 120 cargo test -p swarmbot-cli --bin swarmbot -- --test-threads=1`,
+  and check first for a source rewrite or a stray process holding a port, because
+  "the test hung" and "the thing it talks to was changing underneath it" look
+  identical from a `futex_wait`.
 * **The embedded CLI cannot reach a remote node** — not a missing wire but a
   property of the mode: a node dials the brain's gateway, and `swarmbot` in-process
   has no listener, so nothing can pair with it. A bot configured against a foreign
@@ -274,7 +303,7 @@ them.
 ## State of the tree
 
 Check before you assume — it moves while people work. **All twelve crates are
-built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.354
+built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.376
 passed, 0 failed, 5 ignored** — three live tests (two behind `PROTO_LIVE_LLM`, one
 behind `PROTO_LIVE_ACP`) and two doctests in `store/src/threaded.rs` marked
 `ignore` because a doctest has no runtime to await on): `contracts`,

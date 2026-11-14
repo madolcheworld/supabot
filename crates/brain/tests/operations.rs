@@ -543,6 +543,57 @@ async fn settings_merge_one_key_at_a_time() {
     )
     .await;
 
+    // A token budget travels as a number or as `null`, and `null` is the only
+    // spelling of "no cap": a `0` is a 400, never a synonym for unlimited.
+    assert_eq!(
+        defaults["max_tokens_per_turn"],
+        json!(null),
+        "no cap by default"
+    );
+    assert_eq!(defaults["max_tokens_per_day"], json!(null));
+    let patched = body(
+        patch(
+            &client,
+            &brain.url("/api/settings"),
+            &json!({"max_tokens_per_day": 250_000}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(patched["max_tokens_per_day"], json!(250_000));
+    assert_eq!(
+        patched["max_tokens_per_turn"],
+        json!(null),
+        "setting one cap leaves the other off"
+    );
+    assert_eq!(
+        brain.swarm.settings.get().max_tokens_per_day,
+        Some(250_000),
+        "the runner reads the cap back through the same handle"
+    );
+    let cleared = body(
+        patch(
+            &client,
+            &brain.url("/api/settings"),
+            &json!({"max_tokens_per_day": null}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(cleared["max_tokens_per_day"], json!(null), "null clears it");
+    for key in ["max_tokens_per_turn", "max_tokens_per_day"] {
+        let message = expect_error(
+            patch_req(&client, &brain.url("/api/settings"), &json!({ key: 0 })).await,
+            400,
+            "invalid_input",
+        )
+        .await;
+        assert!(
+            message.contains(key) && message.contains("null"),
+            "{message} should say {key} is at least 1 or null"
+        );
+    }
+
     brain.stop().await;
 }
 

@@ -936,6 +936,7 @@ pub fn config_show_text(
         settings.approval_expiry_secs,
         settings.auto_approve_read_only,
     ));
+    out.push_str(&crate::config::budget_line(settings));
     out.push_str("backends:\n");
     if backends.is_empty() {
         out.push_str("  (none — only the built-in `fake` will resolve)\n");
