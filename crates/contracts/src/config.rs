@@ -296,6 +296,28 @@ pub struct Settings {
     /// the log line is `error!` on purpose.
     #[serde(default)]
     pub max_tokens_per_day: Option<u64>,
+    /// Where a backend that **owns its own tool loop** (ACP, `claude -p`) starts
+    /// its session — the `cwd` it gets. `None` is the bot's private workspace,
+    /// which is the default and the safe one.
+    ///
+    /// This is the seam that lets a bot work on a real checkout instead of an
+    /// empty directory: an ACP agent resolves relative paths against its `cwd`,
+    /// and its `read`/`grep`/`write` tools are its own, so *where* the bot works
+    /// is decided here and nowhere else. It changes nothing for a backend the
+    /// runner drives (`openai_compat`, `fake`): those tools are SwarmBot's and
+    /// stay rooted at the bot's private workspace under `PathPolicy`.
+    ///
+    /// **A widening, stated plainly.** The agent's own tools are not gated by
+    /// our `PathPolicy`, `PolicyEngine`, `AuditLog` or approval cards (D2.5), so
+    /// pointing this at a checkout hands the agent whatever its own sandbox
+    /// allows there. Whether it may *write* is still the backend's
+    /// `permission_mode`: `reject` (the default) refuses every permission ask,
+    /// so the bot reads and answers but changes nothing; `allow` is the
+    /// operator's explicit opt-in. Either way the transcript shows every call it
+    /// makes with `origin = agent` (D9.31), so work that our policy did not gate
+    /// is still work somebody can read.
+    #[serde(default)]
+    pub agent_cwd: Option<String>,
 }
 
 impl Settings {
@@ -353,6 +375,16 @@ impl Settings {
                 "max_tokens_per_day must be at least 1, or null for no cap",
             ));
         }
+        // An empty `agent_cwd` would silently mean "a directory named nothing"
+        // and an ACP agent would start in a path that cannot exist, so a blank
+        // value is refused rather than read as the default.
+        if let Some(dir) = &self.agent_cwd
+            && dir.trim().is_empty()
+        {
+            return Err(DomainError::invalid(
+                "agent_cwd must be a path, or absent for the bot's private workspace",
+            ));
+        }
         Ok(())
     }
 }
@@ -377,6 +409,10 @@ impl Default for Settings {
             // mid-work and look like a bug. The owner sets one deliberately.
             max_tokens_per_turn: None,
             max_tokens_per_day: None,
+            // The private workspace by default: a bot that suddenly started in
+            // somebody's repository because a field was absent would be the
+            // worst kind of surprise.
+            agent_cwd: None,
         }
     }
 }
@@ -857,6 +893,57 @@ mod tests {
             assert!(via_config.is_err(), "{settings:?} loaded from a file");
         }
         assert!(BrainConfig::default().validate().is_ok());
+    }
+
+    /// `agent_cwd` is the seam that lets a bot work in a real checkout, so its
+    /// two failure modes are worth pinning: absent must mean "the private
+    /// workspace" (never somebody's repository by accident), and blank must be
+    /// refused rather than read as a path.
+    #[test]
+    fn agent_cwd_is_absent_by_default_and_blank_is_refused() {
+        assert_eq!(Settings::default().agent_cwd, None);
+
+        // An old settings row has no such key and must still load.
+        let old: Settings = serde_json::from_value(serde_json::json!({
+            "bot_messaging": true,
+            "max_hops": 8,
+            "max_tool_rounds": 32,
+            "max_running_tasks_per_bot": 3,
+            "max_task_restarts": 2,
+            "approval_expiry_secs": 600,
+            "safety": {"default": "ask"},
+            "auto_approve_read_only": true,
+            "transcript_mirror": true,
+            "compact_at_fraction": 0.6
+        }))
+        .expect("an old row loads");
+        assert_eq!(old.agent_cwd, None);
+
+        // A path is accepted, and the config it rides in validates as a whole.
+        let with_cwd = Settings {
+            agent_cwd: Some("/tmp/a-checkout".to_string()),
+            ..Settings::default()
+        };
+        with_cwd.validate().expect("a path is a valid value");
+        BrainConfig {
+            settings: with_cwd.clone(),
+            ..BrainConfig::default()
+        }
+        .validate()
+        .expect("and it survives config validation");
+
+        // Blank is not "the default": it is a value nobody meant, and an agent
+        // would start in a directory that cannot exist.
+        for blank in ["", "   ", "\t"] {
+            let bad = Settings {
+                agent_cwd: Some(blank.to_string()),
+                ..Settings::default()
+            };
+            assert!(
+                bad.validate().is_err(),
+                "{blank:?} must be refused, not read as the default"
+            );
+        }
     }
 
     #[test]

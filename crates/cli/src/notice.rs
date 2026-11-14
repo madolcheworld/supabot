@@ -1,4 +1,7 @@
-//! The unscripted-`fake` notice: one honest word before the first message.
+//! Two notices, both about a run whose output would otherwise mislead: the
+//! unscripted-`fake` one, and the embedded-ACP-without-team-tools one.
+//!
+//! ## The unscripted-`fake` notice: one honest word before the first message
 //!
 //! `swarmbot run "…" --backend fake` and `swarmbot chat … --backend fake` start
 //! a real brain on the scripted [`FakeBackend`] — but nothing in those commands
@@ -25,6 +28,18 @@
 //!   notice is due whenever a bot the conversation can wake reports
 //!   `kind == fake`. A lookup that fails decides "do not warn": the notice must
 //!   never be the reason a command fails.
+//!
+//! ## The embedded-ACP notice: a bot that cannot delegate
+//!
+//! A backend that owns its own tool loop (ACP, `claude -p`) reaches SwarmBot's
+//! roster tools only through the brain's MCP gateway. `swarmbot` without
+//! `--brain` never composes one, so the agent is handed no `mcpServers` while its
+//! instructions describe `handoff_task` and friends. The run is not broken — the
+//! bot answers for itself — but a claim that it delegated has nothing behind it,
+//! and the closing `delegated:` line would contradict it silently. So
+//! [`embedded_agent_without_team_tools`] decides from the roster + registry
+//! kinds, and [`warn_agent_on_stderr`] says the two lines once per command.
+//! D9.29 records why the fix is a disclosure and not a refusal.
 
 use std::io::Write;
 
@@ -63,10 +78,38 @@ pub fn lines() -> [String; 2] {
 /// run over: the notice is a courtesy, so a write error ends the attempt
 /// quietly instead of becoming the command's error.
 pub fn warn<W: Write>(sink: &mut W, quiet: bool, due: bool) -> bool {
+    emit(sink, quiet, due, &lines())
+}
+
+/// The notice for an embedded run whose bot owns its own tool loop: two lines to
+/// stderr, the same sink and the same `--quiet` rule as [`warn`].
+pub fn warn_agent<W: Write>(sink: &mut W, quiet: bool, due: bool) -> bool {
+    emit(sink, quiet, due, &agent_lines())
+}
+
+/// The message an embedded `run`/`chat` on an ACP (or `claude -p`) backend is
+/// missing when its bot is asked to work as part of a team.
+///
+/// Read this together with the module docs: the same rule applies — the notice
+/// must never be the reason a command fails, and it must only describe what is
+/// actually true of this process.
+pub fn agent_lines() -> [String; 2] {
+    [
+        "swarmbot: embedded mode hands an ACP agent no SwarmBot team tools — `handoff_task`, \
+         `message_bot` and `post_to_group` never reach it, so it can only answer for itself."
+            .to_string(),
+        "swarmbot: run a `swarmbot-brain` and pass `--brain <url>` (or use `swarmbot-ui`, which \
+         spawns one) when bots must delegate to each other; the brain composes the MCP gateway \
+         the embedded mode has no listener for."
+            .to_string(),
+    ]
+}
+
+fn emit<W: Write>(sink: &mut W, quiet: bool, due: bool, lines: &[String; 2]) -> bool {
     if quiet || !due {
         return false;
     }
-    for line in lines() {
+    for line in lines {
         if writeln!(sink, "{line}").is_err() {
             return false;
         }
@@ -79,6 +122,49 @@ pub fn warn<W: Write>(sink: &mut W, quiet: bool, due: bool) -> bool {
 /// `run --json`).
 pub fn warn_on_stderr(quiet: bool, due: bool) {
     warn(&mut std::io::stderr(), quiet, due);
+}
+
+/// [`warn_agent`] on this process's stderr, for the same reason as
+/// [`warn_on_stderr`].
+pub fn warn_agent_on_stderr(quiet: bool, due: bool) {
+    warn_agent(&mut std::io::stderr(), quiet, due);
+}
+
+/// Embedded mode: does a bot this conversation can wake own its own tool loop
+/// (an ACP agent, or `claude -p`)?
+///
+/// Those backends reach SwarmBot's roster tools — `handoff_task`,
+/// `message_bot`, `post_to_group` — only through the MCP gateway, and the
+/// gateway is composed by the **brain** (`Swarm::set_mcp_provider`, which
+/// `crates/brain/src/state.rs` calls): the embedded CLI never sets a provider,
+/// so the agent is handed `mcpServers: []` and its team instructions describe
+/// tools it does not have.
+///
+/// This is a disclosure, not a capability: the fix is to run a brain (D9.11's
+/// shape — the same reason the embedded CLI refuses remote node calls). It is
+/// due only for a backend that owns its loop: an `openai_compat` backend is
+/// driven by the runner, which calls our tools in-process and needs no gateway.
+///
+/// Observed 2026-11-14 (opencode, no `--brain`): a `run` asked to let `@scout`
+/// count files answered "Sudah dikerjakan scout" while the run's own summary
+/// said `delegated: nothing` — the model claimed a handoff nothing performed.
+/// The notice is what stops that reading from being the only one available.
+pub fn embedded_agent_without_team_tools(swarm: &Swarm, conversation: &ConversationId) -> bool {
+    let participants = match swarm.store.get_conversation(conversation) {
+        Ok(Some(conversation)) => conversation.kind.participants(),
+        _ => return false,
+    };
+    let bots = match swarm.bots.list() {
+        Ok(bots) => bots,
+        Err(_) => return false,
+    };
+    let backends = swarm.backends.registry().list();
+    participants.iter().any(|id| {
+        bots.iter()
+            .find(|bot| &bot.id == id)
+            .and_then(|bot| backends.iter().find(|info| info.id == bot.backend))
+            .is_some_and(|info| info.kind.owns_tool_loop())
+    })
 }
 
 /// Embedded mode: is this a run on `fake` backends that **nothing scripted**?
@@ -262,6 +348,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn an_embedded_acp_run_says_its_bots_have_no_team_tools() {
+        let dir = TempDir::new("notice-agent").expect("temp");
+        // An ACP backend that owns its own tool loop. Nothing spawns: building
+        // a spec registers a backend and dials nothing (the comment on
+        // `a_real_backend_never_warns_in_either_mode` makes the same point).
+        let mut spec = BackendSpec::fake("agent");
+        spec.kind = BackendKind::Acp;
+        spec.options.insert(
+            "command".to_string(),
+            serde_json::json!("/nonexistent/swarmbot-test/agent"),
+        );
+        let config = BrainConfig {
+            default_backend: "agent".into(),
+            backends: vec![spec],
+            ..demo_on("agent")
+        };
+        let embedded = embedded(dir.path(), config);
+        let swarm = swarm_of(&embedded);
+        let group = team_group(&swarm);
+        // The group and the DM both can wake that bot: the notice is due.
+        assert!(embedded_agent_without_team_tools(&swarm, &group.id));
+        let lead = swarm.bots.by_name("lead").expect("the demo lead");
+        assert!(embedded_agent_without_team_tools(
+            &swarm,
+            &lead.direct_conversation_id
+        ));
+        // A conversation the store does not know decides "do not warn".
+        assert!(!embedded_agent_without_team_tools(
+            &swarm,
+            &ConversationId::new()
+        ));
+
+        // Two lines, to the sink, and `--quiet` suppresses them.
+        let mut sink = Vec::new();
+        assert!(warn_agent(&mut sink, false, true));
+        assert_eq!(
+            sink.iter().filter(|byte| **byte == b'\n').count(),
+            2,
+            "{}",
+            String::from_utf8_lossy(&sink)
+        );
+        let mut quiet = Vec::new();
+        assert!(!warn_agent(&mut quiet, true, true));
+        assert!(quiet.is_empty());
+        embedded.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn an_echo_fake_needs_no_script_so_it_does_not_warn() {
         let dir = TempDir::new("notice-echo").expect("temp");
         let mut spec = BackendSpec::fake("echo-y");
@@ -302,6 +436,10 @@ mod tests {
         // scripts in general. (No request is ever made; building a spec dials
         // nothing.)
         assert!(!embedded_unscripted_fake(&swarm, &group.id));
+        // And it is driven by the runner, which calls our tools in-process:
+        // the missing-MCP notice is not due. This is the line that keeps the
+        // two notices distinct — a runner-driven backend needs no gateway.
+        assert!(!embedded_agent_without_team_tools(&swarm, &group.id));
         embedded.shutdown().await;
 
         // The remote decision agrees: kind is what it reads.

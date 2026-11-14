@@ -24,7 +24,7 @@ use swarmbot_contracts::bot::Bot;
 use swarmbot_contracts::conversation::Conversation;
 use swarmbot_contracts::entry::{
     Author, CardEntry, Entry, EntryKind, EventEntry, MessageEntry, NoticeEntry, NoticeLevel,
-    PostState, ReasoningEntry, ToolCallEntry, ToolCallStatus,
+    PostState, ReasoningEntry, ToolCallEntry, ToolCallOrigin, ToolCallStatus,
 };
 use swarmbot_contracts::id::{BotId, ConversationId, EntryId, NodeId, TaskId, TurnId};
 use swarmbot_contracts::live::{LiveEvent, Snapshot};
@@ -636,7 +636,12 @@ fn render_tool_call(
         .filter(|line| line.starts_with("exit="))
         .map(str::to_string);
     let outcome = match call.status {
-        ToolCallStatus::Pending | ToolCallStatus::Running => theme.dim("→ running…"),
+        // `Pending` is what an agent's own call looks like between its first
+        // `session/update` and the one that says `in_progress`; saying
+        // "running…" there would claim a start nobody reported. Our own calls
+        // are inserted `Running`, so they are unaffected.
+        ToolCallStatus::Pending => theme.dim("→ pending…"),
+        ToolCallStatus::Running => theme.dim("→ running…"),
         ToolCallStatus::Completed => match &exit_line {
             // The shell handler's first line is `exit=<code>`; showing it
             // verbatim beats inventing our own "ok".
@@ -659,6 +664,12 @@ fn render_tool_call(
         } else {
             format!("node {}", short_id(node.as_str()))
         });
+    }
+    // An agent's own call has no node at all. Saying nothing would read as
+    // "we just did not record where", which is a different claim from the true
+    // one: no SwarmBot node ran this, and no policy of ours saw it (D9.31).
+    if call.origin == ToolCallOrigin::Agent {
+        facts.push("agent's own tool".to_string());
     }
     if !facts.is_empty() {
         head.push_str(&theme.dim(&format!(" ({})", facts.join(", "))));
@@ -1290,7 +1301,46 @@ mod tests {
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),
             duration_ms: Some(1234),
+            origin: ToolCallOrigin::Swarm,
         })))
+    }
+
+    /// An agent's own call renders as such: it has no node, and silence about
+    /// that would read as "we forgot to record where it ran" rather than the
+    /// true "no SwarmBot node ran it" (D9.31).
+    #[test]
+    fn an_agents_own_tool_call_says_so_and_names_no_node() {
+        let mut ours = tool_entry(ToolCallStatus::Completed, Some("ok"));
+        let mut call = ours.as_tool_call().cloned().expect("a tool call");
+        call.origin = ToolCallOrigin::Agent;
+        call.node_id = None;
+        *ours.as_tool_call_mut().expect("a tool call") = call.clone();
+
+        let roster = roster();
+        let mut buffer = Vec::new();
+        {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            printer.entry(&ours, &roster).expect("renders");
+            printer.finish().expect("finishes");
+        }
+        let out = String::from_utf8(buffer).expect("utf8");
+        assert!(out.contains("agent's own tool"), "{out:?}");
+        assert!(!out.contains("node local"), "{out:?}");
+
+        // The same row marked as ours keeps the node and says nothing extra.
+        call.origin = ToolCallOrigin::Swarm;
+        call.node_id = Some(NodeId::local());
+        let mut ours = tool_entry(ToolCallStatus::Completed, Some("ok"));
+        *ours.as_tool_call_mut().expect("a tool call") = call;
+        let mut buffer = Vec::new();
+        {
+            let mut printer = Printer::new(&mut buffer, Theme::plain(), false);
+            printer.entry(&ours, &roster).expect("renders");
+            printer.finish().expect("finishes");
+        }
+        let out = String::from_utf8(buffer).expect("utf8");
+        assert!(!out.contains("agent's own tool"), "{out:?}");
+        assert!(out.contains("node local"), "{out:?}");
     }
 
     #[test]
@@ -1966,6 +2016,7 @@ mod tests {
                 ended_at: Some(Utc::now()),
                 duration_ms: Some(120),
                 turn_id: Some(turn.id.clone()),
+                origin: ToolCallOrigin::Swarm,
             })),
         );
         let card = Entry::new(

@@ -388,6 +388,19 @@ pub enum LlmEvent {
         index: u32,
         fragment: String,
     },
+    /// **The agent ran one of its own tools** (ACP `session/update`). Distinct
+    /// from `ToolCallStart`/`ToolCallArgsDelta` on purpose, and not just naming
+    /// taste: those describe a call **this runner is about to make** through
+    /// `ToolRegistry`, under our `PolicyEngine`, our `AuditLog` and a
+    /// `NodeExecutor`. An [`AgentToolCall`] made no such promise — the agent's
+    /// own process decided it, in the agent's own sandbox, and this crate never
+    /// sees the arguments before the fact. Emitting it as `ToolCallStart` would
+    /// be the one mistake a consumer could not detect afterwards, because the
+    /// runner keys tool execution off exactly those events.
+    ///
+    /// A consumer renders these; it must never execute them. [`AgentToolCall`]
+    /// says so in its type.
+    AgentToolCall(Box<AgentToolCall>),
     /// Emitted exactly once per successful call, immediately before `chat`
     /// returns; `tool_calls` are already assembled.
     Finished {
@@ -397,6 +410,88 @@ pub enum LlmEvent {
         reasoning: String,
         tool_calls: Vec<ToolCall>,
     },
+}
+
+/// One tool call an **ACP agent made for itself**, as one `session/update`
+/// notification described it.
+///
+/// The agent sends these incrementally (`pending` → `in_progress` →
+/// `completed`, each notification carrying whatever fields it has so far), so a
+/// consumer receives **several events with the same [`AgentToolCall::id`]** and
+/// must merge them into one row. [`AgentToolCall::state`] tells it whether the
+/// row is still open.
+///
+/// ACP is explicit that this is informational for a client: it is how the agent
+/// reports what it is doing, not a request. There is no `args`-then-approve
+/// step here, which is precisely why SwarmBot's approvals cannot gate an ACP
+/// agent's tools — see the `llm::acp` module docs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentToolCall {
+    /// The agent's own id for the call (`toolCallId`). Stable across the
+    /// notifications that describe one call, which is what makes merging
+    /// possible; it is **not** a [`swarmbot_contracts::id::ToolCallId`] and is
+    /// not unique across agents or sessions.
+    pub id: String,
+    /// The agent's tool name, resolved from whichever of `name`/`title`/`kind`
+    /// it sent. Empty when it sent none of them, which happens on a bare
+    /// `tool_call_update`.
+    pub tool: String,
+    /// The call's arguments **as the agent sent them**, or `None` when this
+    /// notification carried no `rawInput`.
+    ///
+    /// `None` is not `{}` on purpose. Agents split one call across several
+    /// notifications and only some of them repeat `rawInput` (opencode sends it
+    /// on `in_progress` and omits it on the terminal update), so "this update
+    /// said nothing about the arguments" and "the arguments are empty" must be
+    /// distinguishable — otherwise a consumer merging them in order would let
+    /// the last, argument-less update erase what the agent already told it.
+    pub args: Option<Value>,
+    /// `locations[].path`: the machine-readable files the agent says the call
+    /// touched. A *fallback* for the arguments, never a replacement — some
+    /// agents only ever expose this much, and a row with a path beats a row
+    /// with `{}`.
+    pub locations: Vec<String>,
+    pub state: AgentToolState,
+    /// The call's output text, when the agent sent `content` blocks with it.
+    pub result_text: Option<String>,
+}
+
+/// How far along an agent's own tool call is, per its `status` field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolState {
+    /// Announced, not started.
+    Pending,
+    /// `in_progress`: the agent is running it now.
+    Running,
+    Completed,
+    Failed,
+    /// A status an agent sent that this build does not recognise. Kept as its
+    /// own variant instead of being folded into one of the real ones: the honest
+    /// report is "the agent said something we do not understand", and a consumer
+    /// that treated it as `Completed` would close a row the agent may still be
+    /// working on.
+    Unknown,
+}
+
+impl AgentToolState {
+    /// The protocol's own spellings, which is what agents actually send. A
+    /// value outside this set becomes [`AgentToolState::Unknown`] rather than a
+    /// guess.
+    pub fn from_acp(status: Option<&str>) -> Self {
+        match status {
+            Some("pending") => Self::Pending,
+            Some("in_progress") => Self::Running,
+            Some("completed") => Self::Completed,
+            Some("failed") => Self::Failed,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// A call that is still open (so its transcript row is not settled).
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Pending | Self::Running | Self::Unknown)
+    }
 }
 
 /// Why the model stopped.

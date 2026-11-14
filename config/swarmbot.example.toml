@@ -69,17 +69,51 @@ model = "fake"
 # `permission_mode` below. `probe` = spawn + initialize + session/new, and
 # costs no model call.
 #
+# **A green probe is not a working turn.** On this machine (2026-11-14) all
+# three agents probe green and only opencode answers: the Claude adapter
+# refuses `session/prompt` with "Authentication required" (the `claude` CLI
+# itself says "Not logged in"), and Codex's ChatGPT account rejects every model
+# its adapter advertises. `scripts/opencode-live.sh <backend-id>` checks the
+# handshake *and* one real turn — the only proof that matters. opencode is the
+# configured default in `config/swarmbot.toml`.
+#
+# **`permission_mode = "reject"` only bites if the agent asks.** Measured
+# 2026-11-14: `opencode acp` with a stock configuration sends no
+# `session/request_permission` at all, so it wrote a file while our `reject` was
+# in force — our answer was never consulted. Setting opencode's own
+# `permission: {edit: "ask", bash: "ask"}` in `model_env` makes the ask arrive;
+# then `reject` really refuses (the write fails, the transcript shows it) and
+# `allow` really permits it. Verified both ways through `swarmbot run`.
+#
+# **`settings.agent_cwd`** is where the agent's session starts (its `cwd`).
+# Absent = the bot's private workspace. Point it at a checkout to let a bot work
+# on real files; the prompt then says "session directory … (shared by every bot
+# that names it — files here are not private)" instead of claiming a private
+# workspace. It changes nothing for `openai_compat`/`fake`, whose tools are ours.
+#
+# **Pin `model`.** ACP needs a model this machine can route. Without one,
+# opencode picks its own default and every turn dies with
+# `no provider's ask matches your max-per-mtok bid`, so a bot that names no
+# model of its own has no fallback.
+#
 # [[backends]]
 # id = "opencode"
 # kind = "acp"
+# model = "inferhub/ali/qwen3.8-2.4t-a95b"   # verified here; also
+#                                   # `omniroute/yeta/deepseek-v4.1-flash`
+#                                   # (faster, needs the local OmniRoute daemon)
 # [backends.options]
 # command = "opencode"            # the agent binary to spawn
 # args = ["acp"]                  # its ACP mode
-# models_command = ["opencode", "models"]   # fallback model lister for agents
-#                                   # whose ACP server advertises no model state
-# [backends.options.model_env]      # pin the picked model inside the child for
-# OPENCODE_CONFIG_CONTENT = '{"model":"{model}"}'  # agents that accept no ACP
-#                                   # model selection; one process per model
+# models_command = ["opencode", "models"]   # fallback lister for the provider
+#                                   # menu; the agent advertises models over
+#                                   # ACP too, and that channel is preferred
+# [backends.options.model_env]      # pin the model AND the agent's own
+# OPENCODE_CONFIG_CONTENT = '{"model":"{model}","permission":{"edit":"ask","bash":"ask"}}'
+#                                   # permission policy (see above), one agent
+#                                   # process per model,
+#                                   # so a per-bot model override reaches the
+#                                   # agent even when it has its own default
 # # cwd = "/home/me/projects"     # session working dir; default: the brain's
 # # permission_mode = "reject"    # "reject" (default): refuse every permission
 #                                 #   ask — the agent reads and answers but
@@ -89,10 +123,9 @@ model = "fake"
 #                                 #   options are never chosen, so no blanket
 #                                 #   grant outlives a turn.
 # # env = { OPENCODE_CONFIG = "/home/me/.config/opencode-work" }
-# # opencode ignores ACP model selection (it advertises no model list), so a
-# # per-bot model override will not reach it; pin its model through its own
-# # config channel instead:
-# # env = { OPENCODE_CONFIG_CONTENT = "{\"model\":\"inferhub/ali/qwen3.8-max-0902\"}" }
+# # opencode now honours ACP model selection (it advertises its list), but it
+# # also carries a model of its own, so `model_env` above is what makes a
+# # per-bot override deterministic: verified 2026-11-14 both ways.
 # # inherit_env = false           # scrub the child's env down to a whitelist
 # # timeout_secs = 180            # ← inherited from the kind defaults: for acp
 #                                 #   this is the IDLE timeout — silence longer

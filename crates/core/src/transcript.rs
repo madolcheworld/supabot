@@ -241,6 +241,32 @@ impl Transcript {
         Ok(entry)
     }
 
+    /// A tool call an **agent ran itself** (ACP): written with
+    /// `origin = Agent` and no node, because no SwarmBot node ran it and no
+    /// policy of ours saw it (D9.31).
+    ///
+    /// Upserted by the runner on the agent's own call id, so the several
+    /// `session/update` notifications describing one call become one row.
+    pub fn agent_tool_call(
+        &self,
+        conversation: &ConversationId,
+        turn_id: Option<TurnId>,
+        call_id: ToolCallId,
+        tool: impl Into<String>,
+        args: serde_json::Value,
+    ) -> Result<Entry, DomainError> {
+        let entry = Entry::agent_tool_call(
+            conversation.clone(),
+            self.next_seq(conversation)?,
+            turn_id,
+            call_id,
+            tool,
+            args,
+        );
+        self.write(&entry)?;
+        Ok(entry)
+    }
+
     pub fn card(
         &self,
         request: &RuntimeRequest,

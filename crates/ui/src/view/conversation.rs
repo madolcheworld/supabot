@@ -991,6 +991,11 @@ fn tool_row(
     if let Some(node) = &call.node_id {
         meta = meta.child(format!("· {}", node));
     }
+    // An agent's own tool call (ACP) ran in the agent's sandbox, not on one of
+    // our nodes; it must not read as "where unknown" (D9.31).
+    if call.origin == swarmbot_contracts::entry::ToolCallOrigin::Agent {
+        meta = meta.child("· agent's own tool");
+    }
 
     let mut card = div()
         .w_full()

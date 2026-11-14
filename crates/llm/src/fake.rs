@@ -573,6 +573,10 @@ mod tests {
                 LlmEvent::TextDelta(_) => "text",
                 LlmEvent::ToolCallStart { .. } => "start",
                 LlmEvent::ToolCallArgsDelta { .. } => "args",
+                // The fake drives the runner's own tool loop; an agent's own
+                // call is an ACP thing and would be a bug here, so it gets a
+                // label that makes it visible in the order assertion below.
+                LlmEvent::AgentToolCall(_) => "agent",
                 // The fake never retries, so a `Restart` here would be a bug;
                 // the label keeps the match exhaustive when the variant exists.
                 LlmEvent::Restart { .. } => "restart",

@@ -105,13 +105,20 @@ rewrite history unless the owner asks.
 
 * **No test touches the network.** Live tests are `#[ignore]`d and gated:
   `PROTO_LIVE_LLM=1` (plus `PROTO_LIVE_BASE_URL`, `PROTO_LIVE_API_KEY`,
-  `PROTO_LIVE_MODEL`), `PROTO_LIVE_CLAUDE=1` and `PROTO_LIVE_ACP=1` (plus
-  `PROTO_LIVE_ACP_CMD`/`_ARGS`; free handshake unless `PROTO_LIVE_ACP_PROMPT=1`).
+  `PROTO_LIVE_MODEL`) and `PROTO_LIVE_ACP=1` (plus `PROTO_LIVE_ACP_CMD`/`_ARGS`;
+  free handshake unless `PROTO_LIVE_ACP_PROMPT=1`). There is **no**
+  `PROTO_LIVE_CLAUDE` test, whatever older text said — `ClaudeCli` is covered
+  offline against a stand-in binary, and its real path is the same ACP/CLI shape
+  this list already names. `scripts/opencode-live.sh [backend-id]` is the one
+  command that runs the ACP gate against the box's own agent (opencode by
+  default), and it is the honest answer to "can this machine complete a turn?".
   They stay trivially cheap — one turn — and they print what they spent.
   Three exist: `llm`'s `live_gateway_round_trip` (one turn, also asserts the
-  adapter filled `Usage`), and `node`'s `live_two_process` — two real processes
-  and a real model, which is the only proof of a remote tool call in that shape
-  (D9.26). The last one needs **both** binaries built first
+  adapter filled `Usage`), `llm`'s `live_acp_agent_handshake_and_one_cheap_turn`
+  (the one `scripts/opencode-live.sh` runs; without `PROTO_LIVE_ACP_PROMPT=1` it
+  stops at the free handshake), and `node`'s `live_two_process` — two real
+  processes and a real model, which is the only proof of a remote tool call in
+  that shape (D9.26). The last one needs **both** binaries built first
   (`cargo build -p swarmbot-brain -p swarmbot-node`), because
   `CARGO_BIN_EXE_<name>` only exists for a package's own bins.
 * **No test writes outside a `TempDir`**, and no test runs a destructive command
@@ -294,6 +301,60 @@ them.
   and check first for a source rewrite or a stray process holding a port, because
   "the test hung" and "the thing it talks to was changing underneath it" look
   identical from a `futex_wait`.
+* **A green `probe` is not a working turn, and the difference cost a day.**
+  `probe` is spawn + `initialize` + `session/new`, so on 2026-11-14 all three ACP
+  agents on this box reported `ok: true` while only **opencode** could answer a
+  turn: `claude-code-acp` refused `session/prompt` with `Authentication required`
+  (the `claude` CLI says `Not logged in`), and `codex-acp` had its every
+  advertised model rejected by the owner's ChatGPT account — reproduced by
+  `codex exec` outside SwarmBot, so it is the account, not the adapter. The
+  config therefore names opencode only, with `model` pinned (no model ⇒
+  opencode's own unroutable default ⇒ `no provider's ask matches your
+  max-per-mtok bid`), and `scripts/opencode-live.sh [backend-id]` is the command
+  that answers "can this box complete a turn?" because it runs the `#[ignore]`d
+  live test and asserts the reply. **Before trusting any provider row, run
+  that, not `/api/backends/probe`.** D9.28.
+* **The embedded CLI gives an ACP bot no team tools, and now says so.** Roster
+  tools (`handoff_task`, `message_bot`, `post_to_group`) reach an agent that owns
+  its tool loop only through the brain's MCP gateway; `swarmbot` without
+  `--brain` sets no provider, so the agent gets `mcpServers: []` and can only
+  answer for itself. Observed: a `run` reporting `delegated: nothing` while the
+  model claimed it had delegated. `notice::embedded_agent_without_team_tools`
+  now prints two lines on stderr before the first message (D9.29); **do not
+  "fix" it by faking a handoff.** Use `--brain` or `swarmbot-ui`.
+* **`delegated:` counts `handoff_task` rows, not messages, and now says which
+  tool was used instead.** A team that coordinated with `message_bot` made no
+  task and used to print a bare `delegated: nothing` — true about tasks, and
+  easy to read as "the team did nothing" (D9.30). `team_tool_hint` names the
+  coordination tool with first-use order and `×n` counts, and deliberately skips
+  `handoff_task` (that call already produced a row). Test:
+  `a_message_bot_run_names_the_tool_instead_of_a_bare_nothing`.
+* **An agent's own tool calls are transcribed as *the agent's*, and the event
+  type is the guard.** ACP reports tool activity through `session/update`, and
+  the adapter emits it as `LlmEvent::AgentToolCall` — **never** as
+  `ToolCallStart`, because the runner executes what those events describe. If a
+  future edit "simplifies" the two into one variant, SwarmBot will re-run, under
+  our policy and our node, commands the agent already ran in its own sandbox.
+  Rows carry `ToolCallEntry.origin` (`Swarm` | `Agent`, absent = `Swarm` for old
+  transcripts) and an agent row has no `node_id`; render both, as
+  `agent's own tool`, or "no node recorded" reads as a bug (D9.31). Merging one
+  call's several notifications is the other trap: the terminal update repeats
+  `locations` and **omits** `rawInput`, so last-wins erases the real arguments;
+  and only the announcement carries the tool's **name** (`shell`), while the
+  updates' `title` is the *command* (`ls crates | wc -l`) — mixing them renames
+  the row mid-turn. Both were observed on live runs, not reasoned about.
+* **A bot works where `settings.agent_cwd` says, and `permission_mode` is only a
+  boundary when the agent asks.** `agent_cwd` (absent = the bot's private
+  workspace) is handed to the backend as `ChatRequest::cwd`; the instruction text
+  says "session directory … (shared)" rather than claiming privacy (D9.32). And
+  measured 2026-11-14: **`opencode acp` sends no permission ask at all** with a
+  stock config, so `permission_mode = "reject"` let a write through — nothing was
+  ever asked. The shipped config puts `permission: {edit:"ask", bash:"ask"}` in
+  opencode's `model_env`, which is what makes `reject` refuse. **Do not delete
+  that key as redundant.** An agent that ends its own turn (`stopReason:
+  "cancelled"`, what a denial produces) is a normal ending, not
+  `LlmError::Cancelled` — that mapping made a healthy backend print
+  "unavailable: cancelled" right after a denied call.
 * **The embedded CLI cannot reach a remote node** — not a missing wire but a
   property of the mode: a node dials the brain's gateway, and `swarmbot` in-process
   has no listener, so nothing can pair with it. A bot configured against a foreign
@@ -303,7 +364,7 @@ them.
 ## State of the tree
 
 Check before you assume — it moves while people work. **All twelve crates are
-built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.376
+built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.396
 passed, 0 failed, 5 ignored** — three live tests (two behind `PROTO_LIVE_LLM`, one
 behind `PROTO_LIVE_ACP`) and two doctests in `store/src/threaded.rs` marked
 `ignore` because a doctest has no runtime to await on): `contracts`,

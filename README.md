@@ -245,8 +245,10 @@ daemon itu.
 **Konfigurasi**:
 
 ```bash
-cp config/swarmbot.example.toml data/config.toml    # brain, backend, safety
-swarmbot-brain --data-dir ./data --team config/team.example.toml   # 4 bot: lead/scout/dev/sentinel
+cp config/swarmbot.example.toml data/config.toml    # kerangka; config/swarmbot.toml
+                                                   # sudah berisi opencode + model
+swarmbot-brain --data-dir ./data --config config/swarmbot.toml \
+    --team config/team.example.toml    # 4 bot: lead/scout/dev/sentinel, semua opencode
 ```
 
 Aturan yang dijamin loader (`crates/brain/src/config.rs`, `crates/cli/src/config.rs`):
@@ -262,6 +264,29 @@ boot pertama.
 Empat backend, satu port (`swarmbot_llm::LlmBackend`). Backend `fake` **selalu**
 ada walaupun tidak dikonfigurasi, jadi demo dan seluruh tes berjalan tanpa
 kredensial dan tanpa jaringan.
+
+**Default di mesin ini: `opencode`, dan hanya itu yang terbukti menjawab.**
+Diperiksa 2026-11-14 lewat adapter yang sama yang dipakai produk: handshake,
+`session/new`, satu turn model sungguhan (balasan `PONG`, 4,2–4,4 s), dan satu
+`swarmbot run --brain` yang benar-benar **mendelegasikan** (`handoff_task` →
+`@scout` menjawab → `@lead` melaporkan hasilnya). `config/swarmbot.toml` karena
+itu memakai `default_backend = "opencode"` dengan `model` yang dipatok, dan
+seluruh roster di `data/` memakai backend itu.
+
+Dua agen ACP lain **handshake hijau tapi turn-nya gagal** di mesin ini, dan itu
+dua fakta berbeda yang mudah tertukar: `probe` berhenti setelah `initialize` +
+`session/new`, jadi ia melaporkan `ok: true` untuk agen yang akunnya tidak bisa
+dipakai. Kenyataannya `claude-code-acp` menolak `session/prompt` dengan
+"Authentication required" (`claude` sendiri bilang "Not logged in · Please run
+/login"), dan `codex-acp` ditolak akun ChatGPT pemiliknya ("The 'gpt-5.5' model
+is not supported when using Codex with a ChatGPT account"). Karena itu keduanya
+dikomentari di config sampai salah satunya benar-benar login; satu perintah
+memutuskannya:
+
+```bash
+scripts/opencode-live.sh            # opencode: handshake + satu turn nyata
+scripts/opencode-live.sh codex      # backend lain, kalau sudah login
+```
 
 **1. Gateway OpenAI-compatible** (`kind = "openai_compat"`) — SSE streaming dan
 native tool call:
@@ -362,10 +387,11 @@ Cara kerjanya dan batasnya, stated plainly:
 - **`model` adalah keinginan, bukan jaminan.** Kalau agen mengiklankan state
   model ACP (masih *unstable*), kita pindah ke model itu dan penolakan menjadi
   error — bukan diam-diam memakai model lain. Kalau tidak, agen memakai model
-  konfigurasinya sendiri dan `probe` + log mengatakannya. Untuk agen yang
-  tidak mengiklankan daftar model sama sekali (opencode), operator bisa
-  menunjuk `options.models_command` (mis. `["opencode", "models"]`): adapter
-  membaca daftar dari CLI agen sendiri, dan kolom model di menu terisi.
+  konfigurasinya sendiri dan `probe` + log mengatakannya. Agen yang mengiklankan
+  daftar model lewat ACP dipilihkan modelnya di sana (opencode sekarang
+  mengiklankannya, terverifikasi 2026-11-14); `options.models_command` (mis.
+  `["opencode", "models"]`) tetap berguna sebagai sumber daftar untuk menu model
+  dan sebagai jalur cadangan bila agen diam.
 - **Provider & model per bot dari UI.** Tombol `provider: …` di header
   percakapan DM membuka menu dua kolom: kiri daftar backend terkonfigurasi,
   kanan daftar model yang **backend itu sendiri iklankan** (`/models` untuk
@@ -381,9 +407,37 @@ Cara kerjanya dan batasnya, stated plainly:
   menyaring environment anak seperti tool shell (D5.7).
 - **`probe`** = spawn + `initialize` + `session/new`, tanpa panggilan model:
   layar Settings bisa bilang "agen siap / tidak ada / belum login" beserta
-  metode auth yang agen iklankan.
-- **Aktivitas tool agen belum ditranskrip** — satu baris log per aksi; transcript
-  menampilkan teks dan reasoning. Tool delegasi kita (`message_bot`, dst.)
+  metode auth yang agen iklankan. **Hijau di sini bukan berarti bisa menjawab** —
+  probe tidak pernah meminta satu turn, jadi agen yang belum login tetap
+  dilaporkan `ok: true`. `scripts/opencode-live.sh <backend-id>` yang
+  memutuskan, karena ia menjalankan satu turn nyata dan meng-assert balasannya.
+- **Tool tim hanya sampai ke agen lewat brain.** Delegasi (`handoff_task`,
+  `message_bot`, `post_to_group`) mencapai agen sebagai server MCP per-turn yang
+  disusun **brain**. `swarmbot` tanpa `--brain` tidak punya gateway itu, jadi
+  bot ACP di mode embedded hanya bisa menjawab untuk dirinya sendiri; perintahnya
+  sekarang mengatakannya di stderr sebelum pesan pertama, alih-alih membiarkan
+  sebuah run mencetak `delegated: nothing` sementara modelnya mengaku sudah
+  mendelegasikan. Pakai `--brain` (atau `swarmbot-ui`, yang men-spawn brain).
+- **`delegated:` menghitung tugas, bukan pesan.** Baris penutup `swarmbot run`
+  dihitung dari `handoff_task` saja; sebuah tim yang berkoordinasi lewat
+  `message_bot`/`post_to_group` tidak membuat task, jadi barisnya menyebut tool
+  yang benar-benar dipakai (`delegated: nothing — no handoff_task; the team
+  reached each other with message_bot ×5`) alih-alih "nothing". Diuji dengan
+  `a_message_bot_run_names_the_tool_instead_of_a_bare_nothing`.
+- **Aktivitas tool agen sekarang masuk transkrip (D9.31).** Setiap
+  `session/update` `tool_call`/`tool_call_update` menjadi **satu** baris
+  transkrip (beberapa notifikasi untuk satu panggilan digabung: nama, argumen,
+  status, hasil), dan baris itu ditandai `origin = agent` — bukan `swarm` —
+  serta tanpa `node_id`, karena agen menjalankannya di sandbox-nya sendiri dan
+  tidak ada `PolicyEngine`, `AuditLog` atau node SwarmBot kita di jalur itu.
+  Di CLI tampil sebagai `⚙ read {"path": …} → ok (682ms, agent's own tool)`.
+  Adapter sengaja **tidak** menerjemahkannya menjadi `ToolCallStart`, karena
+  event itu berarti "runner akan menjalankannya"; menerjemahkan berarti
+  SwarmBot menjalankan ulang perintah yang sudah dijalankan agen. Dibatasi
+  pengujian: `crates/core/tests/agent_tool_calls.rs` (turn nyata lewat runner),
+  `an_agents_tool_call_is_reported_but_never_offered_to_the_runner` (adapter),
+  dan tes protokol yang memakai JSON asli tangkapan `opencode acp`.
+  Tool delegasi kita (`message_bot`, dst.)
   menjangkau agen lewat MCP per-turn (`/mcp/t/{token}`, disaring sesuai toolset
   bot itu). Shutdown koneksi menutup stdin agen lebih dulu (EOF —
   agen stdio yang baik keluar dan mengurus anaknya sendiri) lalu, setelah 2
@@ -410,7 +464,7 @@ Login `claude.ai`/ChatGPT milik bot tidak pernah dibaca atau diteruskan.
 | Crate | Isi | Status (tes dari run terakhir) |
 | --- | --- | --- |
 | `swarmbot-contracts` | Domain types shared by every SwarmBot crate: ids, transcript entries, deliveries, turns, tasks, requests, nodes, tools, errors and live events — plus `Settings::validate`, the one place a budget of zero is refused on **both** the config-file and the API paths. | selesai — 86 |
-| `swarmbot-llm` | LLM backend port and adapters: OpenAI-compatible HTTP (SSE + tool calls), ACP agent harnesses (opencode / Claude Code / Codex), CLI harnesses, and a deterministic Fake for tests. | selesai — 138 (+2 `#[ignore]`: gateway live `PROTO_LIVE_LLM`, agen ACP live `PROTO_LIVE_ACP`). `AcpAgent`: nyata end-to-end — 15 tes unit + 15 tes integrasi offline (agen terskrip in-memory + `/bin/sh` lewat stdio nyata) dan satu turn live terverifikasi lewat `codex-acp`. `ClaudeCli`: `probe()` nyata dan `chat()` yang berjalan lewat `claude -p` + MCP |
+| `swarmbot-llm` | LLM backend port and adapters: OpenAI-compatible HTTP (SSE + tool calls), ACP agent harnesses (opencode / Claude Code / Codex), CLI harnesses, and a deterministic Fake for tests. | selesai — 138 (+2 `#[ignore]`: gateway live `PROTO_LIVE_LLM`, agen ACP live `PROTO_LIVE_ACP`). `AcpAgent`: nyata end-to-end — 15 tes unit + 15 tes integrasi offline (agen terskrip in-memory + `/bin/sh` lewat stdio nyata) dan satu turn live terverifikasi lewat **`opencode`** (2026-11-14: `PONG`, 4,2–4,4 s, lewat `scripts/opencode-live.sh`; `codex-acp` dan `claude-code-acp` handshake hijau tetapi turn-nya ditolak akun/login di mesin ini). `ClaudeCli`: `probe()` nyata dan `chat()` yang berjalan lewat `claude -p` + MCP |
 | `swarmbot-tools` | Tool registry and local handlers (shell, fs, glob, grep) with the path policy, safety ceilings, output spilling and audit log. | selesai — 115 |
 | `swarmbot-store` | SQLite projections (WAL, migrations), the append-only JSONL transcript mirror, boot recovery, backup, restore, dan retensi `tool_calls`. | selesai — 49 (21 lib + 12 backup — yang di dalamnya termasuk tes restore — + 2 memory + 4 sqlite + 10 threaded; satu contract suite dijalankan ke dua store) |
 | `swarmbot-core` | Orchestration: one runner per bot, deliveries, group routing, bot-to-bot messaging, handoffs, background tasks, approvals, instructions, the live hub, and the two token budgets (`max_tokens_per_turn` after each round trip, `max_tokens_per_day` before a turn). Store calls on the turn path go through the async facade. | selesai — 231 (203 lib + 23 integrasi delegasi + 5 integrasi `budget`), termasuk `bot_tools.rs`: 13 tool delegasi |
@@ -439,17 +493,19 @@ tes dari `cargo test --workspace` (bukan hasil grep).
 | **M7** Penguatan | routines, memory, skills, data stream `/node/stream/:id`, backend `codex app-server`, backup, retensi | **selesai kecuali dua item yang dinyatakan**: routines berjalan (ticker dipanggil di brain dan CLI embedded, `RoutineRun` ditutup saat turn selesai), memory punya jalur tulis (`remember` → `MEMORY.md`), skills dibaca dari pustaka `<data>/skills/<nama>/SKILL.md`, **backup selesai** (`swarmbot backup create/verify/restore` — `VACUUM INTO` + manifest yang diverifikasi ulang dari snapshot; restore menolak brain yang masih hidup, membuang `-wal` basi, dan meninggalkan salinan `pre-restore`, D9.22), **retensi `tool_calls` selesai** (prune berdasarkan umur lewat ticker housekeeping, D9.23), dan **usage token punya permukaan di ketiga front end** (`GET /api/usage`, `swarmbot usage`, dan layar Usage di UI desktop). **Data stream `/node/stream/:id`: jalur RPC selesai end-to-end** — token, `StreamKind`, `StreamFrame` (cap 1 MiB/chunk, 2 MiB in-flight, 64 MiB/transfer), route `/node/stream/:id` dengan kode tutup `4405`, `StreamHub`, dan `node/src/stream.rs` sebagai dialer; `fs.download` pindah dari tabel refusal ke tabel implemented. Dibuktikan dengan **binary node sungguhan melawan brain sungguhan** (`real_brain.rs`, fixture berisi NUL + `0xff`, digest node dibandingkan dengan digest yang dihitung brain, baris audit menyebut bot) dan di-mutation-check. **Belum ada pemanggil** — tidak ada route/tool/CLI yang meminta download, jadi belum ada permukaan pengguna. **`codex app-server` dihapus, bukan dibangun** (D9.19): Codex sudah tersedia lewat `codex-acp` (ACP), dan varian `CodexAppServer` hanya pernah ada sebagai `Unavailable` yang tetap muncul sebagai provider yang bisa dipilih; config lama yang memakai `kind = "codex_app_server"` sekarang ditolak saat load, bukan gagal di turn pertama |
 
 Run terakhir yang tercatat: `scripts/check.sh` exit 0 — fmt + clippy + tes,
-**1.376 lulus, 0 gagal, 5 di-`#[ignore]`** (36–140 s tes tergantung cache; gate penuh 45–135 s). Yang
+**1.396 lulus, 0 gagal, 5 di-`#[ignore]`** (gate penuh 118 s pada 2026-11-14, termasuk
+`swarmbot-ui`). Yang
 diabaikan memang butuh sesuatu yang tidak ada di gate: tiga tes live — gateway llm
 satu turn (`PROTO_LIVE_LLM=1`), **dua proses + model nyata**
 (`crates/node/tests/live_two_process.rs`, juga `PROTO_LIVE_LLM=1`, D9.26), dan agen
 ACP (`PROTO_LIVE_ACP=1`, plus `PROTO_LIVE_ACP_CMD`; tanpa `PROTO_LIVE_ACP_PROMPT=1`
 ia berhenti di handshake yang gratis) — plus dua doctest di
 `store/src/threaded.rs` yang ditandai `ignore` karena memerlukan runtime yang tidak
-dimiliki doctest. Dari ketiganya, **dua sudah dijalankan dan hijau** di sesi ini
-terhadap `api.inferhub.dev` (`live_gateway_round_trip` dan `live_two_process`);
-tes ACP live **tidak** dijalankan di sesi ini, dan angka di atas adalah gate tanpa
-kredensial apa pun.
+dimiliki doctest. Ketiganya **sudah dijalankan dan hijau**: dua terhadap
+`api.inferhub.dev` (`live_gateway_round_trip` dan `live_two_process`), dan tes ACP
+live terhadap **opencode** (`text=PONG`, 4,2–4,4 s). Angka di atas tetap gate
+tanpa kredensial apa pun — tes live tinggal `#[ignore]` sampai gate env-nya
+dipasang, dan `scripts/opencode-live.sh` adalah jalan pintasnya.
 Perincian per crate ada di tabel di atas; `scripts/check.sh` adalah yang menentukan.
 
 Repository ini adalah repo git; riwayatnya ada di `git log`.
@@ -473,7 +529,40 @@ Ditulis di sini supaya tidak ada yang mengira ini sudah terbukti:
 | ~~Apakah adapter sungguhan mengisi `Usage`~~ | **`openai_compat`: ya, terverifikasi (D9.26).** `live_gateway_round_trip` sekarang **meng-assert** `input_tokens > 0` dan `output_tokens > 0`, bukan hanya mencetaknya; satu run nyata melaporkan `input=66 output=31 llm_calls=1`. **Masih belum:** `acp` dan `claude-cli` terhadap model nyata — keduanya belum pernah melaporkan angka apa pun di sesi ini |
 | Angka usage dari backend sungguhan di layar Usage | layar, route `GET /api/usage` dan `swarmbot usage` ada dan memakai satu fungsi jendela yang sama; yang belum pernah dilihat adalah angka yang **bukan** dari `FakeBackend::with_usage` |
 | ~~Restore backup ke brain yang **sedang berjalan**~~ | **Selesai (D9.22).** Restore **menolak** brain yang masih memegang database (dibuktikan terhadap proses `swarmbot-brain` sungguhan, dengan pid disebut di pesan), dan prosedur **stop → restore → start** terbukti menyajikan roster backup. Rollback lewat salinan `pre-restore` juga terbukti. Yang tetap tidak ada: restore jarak jauh (`--brain` ditolak, karena databasenya di mesin daemon) |
-| Agen ACP **nyata** di dalam test suite | suite memakai agen terskrip in-memory (seluruh protokol: streaming, permission, cancel, timeout, respawn) plus `/bin/sh` lewat stdio nyata (framing + kill grup proses). Agen sungguhan diverifikasi manual di mesin ini: handshake + `session/new` untuk **opencode**, **claude-code-acp** dan **codex-acp**, dan **satu turn penuh lewat codex-acp** (balasan `PONG`, 5,4 s — satu panggilan model kecil). Turn penuh opencode/Claude Code belum: opencode konfigurasi global pemilik menggantung di `session/new` (sisi opencode, bukan adapter — timeout setup kita menangkapnya dengan jujur), dan Claude Agent SDK tidak menemukan kredensial di mesin ini. Tes live satu-turn ada di gate env: `PROTO_LIVE_ACP=1` |
+| Agen ACP **nyata** di dalam test suite | suite tetap memakai agen terskrip in-memory (seluruh protokol: streaming, permission, cancel, timeout, respawn) plus `/bin/sh` lewat stdio nyata (framing + kill grup proses). Agen sungguhan diverifikasi manual di mesin ini lewat `scripts/opencode-live.sh`: handshake + `session/new` untuk **opencode**, **claude-code-acp** dan **codex-acp**, dan **satu turn penuh lewat opencode** (`PONG`, 4,2 s) — plus satu `swarmbot run --brain` yang benar-benar mendelegasikan ke bot kedua. **Turn penuh lewat Claude dan Codex belum**, bukan karena adapter: `claude-code-acp` menjawab `session/prompt` dengan "Authentication required" (`claude` belum login di mesin ini) dan `codex-acp` ditolak akun ChatGPT-nya. Tes live satu-turn ada di gate env: `PROTO_LIVE_ACP=1` |
+
+## Bot yang bekerja di direktori nyata
+
+Secara default setiap bot bekerja di workspace privatnya
+(`<data>/workspaces/<nama>`), yang tidak berisi repo. Untuk membiarkan bot bekerja
+di checkout sungguhan:
+
+```toml
+[settings]
+agent_cwd = "/home/me/projects/thing"   # atau relatif terhadap induk <data>, mis. "."
+
+[[backends]]
+id = "opencode"
+[backends.options]
+permission_mode = "reject"              # default: baca & jawab, tidak mengubah
+[backends.options.model_env]
+OPENCODE_CONFIG_CONTENT = '{"model":"{model}","permission":{"edit":"ask","bash":"ask"}}'
+```
+
+Terbukti 2026-11-14 di mesin ini, tiga jalur sekaligus:
+
+| `permission_mode` | Yang terjadi | Berkas di disk |
+| --- | --- | --- |
+| `reject` (default) | agen membaca, lalu `edit` **ditolak**; transkrip mencatat `⚙ edit … → failed` | tidak berubah |
+| `allow` | agen membaca lalu `edit` **berhasil** | berubah |
+| `reject` **tanpa** blok `permission` di `OPENCODE_CONFIG_CONTENT` | agen **tidak pernah bertanya**, jadi `reject` tidak menolak apa pun | **berubah** ← cacat yang ditemukan & diperbaiki |
+
+Dua batas yang harus disebut apa adanya: tool agen berjalan di sandbox **milik
+agen**, jadi `PathPolicy`, `AuditLog`, dan kartu persetujuan kita **tidak**
+menghalangi di antara agen dan direktori itu — `agent_cwd` menentukan *di mana*,
+`permission_mode` menentukan *boleh bertindak atau tidak*, dan transkrip mencatat
+*apa yang dilakukannya* (`origin = agent`, D9.31). Keputusan `settings.agent_cwd`
+dan pengukuran `permission` ada di D9.32.
 
 ## Keamanan
 

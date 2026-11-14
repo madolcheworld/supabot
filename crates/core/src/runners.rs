@@ -43,7 +43,8 @@ use swarmbot_contracts::turn::{
     DEFAULT_WINDOW_HOURS, Turn, TurnInitiator, TurnStatus, UsageReport,
 };
 use swarmbot_llm::{
-    ChatMessage, ChatRequest, ChatResponse, FinishReason, LlmBackend, LlmEvent, Role,
+    AgentToolCall, AgentToolState, ChatMessage, ChatRequest, ChatResponse, FinishReason,
+    LlmBackend, LlmEvent, Role,
 };
 use swarmbot_tools::{ApprovalGate, NodeExecutor, ToolContext, ToolRegistry};
 
@@ -1277,16 +1278,49 @@ async fn execute_turn(
         .map(|reg| reg.servers.clone())
         .unwrap_or_default();
 
-    let placement = if node.id.is_local() {
+    // Where a backend that owns its tool loop starts: `settings.agent_cwd` when
+    // the operator pointed it at a real checkout, else the bot's private
+    // workspace. A relative `agent_cwd` is resolved against the data dir's
+    // parent (the checkout/working tree the brain was started from) so a config
+    // can say `agent_cwd = "."` without hard-coding a machine path.
+    let agent_cwd_dir = settings
+        .agent_cwd
+        .as_deref()
+        .filter(|dir| !dir.trim().is_empty())
+        .map(|dir| {
+            let path = Path::new(dir);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                env.workspaces_root
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join(path)
+            }
+        });
+    // The instructions must name the place the agent will actually see. Telling
+    // a bot "private workspace: <data>/workspaces/x" while its session starts in
+    // a checkout is the kind of small lie that makes every other line untrusted.
+    let placement = if !node.id.is_local() {
+        format!("node `{}` (remote)", node.label)
+    } else if let Some(dir) = &agent_cwd_dir {
+        format!(
+            "node `{}` (local); session directory: `{}` (shared by every bot that names it —              files here are not private)",
+            node.label,
+            dir.display()
+        )
+    } else {
         format!(
             "node `{}` (local); private workspace: `{}`",
             node.label,
             workspace_abs.display()
         )
-    } else {
-        format!("node `{}` (remote)", node.label)
     };
-    let chat_cwd = node.id.is_local().then_some(workspace_abs);
+    let chat_cwd = node.id.is_local().then(|| {
+        agent_cwd_dir
+            .clone()
+            .unwrap_or_else(|| workspace_abs.clone())
+    });
     let prompt_tools: &[ToolSpec] = if !backend.kind().owns_tool_loop() || !mcp_servers.is_empty() {
         &visible
     } else {
@@ -1994,6 +2028,11 @@ fn publish_status(env: &RunnerEnv, bot_id: &BotId, status: BotStatus) {
 pub struct StreamedEntries {
     pub message: Option<Entry>,
     pub reasoning: Option<Entry>,
+    /// Tool-call rows an agent reported for itself, in the order they first
+    /// appeared, settled by the last notification that described each one
+    /// (D9.31). Empty for a runner-driven backend, whose calls go through
+    /// `run_tool_call` instead.
+    pub agent_calls: Vec<Entry>,
 }
 
 /// Renders deltas into transcript entries, throttled, and holds back anything
@@ -2009,6 +2048,13 @@ struct StreamRenderer {
     reasoning_text: String,
     last_flush: Instant,
     pending_bytes: usize,
+    /// The agent's own tool calls, keyed by **its** call id. One call arrives
+    /// as several `session/update`s (`pending`, `in_progress`, `completed`),
+    /// so this is a merge table, not a growing list.
+    agent_calls: HashMap<String, Entry>,
+    /// The same rows in first-seen order, which is the order a reader expects
+    /// and `HashMap` cannot promise.
+    agent_order: Vec<String>,
 }
 
 impl StreamRenderer {
@@ -2029,6 +2075,8 @@ impl StreamRenderer {
             reasoning_text: String::new(),
             last_flush: Instant::now(),
             pending_bytes: 0,
+            agent_calls: HashMap::new(),
+            agent_order: Vec::new(),
         }
     }
 
@@ -2051,8 +2099,129 @@ impl StreamRenderer {
                 self.maybe_flush();
             }
             LlmEvent::ToolCallStart { .. } | LlmEvent::ToolCallArgsDelta { .. } => self.flush(),
+            // An agent's own call: rendered, never run. It settles over several
+            // events, so the flush first keeps the transcript order honest —
+            // the text the agent wrote before the call stays above the row.
+            LlmEvent::AgentToolCall(call) => {
+                self.flush();
+                self.record_agent_call(&call);
+            }
             LlmEvent::Restart { attempt } => self.restart(attempt),
             LlmEvent::Finished { .. } => self.flush(),
+        }
+    }
+
+    /// Fold one `session/update` from an agent's own tool loop into a
+    /// transcript row (D9.31).
+    ///
+    /// The agent describes one call across several notifications, each carrying
+    /// whatever it has so far: the first has a name and no arguments, a later
+    /// one has the arguments, the last has the result. So this **merges** — an
+    /// absent field means "nothing new", never "clear it" — and settles the row
+    /// only when the agent says the call is done. A row left open at the end of
+    /// a turn is exactly what the agent said: it never reported a terminal
+    /// status (a cancelled turn looks like this, and closing it as `Completed`
+    /// would credit a call nobody saw finish).
+    ///
+    /// `origin = Agent` on the row, and `node_id` is `None` because no SwarmBot
+    /// node ran this and no `PolicyEngine` or `AuditLog` of ours saw it. That
+    /// is the whole point of the marker: `delegated:` style summaries and any
+    /// future audit query must be able to tell our execution from the agent's.
+    fn record_agent_call(&mut self, call: &AgentToolCall) {
+        let status = agent_status(call.state);
+        match self.agent_calls.get_mut(&call.id) {
+            Some(entry) => {
+                let mut updated = entry.clone();
+                if let Some(row) = updated.as_tool_call_mut() {
+                    if !call.tool.is_empty() {
+                        row.tool = call.tool.clone();
+                    }
+                    if let Some(args) = merge_agent_args(row.args.clone(), call) {
+                        row.args = args;
+                    }
+                    if call.result_text.is_some() {
+                        row.result_text = call.result_text.clone();
+                    }
+                    // An unknown status leaves the row as it was: the agent said
+                    // something this build does not understand, and inventing a
+                    // terminal state would be worse than an open row.
+                    if let Some(status) = status {
+                        if status.is_terminal() && !row.status.is_terminal() {
+                            row.duration_ms = Some(
+                                (chrono::Utc::now() - row.started_at)
+                                    .num_milliseconds()
+                                    .max(0) as u64,
+                            );
+                        }
+                        row.status = status;
+                    }
+                    if row.status.is_terminal() {
+                        row.ended_at = Some(chrono::Utc::now());
+                    }
+                }
+                updated.revision += 1;
+                updated.updated_at = chrono::Utc::now();
+                if let Err(err) = self.transcript.update(&updated) {
+                    warn!(error = %err, "cannot update an agent tool call in the transcript");
+                }
+                if let Some(slot) = self.agent_calls.get_mut(&call.id) {
+                    *slot = updated;
+                }
+            }
+            None => {
+                let call_id = ToolCallId::from_suffix(&stable_id(&call.id));
+                let tool = if call.tool.is_empty() {
+                    "agent tool".to_string()
+                } else {
+                    call.tool.clone()
+                };
+                // The row is written with whatever this notification already
+                // established; later ones merge into it.
+                let initial_args = merge_agent_args(serde_json::json!({}), call)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                match self.transcript.agent_tool_call(
+                    &self.conversation,
+                    Some(self.turn.clone()),
+                    call_id,
+                    tool.clone(),
+                    initial_args,
+                ) {
+                    Ok(mut entry) => {
+                        // A brand-new row is written `Running`; settle it at
+                        // once when this very notification is already terminal
+                        // (a fast call whose first update carries the result).
+                        if let Some(row) = entry.as_tool_call_mut() {
+                            row.result_text = call.result_text.clone();
+                            if let Some(status) = status {
+                                let terminal = status.is_terminal();
+                                row.status = status;
+                                if terminal {
+                                    row.ended_at = Some(chrono::Utc::now());
+                                    row.duration_ms = Some(0);
+                                }
+                            }
+                        }
+                        entry.revision += 1;
+                        entry.updated_at = chrono::Utc::now();
+                        if let Err(err) = self.transcript.update(&entry) {
+                            warn!(error = %err, "cannot settle an agent tool call in the transcript");
+                        }
+                        self.agent_order.push(call.id.clone());
+                        self.agent_calls.insert(call.id.clone(), entry);
+                    }
+                    Err(err) => {
+                        // A transcript that cannot take the row must not fail
+                        // the turn: the call really happened, and the agent is
+                        // mid-answer. Log loudly — a silently missing row is
+                        // how a transcript stops being one.
+                        warn!(
+                            error = %err,
+                            tool = %tool,
+                            "an agent tool call could not be written to the transcript; the turn continues"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -2167,9 +2336,15 @@ impl StreamRenderer {
 
     fn finish(mut self) -> StreamedEntries {
         self.flush();
+        let agent_calls = self
+            .agent_order
+            .iter()
+            .filter_map(|id| self.agent_calls.get(id).cloned())
+            .collect();
         StreamedEntries {
             message: self.message,
             reasoning: self.reasoning,
+            agent_calls,
         }
     }
 }
@@ -2236,6 +2411,57 @@ fn activity_of(delivery: &Delivery) -> String {
 
 /// Tool-call ids come from the model; fold them into our id shape without
 /// losing the one-to-one relation (so idempotency still holds).
+/// The transcript status for an agent's own tool call, or `None` when the
+/// agent sent a status this build does not recognise.
+///
+/// `None` is deliberate and is why this is not a `From`: an unknown value must
+/// leave the row unsettled, not be rounded to the nearest known state.
+fn agent_status(state: AgentToolState) -> Option<ToolCallStatus> {
+    match state {
+        AgentToolState::Pending => Some(ToolCallStatus::Pending),
+        AgentToolState::Running => Some(ToolCallStatus::Running),
+        AgentToolState::Completed => Some(ToolCallStatus::Completed),
+        AgentToolState::Failed => Some(ToolCallStatus::Failed),
+        AgentToolState::Unknown => None,
+    }
+}
+
+/// The arguments a row should hold after this notification, or `None` to keep
+/// what it has.
+///
+/// The rule, and why it is this shape: agents split one call across several
+/// notifications and only *some* of them repeat `rawInput` — opencode sends it
+/// on `in_progress` and omits it on the terminal update, which carries
+/// `locations` instead. A merge that took "the last thing I saw" would let that
+/// terminal update replace `{"path": "README.md", "limit": 20}` with a path
+/// list (observed, on the first run of this feature: the row read
+/// `{"locations": [...]}` while the agent had sent real arguments). So:
+///
+/// * real `rawInput` always wins — it is the agent's own account;
+/// * `locations` fills in only when the row has nothing but `{}`, so an agent
+///   that never sends `rawInput` still gets a usable row;
+/// * a notification with neither changes nothing.
+fn merge_agent_args(current: serde_json::Value, call: &AgentToolCall) -> Option<serde_json::Value> {
+    if let Some(args) = &call.args
+        && !is_blank_args(args)
+    {
+        return Some(args.clone());
+    }
+    let blank = is_blank_args(&current);
+    if blank && !call.locations.is_empty() {
+        // Named after the protocol field: this is a path list, not arguments
+        // the agent supplied, and the key says so.
+        return Some(serde_json::json!({ "locations": call.locations }));
+    }
+    None
+}
+
+/// `true` for `{}`/`null`: an agent's "no arguments yet" must not overwrite
+/// arguments a later notification already gave.
+fn is_blank_args(args: &serde_json::Value) -> bool {
+    args.is_null() || args.as_object().is_some_and(|map| map.is_empty())
+}
+
 fn stable_id(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
@@ -2670,6 +2896,202 @@ mod tests {
             text, "PONG",
             "only the successful attempt's text survives: {text:?}"
         );
+    }
+
+    /// An ACP agent reports its own tool calls; the runner must turn those
+    /// several notifications into **one** transcript row, marked as the
+    /// agent's, with the arguments the agent actually sent (D9.31).
+    ///
+    /// The sequence below is the one `opencode acp` really sent on 2026-11-14,
+    /// including the part that is easy to get wrong: the terminal update
+    /// carries `locations` and **no** `rawInput`, so a merge that took whatever
+    /// arrived last would replace `{"path": …}` with a path list. That is why
+    /// the assertions are on the arguments, not just the row count.
+    #[tokio::test]
+    async fn an_agents_own_tool_calls_become_one_transcript_row() {
+        let (swarm, _dir) = test_swarm();
+        let lead = swarm.bots.by_name("lead").unwrap();
+        let turn = Turn::start(
+            lead.id.clone(),
+            lead.direct_conversation_id.clone(),
+            TurnInitiator::Owner,
+            None,
+            None,
+        );
+        swarm.store.insert_turn(&turn).unwrap();
+
+        let mut renderer = StreamRenderer::new(
+            Arc::clone(&swarm.transcript),
+            lead.direct_conversation_id.clone(),
+            lead.id.clone(),
+            turn.id.clone(),
+        );
+
+        // 1. announced: name, no arguments yet.
+        renderer.on_event(LlmEvent::AgentToolCall(Box::new(AgentToolCall {
+            id: "chatcmpl-tool-abc".into(),
+            tool: "read".into(),
+            args: None,
+            locations: Vec::new(),
+            state: AgentToolState::Pending,
+            result_text: None,
+        })));
+        // 2. in progress: the real arguments arrive.
+        renderer.on_event(LlmEvent::AgentToolCall(Box::new(AgentToolCall {
+            id: "chatcmpl-tool-abc".into(),
+            tool: "read".into(),
+            args: Some(serde_json::json!({"path": "README.md", "limit": 5})),
+            locations: vec!["/repo/README.md".into()],
+            state: AgentToolState::Running,
+            result_text: None,
+        })));
+        // 3. completed: result plus locations, and no arguments repeated.
+        renderer.on_event(LlmEvent::AgentToolCall(Box::new(AgentToolCall {
+            id: "chatcmpl-tool-abc".into(),
+            tool: "read".into(),
+            args: None,
+            locations: vec!["/repo/README.md".into()],
+            state: AgentToolState::Completed,
+            result_text: Some("Read file README.md, lines 1-5\n1: # SwarmBot".into()),
+        })));
+        let streamed = renderer.finish();
+
+        assert_eq!(
+            streamed.agent_calls.len(),
+            1,
+            "three notifications describing one call are one row: {:?}",
+            streamed.agent_calls
+        );
+        let row = streamed.agent_calls[0].as_tool_call().expect("a tool call");
+        assert_eq!(row.tool, "read");
+        assert_eq!(row.status, ToolCallStatus::Completed);
+        assert_eq!(
+            row.origin,
+            swarmbot_contracts::entry::ToolCallOrigin::Agent,
+            "an agent's call must never be recorded as one of ours"
+        );
+        assert_eq!(row.node_id, None, "no SwarmBot node ran it");
+        assert_eq!(
+            row.args,
+            serde_json::json!({"path": "README.md", "limit": 5}),
+            "the agent's real rawInput survives the terminal update that omits it"
+        );
+        assert!(
+            row.result_text
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("Read file README.md"),
+            "the result text is kept: {:?}",
+            row.result_text
+        );
+
+        // The row is in the store, not only in the returned struct: a transcript
+        // that only exists in a return value is not a transcript.
+        let stored = swarm
+            .transcript
+            .tail(&lead.direct_conversation_id, 20)
+            .expect("tail");
+        let on_disk: Vec<&swarmbot_contracts::entry::ToolCallEntry> = stored
+            .iter()
+            .filter_map(|entry| entry.as_tool_call())
+            .collect();
+        assert_eq!(on_disk.len(), 1, "one row on disk: {stored:?}");
+        assert_eq!(on_disk[0].tool, "read");
+        assert_eq!(
+            on_disk[0].origin,
+            swarmbot_contracts::entry::ToolCallOrigin::Agent
+        );
+    }
+
+    /// Two different calls are two rows, in the order they first appeared —
+    /// `HashMap` iteration order would not promise that.
+    #[tokio::test]
+    async fn agent_tool_calls_keep_their_first_seen_order() {
+        let (swarm, _dir) = test_swarm();
+        let lead = swarm.bots.by_name("lead").unwrap();
+        let turn = Turn::start(
+            lead.id.clone(),
+            lead.direct_conversation_id.clone(),
+            TurnInitiator::Owner,
+            None,
+            None,
+        );
+        swarm.store.insert_turn(&turn).unwrap();
+        let mut renderer = StreamRenderer::new(
+            Arc::clone(&swarm.transcript),
+            lead.direct_conversation_id.clone(),
+            lead.id.clone(),
+            turn.id.clone(),
+        );
+        renderer_second_call(&mut renderer, "call-b", "bash");
+        renderer_second_call(&mut renderer, "call-a", "edit");
+        // Re-reporting an existing call must not move it to the end.
+        renderer_second_call(&mut renderer, "call-b", "bash");
+        let streamed = renderer.finish();
+        let tools: Vec<&str> = streamed
+            .agent_calls
+            .iter()
+            .filter_map(|entry| entry.as_tool_call())
+            .map(|call| call.tool.as_str())
+            .collect();
+        assert_eq!(tools, vec!["bash", "edit"]);
+    }
+
+    /// A call the agent never settled stays open, and an unrecognised status
+    /// does not get rounded to `Completed`: the honest row is the one that says
+    /// nobody reported an ending.
+    #[tokio::test]
+    async fn an_agent_call_without_a_terminal_status_stays_open() {
+        let (swarm, _dir) = test_swarm();
+        let lead = swarm.bots.by_name("lead").unwrap();
+        let turn = Turn::start(
+            lead.id.clone(),
+            lead.direct_conversation_id.clone(),
+            TurnInitiator::Owner,
+            None,
+            None,
+        );
+        swarm.store.insert_turn(&turn).unwrap();
+        let mut renderer = StreamRenderer::new(
+            Arc::clone(&swarm.transcript),
+            lead.direct_conversation_id.clone(),
+            lead.id.clone(),
+            turn.id.clone(),
+        );
+        renderer.on_event(LlmEvent::AgentToolCall(Box::new(AgentToolCall {
+            id: "tool-stuck".into(),
+            tool: "bash".into(),
+            args: Some(serde_json::json!({"command": "sleep 999"})),
+            locations: Vec::new(),
+            state: AgentToolState::Running,
+            result_text: None,
+        })));
+        renderer.on_event(LlmEvent::AgentToolCall(Box::new(AgentToolCall {
+            id: "tool-stuck".into(),
+            tool: "bash".into(),
+            args: None,
+            locations: Vec::new(),
+            // A status this build does not know: leave the row as the agent
+            // last described it rather than inventing an ending.
+            state: AgentToolState::Unknown,
+            result_text: None,
+        })));
+        let streamed = renderer.finish();
+        let row = streamed.agent_calls[0].as_tool_call().expect("a row");
+        assert_eq!(row.status, ToolCallStatus::Running);
+        assert_eq!(row.ended_at, None, "nobody reported an end");
+        assert_eq!(row.duration_ms, None, "a duration would be invented");
+    }
+
+    fn renderer_second_call(renderer: &mut StreamRenderer, id: &str, tool: &str) {
+        renderer.on_event(LlmEvent::AgentToolCall(Box::new(AgentToolCall {
+            id: id.to_string(),
+            tool: tool.to_string(),
+            args: Some(serde_json::json!({"command": "ls"})),
+            locations: Vec::new(),
+            state: AgentToolState::Completed,
+            result_text: Some("Cargo.toml".into()),
+        })));
     }
 
     /// `Notify::notify_waiters` stores no permit, so a `joined()` that arrives

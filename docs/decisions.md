@@ -132,10 +132,13 @@ Status: accepted for the M0–M6 prototype.
   wiring does not yet. Model selection is a wish: agents that advertise the
   unstable ACP model state get `session/set_model` and a refusal is an error,
   never a silent swap; agents that do not keep their own model and say so in
-  `probe`. Agents that advertise *no model list at all* (opencode's ACP server)
-  can get one through `options.models_command` — the agent's own CLI as the
-  lister, parsed one id per line — because "the wire is silent" must not read
-  as "this agent has no models" when its CLI happily lists them. Credentials
+  `probe`. Agents that advertise *no model list at all* can get one through
+  `options.models_command` — the agent's own CLI as the lister, parsed one id
+  per line — because "the wire is silent" must not read as "this agent has no
+  models" when its CLI happily lists them. (This paragraph used to name
+  opencode as the silent one; its 2.x ACP server advertises its list, verified
+  2026-11-14, so opencode is now served by the ACP channel and
+  `models_command` is the fallback it no longer needs.) Credentials
   follow D2.3 unchanged — the child uses the owner's own
   agent login, and a resolved `api_key_env` key is injected only into the
   child's environment, never argv, logs or `Debug`.
@@ -299,7 +302,8 @@ Status: accepted for the M0–M6 prototype.
 - **D8.2 Everything is testable offline.** The `Fake` backend is scripted, the
   store has an in-memory double that shares one contract suite with SQLite, and
   no test touches the network. Live tests are `#[ignore]`d behind
-  `PROTO_LIVE_LLM` / `PROTO_LIVE_CLAUDE` and stay trivially cheap.
+  `PROTO_LIVE_LLM` / `PROTO_LIVE_ACP` and stay trivially cheap (`PROTO_LIVE_CLAUDE`
+  names no test; `ClaudeCli` is proven offline against a stand-in binary).
 - **D8.3 Cargo home lives in the checkout** (`.cargo-home`, seeded by reflink
   from `~/.cargo`) so builds work under a sandbox that cannot write to the user's
   home. `scripts/env.sh` exports it together with `LIBCLANG_PATH` (gpui's
@@ -850,3 +854,179 @@ what it is holding back.
     see what the model did not count — the same honesty as `UsageReport`'s doc
     comment, which carries `turns` so "nothing ran" stays distinguishable from
     "turns ran, nothing reported".
+
+- **D9.28 The one backend this machine can complete a turn with is the default,
+  and "probe is green" is not "a turn works".** Verified 2026-11-14 against the
+  real agents on this box, through the adapter the product uses: `opencode`
+  handshakes, opens a session and answers a real model turn (`PONG`, 4.2–4.4 s),
+  and a `swarmbot run --brain` really delegated (`handoff_task` → `@scout`
+  answered → `@lead` reported it, `delegated: @lead → @scout … (succeeded)`).
+  `claude-code-acp` and `codex-acp` both probe **ok** and both fail their first
+  `session/prompt`: the first with `Authentication required` (the `claude` CLI
+  itself says `Not logged in · Please run /login`), the second with the
+  ChatGPT account refusing every model the agent advertises — a fact about the
+  account, reproduced by `codex exec` outside SwarmBot. So `probe` passing is a
+  statement about spawn + `initialize` + `session/new` and nothing more, and a
+  provider menu built on it alone offers a row that cannot answer.
+  Consequences, all recorded rather than papered over: (1)
+  `config/swarmbot.toml` names **opencode only**, with `model` pinned — an ACP
+  backend with no `model` reaches opencode's own default and every turn dies
+  with `no provider's ask matches your max-per-mtok bid`, which is a config
+  fact, not an adapter bug; (2) the other two agents stay configured-but-commented
+  with the exact failure in the comment, and
+  `scripts/opencode-live.sh <backend-id>` is the one command that decides —
+  it runs the `#[ignore]`d live test that spends one small model call and
+  asserts the reply; (3) the live ACP test had only ever been run against
+  `codex-acp` before this (whose account has since stopped accepting the models
+  it advertises), so the README row that said "one full turn through codex-acp"
+  now names opencode and its date. The general rule this repeats from D8.2: a
+  green light must be earned by the operation the user actually cares about, or
+  it teaches everyone downstream to trust a lie.
+- **D9.29 The embedded CLI says out loud that its ACP bots cannot delegate.**
+  SwarmBot's roster tools (`handoff_task`, `message_bot`, `post_to_group`) reach
+  an agent that owns its own tool loop only through the MCP gateway, and the
+  gateway is composed by the **brain** (`Swarm::set_mcp_provider`, called from
+  `brain/src/state.rs`). `swarmbot` without `--brain` never sets a provider, so
+  the agent is handed `mcpServers: []` while its instructions describe tools it
+  does not have. Observed: a `run` asked to let `@scout` count files answered
+  "Sudah dikerjakan scout" while the run's own summary printed
+  `delegated: nothing` — the model claimed a handoff nothing performed. The
+  shape is D9.11's ("absorbing" a capability the mode does not have), so the fix
+  is the same kind: not a stub, and not a silent difference, but a typed,
+  one-time notice on stderr before the first message
+  (`notice::embedded_agent_without_team_tools` → `warn_agent_on_stderr`), plus
+  the documented route that does work (`--brain`, or `swarmbot-ui`, which spawns
+  a brain). It stays a notice and not a refusal because a single-bot question is
+  still answered correctly in that mode; what is untrue is only the delegation.
+  Tests: `an_embedded_acp_run_says_its_bots_have_no_team_tools` (due for an ACP
+  bot, quiet suppressed, two lines) and the pre-existing
+  `a_real_backend_never_warns_in_either_mode`, now also asserting the notice is
+  **not** due for a runner-driven `openai_compat` backend — that line is what
+  keeps the two notices distinct.
+- **D9.30 `delegated:` counts tasks, and now says so when there were none but the
+  team still talked.** The closing line of `swarmbot run` is built from the
+  tasks whose origin is the conversation, so a run in which the lead reached a
+  teammate with `message_bot` — a real wake, a real turn, a real answer —
+  printed a bare `delegated: nothing` and read like a team that did nothing.
+  Observed twice on 2026-11-14 with the opencode roster: `@lead` asked `@dev` for
+  a file list with `message_bot`, `@dev` woke and answered
+  (`crates/llm/src/acp/`: `mod.rs`, `proto.rs`, `client.rs` in their DM), and the
+  run still ended on `delegated: nothing`. The fix is in the presentation, not
+  the accounting: a `handoff_task` remains the only thing that makes a
+  `delegated:` row (that is what a task *is*), and when there is no task the line
+  now names the coordination tool the transcript actually shows —
+  `delegated: nothing — no handoff_task; the team reached each other with
+  message_bot ×5`. Counting order is first use, repeats are collapsed to `×n`,
+  and `handoff_task` entries are deliberately **not** counted here (a task would
+  already have produced a row, so counting the call too would say it twice).
+  Anything unreadable keeps the old plain line rather than guessing. Test:
+  `a_message_bot_run_names_the_tool_instead_of_a_bare_nothing`, mutation-checked
+  (renaming the coordination-tool list fails it).
+
+- **D9.31 An agent's own tool calls are transcribed, and the type says who ran
+  them.** Until this entry, an ACP agent's `session/update` `tool_call`s were
+  written to a `tracing::debug!` line and nothing else, so the transcript showed
+  the text and the reasoning and *not* the file the agent read or the command it
+  ran — while the agent's own sandbox was the only place any real work happened.
+  That was the largest visibility gap left in the one backend this machine can
+  actually run (D9.28). Three decisions made the fix honest rather than merely
+  complete:
+  * **A new event, not the existing one.** `LlmEvent::AgentToolCall` is separate
+    from `ToolCallStart`/`ToolCallArgsDelta` because the runner keys tool
+    execution off those: translating an agent's call into `ToolCallStart` would
+    make SwarmBot re-run, through its own `PolicyEngine`, `AuditLog` and
+    `NodeExecutor`, a command the agent had already executed. The event type is
+    the guard, and
+    `an_agents_tool_call_is_reported_but_never_offered_to_the_runner` fails if a
+    future edit reintroduces the translation (mutation-checked: emitting
+    `ToolCallStart` as well makes it fail).
+  * **`ToolCallEntry.origin` says which door the call came through.** `Swarm`
+    (default, and what every row written before this entry really was) ran under
+    our policy and on one of our nodes; `Agent` did not, and carries `node_id:
+    None`. Absent-in-JSON means `Swarm`, so old transcripts load unchanged
+    (`a_tool_call_row_without_an_origin_loads_as_ours`). Rendering follows: the
+    CLI prints `(682ms, agent's own tool)` and the UI `· agent's own tool`
+    instead of nothing, because "no node recorded" and "no node ran it" are
+    different claims.
+  * **Merging, not overwriting.** A real agent describes one call across several
+    notifications — captured from `opencode acp` on 2026-11-14: `tool_call`
+    (name, `rawInput: {}`), then `tool_call_update` (`in_progress`, real
+    `rawInput`, `locations`), then `tool_call_update` (`completed`, `content`
+    text, **no** `rawInput`). The first implementation took the last non-empty
+    arguments it saw and wrote `{"locations": [...]}` into the row, erasing
+    `{"path": "README.md", "limit": 5}`; that is what the live run showed before
+    it was fixed, and `an_agents_own_tool_calls_become_one_transcript_row` now
+    fails on exactly that mutation. An unrecognised `status` leaves the row
+    open rather than closing it as `Completed`: nobody reported an ending, and a
+    cancelled turn looks like this. Non-text content blocks are dropped rather
+    than stringified, so a transcript never contains `[object Object]`.
+  Proven end to end against the real agent: `swarmbot run --brain` on this box
+  now prints each `read`/`bash` the agent ran, with its real arguments
+  (`{"path": "…/Cargo.toml"}`, `{"command": "ls -la …"}`), a `failed` status for
+  the one that failed and a duration for each. Tests: two unit tests in
+  `crates/core/src/runners.rs` (merge + order), three in
+  `crates/core/tests/agent_tool_calls.rs` (a real turn through the real runner),
+  two in `crates/llm/src/acp/proto.rs` built from the captured JSON, the adapter
+  test above, a contracts serde test, and a CLI render test. **What is still
+  not there:** the agent's tool calls are *not* in `tool_calls` (the store's
+  idempotency table) and not in the audit log — deliberately, since neither our
+  dispatch nor our policy produced them — and a call's `locations` are only kept
+  as the `args` fallback; nothing yet links a row to the file's git state.
+  **Two field-level traps the live runs found, both now pinned by a test.** (1)
+  `tool_call` (the announcement) is the only notification that carries the
+  agent's tool **name** (`shell`); its updates carry a `title` that becomes the
+  *command* (`ls crates | wc -l`), so "first non-empty label wins" renamed a row
+  mid-turn — a row read `ls crates` where it should have read `shell`
+  (`a_tool_keeps_the_name_its_announcement_gave_it`, and
+  `an_announcement_is_distinguishable_from_an_update` pins that `announced` is
+  what carries the distinction). (2) An agent may send `rawInput: {}` on the
+  announcement, so the protocol layer maps empty-or-null to `None` rather than
+  `Some({})`, or the merge would treat "nothing yet" as a real argument set.
+
+- **D9.32 `agent_cwd` decides where an agent works, and `reject` is only a
+  boundary when the agent asks.** Two facts about the same seam, both measured
+  on this machine on 2026-11-14, and the second was found *by* the first: the
+  point of letting a bot work on a real checkout was to see whether our policy
+  reaches what the agent does there. It does not, and that is ACP's design
+  (D2.5) — but the run also showed the default was weaker than it read.
+  * **`settings.agent_cwd`** (absolute, or relative to the data dir's parent;
+    blank is refused at validation, absent means the bot's private workspace).
+    The runner hands it to the backend as `ChatRequest::cwd`, which the ACP
+    adapter uses as the session's `cwd` — the directory an agent resolves
+    relative paths against. The instruction text follows the same rule: a bot
+    whose session starts in a shared directory is told "session directory: `…`
+    (shared by every bot that names it — files here are not private)" instead of
+    being told it has a private workspace. Proven end to end: with
+    `agent_cwd = "<checkout>"` a bot read and edited a real file
+    (`⚙ edit … → ok`), and the file on disk held the new line. Mutation-checked:
+    dropping the field from the `chat_cwd` expression fails
+    `the_agent_starts_where_the_settings_say`.
+  * **`permission_mode = "reject"` did not stop a write**, and the reason is not
+    our answer but the agent's silence. `opencode acp` with its stock
+    configuration sends **no** `session/request_permission`; a "write NOTES.md"
+    turn created the file with `reject` in force, because nothing was ever asked.
+    A direct capture confirms it: zero permission asks, the file created. Add
+    `permission: {edit: "ask", bash: "ask"}` to opencode's own config (which
+    travels in `model_env`, beside the pinned model) and the ask arrives — then
+    `reject` answers `reject-once`, the write fails, and the transcript says so.
+    The shipped `config/swarmbot.toml` now carries those keys, so its `reject`
+    means what it says; the comment there records the measurement so nobody
+    removes the `permission` block as "redundant".
+  * **A refused permission is not a broken backend.** With `reject` working,
+    `opencode` ends the turn with `stopReason: "cancelled"` — and the adapter
+    mapped every `cancelled` to `LlmError::Cancelled`, so the CLI printed
+    "backend `opencode` is unavailable: cancelled" directly after the transcript
+    showed a denied tool call. Those are different facts: *our* stop token being
+    set is the owner stopping the turn (still an error, still the runner's
+    `stopped by the owner`), while the agent cancelling itself is a normal
+    ending — and, after D9.32, the expected one under `reject`. It now closes
+    the turn as `Stop` with a `warn!` naming the cause, and a test
+    (`an_agent_ending_its_own_turn_is_not_a_backend_failure`, scripted
+    `Behavior::SelfCancel`) fails if the old mapping comes back.
+  * **What is still not gated, stated once more:** an ACP agent's tools run in
+    its own sandbox. `agent_cwd` says *where*, `permission_mode` says *whether
+    it may act*, and the transcript records *what it did* (`origin = agent`,
+    D9.31) — but no `PathPolicy`, `AuditLog` line or approval card of ours
+    stands between the agent and that directory. A bot pointed at a checkout
+    with `allow` can change it; that is why `reject` is the default and why
+    `agent_cwd` is absent by default.

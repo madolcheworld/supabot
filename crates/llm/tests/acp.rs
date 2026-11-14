@@ -27,8 +27,9 @@ use tokio_util::sync::CancellationToken;
 
 use swarmbot_contracts::{BackendKind, BackendSpec};
 use swarmbot_llm::{
-    AcpAgent, AcpTransport, AgentHandle, AgentLaunch, BackendRegistry, ChatMessage, ChatRequest,
-    FinishReason, LlmBackend, LlmError, LlmEvent, McpServerSpec, PermissionMode, ProcessTransport,
+    AcpAgent, AcpTransport, AgentHandle, AgentLaunch, AgentToolCall, AgentToolState,
+    BackendRegistry, ChatMessage, ChatRequest, FinishReason, LlmBackend, LlmError, LlmEvent,
+    McpServerSpec, PermissionMode, ProcessTransport,
 };
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,11 @@ enum Behavior {
     AnswerAfterCancel,
     /// Never answers the prompt at all: the idle timeout must fire.
     NeverAnswer,
+    /// Streams some text, then ends the turn with `stopReason: "cancelled"`
+    /// **without** the client ever cancelling — what a real agent does after a
+    /// permission ask came back `reject-once` (measured against `opencode acp`
+    /// on 2026-11-14). The backend is healthy; the turn simply ended.
+    SelfCancel,
     /// Hangs up right after `session/new` — but only the first time (the
     /// transport's `died` flag makes the next spawn healthy, so the test also
     /// proves the connection respawns).
@@ -311,6 +317,41 @@ async fn play_agent(
             "session/prompt" => match behavior {
                 Behavior::AnswerAfterCancel => prompt_id = id,
                 Behavior::NeverAnswer => {}
+                Behavior::SelfCancel => {
+                    let Some(id) = id else { continue };
+                    let sid = value["params"]["sessionId"]
+                        .as_str()
+                        .unwrap_or("s-test")
+                        .to_string();
+                    let agent_writer = Arc::clone(&writer);
+                    tokio::spawn(async move {
+                        update(
+                            &agent_writer,
+                            &sid,
+                            json!({"sessionUpdate": "tool_call", "toolCallId": "t-deny",
+                                   "name": "edit", "title": "edit", "kind": "edit",
+                                   "status": "pending"}),
+                        )
+                        .await;
+                        update(
+                            &agent_writer,
+                            &sid,
+                            json!({"sessionUpdate": "tool_call_update", "toolCallId": "t-deny",
+                                   "status": "failed",
+                                   "content": [{"type": "content", "content":
+                                       {"type": "text", "text": "The user declined this tool call"}}]}),
+                        )
+                        .await;
+                        update(
+                            &agent_writer,
+                            &sid,
+                            json!({"sessionUpdate": "agent_message_chunk",
+                                   "content": {"type": "text", "text": "I could not edit the file."}}),
+                        )
+                        .await;
+                        respond(&agent_writer, Some(id), json!({"stopReason": "cancelled"})).await;
+                    });
+                }
                 // Streams keepalives, then answers: the concurrent turn whose
                 // setup times out must not take this one down with it, and the
                 // keepalives keep this turn's *idle* clock from firing first
@@ -632,6 +673,17 @@ async fn a_full_turn_streams_reasoning_and_text_and_finishes_once() {
         vec![
             LlmEvent::ReasoningDelta("thinking…".into()),
             LlmEvent::TextDelta("Hello ".into()),
+            // The agent's own tool call, reported for the transcript but never
+            // offered to the runner (D9.31 — see
+            // `an_agents_tool_call_is_reported_but_never_offered_to_the_runner`).
+            LlmEvent::AgentToolCall(Box::new(AgentToolCall {
+                id: "t1".into(),
+                tool: "Edit src/main.rs".into(),
+                args: None,
+                locations: Vec::new(),
+                state: AgentToolState::Completed,
+                result_text: None,
+            })),
             LlmEvent::TextDelta("world".into()),
             LlmEvent::Finished {
                 finish_reason: FinishReason::Stop,
@@ -680,6 +732,109 @@ async fn a_full_turn_streams_reasoning_and_text_and_finishes_once() {
         .join("\n");
     assert!(text.contains("You are @test"), "{text}");
     assert!(text.contains("user: hi there"), "{text}");
+}
+
+/// An agent's own tool call must arrive as `AgentToolCall`, and **never** as
+/// `ToolCallStart`/`ToolCallArgsDelta` (D9.31).
+///
+/// This is the safety property, not a naming preference: the runner executes
+/// tool calls it is told about with `ToolCallStart`, so a translated event would
+/// make SwarmBot re-run — through its own policy, approval and audit path — a
+/// command the agent already ran in its own sandbox. Emitting the same
+/// information under a different variant is what makes that impossible.
+/// An agent that ends its own turn (`stopReason: "cancelled"`) must not be
+/// reported as a broken backend (D9.32).
+///
+/// The case is not hypothetical: with `permission_mode = "reject"` — the default
+/// — a bot that tries to write gets its permission ask answered `reject-once`,
+/// and `opencode acp` then ends the turn with `cancelled`. Mapping that to
+/// `LlmError::Cancelled` made the CLI print "backend `opencode` is unavailable:
+/// cancelled" immediately after the transcript showed a denied tool call, i.e. a
+/// healthy backend blamed for our own policy. A *client* cancel is still
+/// `Cancelled`; only the agent's own stop is a normal ending.
+#[tokio::test]
+async fn an_agent_ending_its_own_turn_is_not_a_backend_failure() {
+    let (backend, _log) = agent(Behavior::SelfCancel);
+    let (tx, rx) = mpsc::channel(64);
+    let events = collect_events(rx);
+
+    let response = backend
+        .chat(request_with_history(), tx, CancellationToken::new())
+        .await
+        .expect("the turn ends, it does not fail");
+    assert_eq!(response.finish_reason, FinishReason::Stop);
+    assert_eq!(response.text, "I could not edit the file.");
+    assert_eq!(response.usage.llm_calls, 1);
+
+    // And the refused call reached the transcript as a call, not as an error:
+    // the reader can see what the agent wanted to do.
+    let events = events.await.expect("joined");
+    // Two notifications describe one call: the announcement names it, the
+    // update settles it and carries no name. That split is exactly why the
+    // runner merges instead of overwriting (D9.31), so this asserts the two
+    // facts separately rather than pretending one event has both.
+    let calls: Vec<&AgentToolCall> = events
+        .iter()
+        .filter_map(|event| match event {
+            LlmEvent::AgentToolCall(call) => Some(call.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 2, "announced, then settled: {calls:#?}");
+    assert_eq!(calls[0].tool, "edit", "the announcement names the tool");
+    assert_eq!(calls[0].state, AgentToolState::Pending);
+    assert_eq!(
+        calls[1].state,
+        AgentToolState::Failed,
+        "the transcript must be able to say the write was refused"
+    );
+    assert_eq!(calls[1].tool, "", "an update carries no name of its own");
+}
+
+#[tokio::test]
+async fn an_agents_tool_call_is_reported_but_never_offered_to_the_runner() {
+    let (backend, _log) = agent(Behavior::Normal);
+    let (tx, rx) = mpsc::channel(64);
+    let events = collect_events(rx);
+
+    backend
+        .chat(request_with_history(), tx, CancellationToken::new())
+        .await
+        .expect("the turn completes");
+    let events = events.await.expect("joined");
+
+    // Nothing in this stream may look like a call the runner has to make.
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            LlmEvent::ToolCallStart { .. } | LlmEvent::ToolCallArgsDelta { .. }
+        )),
+        "an agent's call must not be announced as the runner's own: {events:#?}"
+    );
+
+    let reported: Vec<&AgentToolCall> = events
+        .iter()
+        .filter_map(|event| match event {
+            LlmEvent::AgentToolCall(call) => Some(call.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reported.len(), 1, "one call in the scenario: {events:#?}");
+    let call = reported[0];
+    assert_eq!(call.id, "t1");
+    assert_eq!(
+        call.tool, "Edit src/main.rs",
+        "with no `name`, the agent's own title is the tool"
+    );
+    assert_eq!(call.state, AgentToolState::Completed);
+    assert_eq!(call.args, None, "the scenario sends no rawInput");
+
+    // The response's own tool-call list stays empty too: it is what the runner
+    // would execute next.
+    assert!(matches!(
+        events.last(),
+        Some(LlmEvent::Finished { tool_calls, .. }) if tool_calls.is_empty()
+    ));
 }
 
 #[tokio::test]

@@ -305,17 +305,66 @@ pub(crate) enum SessionUpdate {
     AgentMessage(String),
     /// Chain-of-thought — becomes a `ReasoningDelta`.
     AgentThought(String),
-    /// The agent's own tool activity. Informational in this milestone: it is
-    /// logged, not transcribed (the transcript renders text and reasoning).
-    ToolCall {
-        tool_call_id: String,
-        title: String,
-        kind: Option<String>,
-        status: Option<String>,
-    },
+    /// The agent's own tool activity, carried forward so it can be transcribed
+    /// (D9.31). The fields are the ones a real agent actually sends, captured
+    /// from `opencode acp` on 2026-11-14:
+    ///
+    /// ```text
+    /// {"sessionUpdate":"tool_call","toolCallId":"chatcmpl-tool-…","name":"read",
+    ///  "title":"read","kind":"read","status":"pending","locations":[],"rawInput":{}}
+    /// {"sessionUpdate":"tool_call_update","toolCallId":"chatcmpl-tool-…",
+    ///  "status":"in_progress","rawInput":{"path":"README.md","limit":5},
+    ///  "locations":[{"path":"…/README.md"}]}
+    /// {"sessionUpdate":"tool_call_update","toolCallId":"chatcmpl-tool-…",
+    ///  "status":"completed","content":[{"type":"content","content":
+    ///  {"type":"text","text":"Read file README.md, lines 1-5\n1: # SwarmBot…"}}]}
+    /// ```
+    ///
+    /// Note what arrives **split across notifications**: the first carries
+    /// `name` and no `rawInput`, a later one carries `rawInput` and no `name`,
+    /// and only the terminal one carries `content`. A consumer therefore has to
+    /// merge, not overwrite — which is exactly why this is one struct with
+    /// optional fields rather than three message types.
+    ToolCall(Box<ToolCallUpdate>),
     /// Anything else (`user_message_chunk` echoes, plans, mode changes,
     /// unknown future kinds): carries the tag for an honest debug log.
     Ignored(String),
+}
+
+/// The payload of one `tool_call` / `tool_call_update` notification.
+///
+/// A struct behind a `Box` rather than inline fields: this payload is several
+/// times larger than any other `SessionUpdate`, and `SessionUpdate` is what a
+/// turn allocates per notification — clippy's `large_enum_variant` named the
+/// cost, and the box is the honest fix.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ToolCallUpdate {
+    // `pub(crate)` fields so the adapter can destructure one; the struct itself
+    // never leaves this crate.
+    /// `true` for a `tool_call` (the announcement) and `false` for a
+    /// `tool_call_update`. It matters because only the announcement carries the
+    /// agent's **tool name** (`shell`); the updates carry a `title` that becomes
+    /// the *command* (`ls crates | wc -l`). Treating the two as one "label"
+    /// field renames the tool mid-turn — observed on the first live run of
+    /// D9.31, where a row read `ls crates` instead of `shell`.
+    pub(crate) announced: bool,
+    pub(crate) tool_call_id: String,
+    pub(crate) title: String,
+    /// The agent's own tool identifier (`read`, `bash`, …). Distinct from
+    /// `title` (a human label the agent may send as the same string) and
+    /// from `kind` (ACP's coarse category: `read`/`edit`/`execute`/…).
+    pub(crate) name: Option<String>,
+    pub(crate) kind: Option<String>,
+    pub(crate) status: Option<String>,
+    /// The call's arguments, as the agent finally revealed them.
+    pub(crate) raw_input: Option<Value>,
+    /// The text of the result content blocks, joined. Empty when the agent
+    /// sent none (a `pending`/`in_progress` update usually has no content).
+    pub(crate) content_text: Option<String>,
+    /// Files the agent says the call touched, from `locations[].path`.
+    /// Kept because it is often the only machine-readable argument an agent
+    /// gives for a write, and it makes a transcript row checkable.
+    pub(crate) locations: Vec<String>,
 }
 
 /// Classify the `update` object of a `session/update` notification.
@@ -333,9 +382,14 @@ pub(crate) fn classify_update(update: &Value) -> SessionUpdate {
             Some(text) => SessionUpdate::AgentThought(text),
             None => SessionUpdate::Ignored(format!("{tag} with non-text content")),
         },
-        "tool_call" | "tool_call_update" => SessionUpdate::ToolCall {
+        "tool_call" | "tool_call_update" => SessionUpdate::ToolCall(Box::new(ToolCallUpdate {
+            announced: tag == "tool_call",
             tool_call_id: string_field(update, "toolCallId"),
             title: string_field(update, "title"),
+            name: update
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             kind: update
                 .get("kind")
                 .and_then(Value::as_str)
@@ -344,7 +398,18 @@ pub(crate) fn classify_update(update: &Value) -> SessionUpdate {
                 .get("status")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-        },
+            // `{}` and `null` both mean "nothing yet"; a later notification
+            // carries the real arguments, so this must be `None` rather than an
+            // empty object a merge could mistake for a value.
+            raw_input: update
+                .get("rawInput")
+                .filter(|value| {
+                    !value.is_null() && !value.as_object().is_some_and(|map| map.is_empty())
+                })
+                .cloned(),
+            content_text: result_text_of(update.get("content")).filter(|s| !s.is_empty()),
+            locations: locations_of(update.get("locations")),
+        })),
         other => SessionUpdate::Ignored(other.to_string()),
     }
 }
@@ -362,6 +427,52 @@ fn text_of_content(content: Option<&Value>) -> Option<String> {
     None
 }
 
+/// The text of a `content` array, as `tool_call_update` sends results.
+///
+/// Two shapes exist in the wild for the same idea: ACP's own block
+/// (`{"type":"content","content":{"type":"text","text":"…"}}`, what opencode
+/// sends) and a bare text block (`{"type":"text","text":"…"}`). Both are read;
+/// anything else (an image, an embedded resource) contributes nothing rather
+/// than being stringified into the transcript, because a `[object Object]` line
+/// is worse than an absent one.
+fn result_text_of(content: Option<&Value>) -> Option<String> {
+    let blocks = content?.as_array()?;
+    let mut parts: Vec<&str> = Vec::new();
+    for block in blocks {
+        let text = match block.get("type").and_then(Value::as_str) {
+            Some("content") => block
+                .get("content")
+                .and_then(Value::as_object)
+                .and_then(|c| {
+                    c.get("type")
+                        .and_then(Value::as_str)
+                        .filter(|kind| *kind == "text")
+                        .and_then(|_| c.get("text"))
+                        .and_then(Value::as_str)
+                }),
+            Some("text") => block.get("text").and_then(Value::as_str),
+            _ => None,
+        };
+        if let Some(text) = text {
+            parts.push(text);
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+/// `locations[].path`, in the order the agent listed them.
+fn locations_of(locations: Option<&Value>) -> Vec<String> {
+    locations
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|item| item.get("path").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A string field, or empty: agents disagree about which display fields are
 /// always present, and a missing title must not fail a turn.
 fn string_field(value: &Value, field: &str) -> String {
@@ -376,6 +487,194 @@ fn string_field(value: &Value, field: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The three `session/update`s `opencode acp` really sent on 2026-11-14 for
+    /// one `read` call, byte for byte (paths shortened). This is the shape the
+    /// adapter has to fold, so the test uses the captured JSON rather than a
+    /// tidier one nobody sends.
+    #[test]
+    fn a_captured_opencode_tool_call_is_read_faithfully() {
+        // Announced: a name, no arguments yet, status `pending`.
+        let announced = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "chatcmpl-tool-aeff5351a6161134",
+            "name": "read",
+            "title": "read",
+            "kind": "read",
+            "status": "pending",
+            "locations": [],
+            "rawInput": {}
+        });
+        match classify_update(&announced) {
+            SessionUpdate::ToolCall(update) => {
+                let ToolCallUpdate {
+                    tool_call_id,
+                    name,
+                    status,
+                    raw_input,
+                    content_text,
+                    locations,
+                    ..
+                } = *update;
+                assert_eq!(tool_call_id, "chatcmpl-tool-aeff5351a6161134");
+                assert_eq!(name.as_deref(), Some("read"));
+                assert_eq!(status.as_deref(), Some("pending"));
+                assert_eq!(
+                    raw_input, None,
+                    "an empty rawInput is 'nothing yet', not an argument set"
+                );
+                assert_eq!(content_text, None);
+                assert!(locations.is_empty());
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+
+        // In progress: the arguments and the location arrive.
+        let running = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "chatcmpl-tool-aeff5351a6161134",
+            "status": "in_progress",
+            "kind": "read",
+            "title": "read",
+            "locations": [{"path": "/repo/README.md"}],
+            "rawInput": {"path": "README.md", "limit": 5}
+        });
+        match classify_update(&running) {
+            SessionUpdate::ToolCall(update) => {
+                let ToolCallUpdate {
+                    raw_input,
+                    locations,
+                    name,
+                    status,
+                    ..
+                } = *update;
+                assert_eq!(
+                    raw_input,
+                    Some(json!({"path": "README.md", "limit": 5})),
+                    "the arguments the agent sent are carried through unchanged"
+                );
+                assert_eq!(locations, vec!["/repo/README.md".to_string()]);
+                assert_eq!(
+                    name, None,
+                    "this update carries no name; merging is the caller's job"
+                );
+                assert_eq!(status.as_deref(), Some("in_progress"));
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+
+        // Completed: content blocks, no rawInput. The text is what a reader
+        // needs; the nesting is ACP's, not ours.
+        let done = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "chatcmpl-tool-aeff5351a6161134",
+            "status": "completed",
+            "locations": [{"path": "/repo/README.md"}],
+            "content": [{"type": "content", "content": {"type": "text",
+                "text": "Read file README.md, lines 1-5\n1: # SwarmBot"}}],
+            "rawOutput": {"metadata": {"truncated": true}}
+        });
+        match classify_update(&done) {
+            SessionUpdate::ToolCall(update) => {
+                let ToolCallUpdate {
+                    status,
+                    content_text,
+                    raw_input,
+                    ..
+                } = *update;
+                assert_eq!(status.as_deref(), Some("completed"));
+                assert_eq!(
+                    content_text.as_deref(),
+                    Some("Read file README.md, lines 1-5\n1: # SwarmBot")
+                );
+                assert_eq!(raw_input, None, "the terminal update repeats no arguments");
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+    }
+
+    /// A captured `shell` call (2026-11-14): the announcement says
+    /// `name:"shell"`, and the update's `title` is the command. The adapter must
+    /// be able to tell them apart, which is what `announced` is for.
+    #[test]
+    fn an_announcement_is_distinguishable_from_an_update() {
+        let announced = classify_update(&json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "chatcmpl-tool-a48d7ca131980cd9",
+            "name": "shell",
+            "title": "shell",
+            "kind": "execute",
+            "status": "pending",
+            "locations": [{"path": "/repo"}],
+            "rawInput": {"cwd": "/repo"}
+        }));
+        match announced {
+            SessionUpdate::ToolCall(update) => {
+                assert!(update.announced, "a `tool_call` announces the call");
+                assert_eq!(update.name.as_deref(), Some("shell"));
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+
+        let update_line = classify_update(&json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "chatcmpl-tool-a48d7ca131980cd9",
+            "status": "in_progress",
+            "kind": "execute",
+            "title": "ls crates | wc -l",
+            "locations": [{"path": "/repo"}],
+            "rawInput": {"command": "ls crates | wc -l", "cwd": "/repo"}
+        }));
+        match update_line {
+            SessionUpdate::ToolCall(update) => {
+                assert!(!update.announced, "a `tool_call_update` does not");
+                assert_eq!(update.name, None, "and carries no tool name");
+                assert_eq!(
+                    update.title, "ls crates | wc -l",
+                    "its title is the command, which must not become the tool"
+                );
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tool_result_that_is_not_text_is_not_stringified() {
+        // An agent may attach an image or an embedded resource. Inventing a
+        // line for it would put `[object Object]` in the transcript; leaving it
+        // out is the honest answer, and the row still exists.
+        let image_only = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t1",
+            "status": "completed",
+            "content": [{"type": "content", "content": {"type": "image",
+                "mimeType": "image/png", "data": "AAAA"}}]
+        });
+        match classify_update(&image_only) {
+            SessionUpdate::ToolCall(update) => {
+                assert_eq!(update.content_text, None);
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+
+        // Two text blocks are joined; a bare text block (the other spelling in
+        // the wild) is read too.
+        let mixed = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t2",
+            "status": "failed",
+            "content": [
+                {"type": "content", "content": {"type": "text", "text": "line one"}},
+                {"type": "text", "text": "line two"}
+            ]
+        });
+        match classify_update(&mixed) {
+            SessionUpdate::ToolCall(update) => {
+                assert_eq!(update.content_text.as_deref(), Some("line one\nline two"));
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+    }
 
     #[test]
     fn classify_separates_responses_requests_and_notifications() {
@@ -467,12 +766,14 @@ mod tests {
             "status": "in_progress"
         }));
         match tool {
-            SessionUpdate::ToolCall {
-                tool_call_id,
-                title,
-                kind,
-                status,
-            } => {
+            SessionUpdate::ToolCall(update) => {
+                let ToolCallUpdate {
+                    tool_call_id,
+                    title,
+                    kind,
+                    status,
+                    ..
+                } = *update;
                 assert_eq!(tool_call_id, "t1");
                 assert_eq!(title, "Edit src/main.rs");
                 assert_eq!(kind.as_deref(), Some("edit"));
@@ -483,10 +784,13 @@ mod tests {
 
         // Tolerant parsing: fields nobody filled in become empty, not errors.
         let sparse = classify_update(&json!({"sessionUpdate": "tool_call_update"}));
-        assert!(
-            matches!(sparse, SessionUpdate::ToolCall { tool_call_id, title, .. }
-            if tool_call_id.is_empty() && title.is_empty())
-        );
+        match sparse {
+            SessionUpdate::ToolCall(update) => {
+                assert!(update.tool_call_id.is_empty());
+                assert!(update.title.is_empty());
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
 
         // Future protocol additions land here instead of breaking the turn.
         let future = classify_update(&json!({"sessionUpdate": "brand_new_kind"}));

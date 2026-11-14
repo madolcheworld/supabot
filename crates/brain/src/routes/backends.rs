@@ -59,9 +59,13 @@ pub async fn probe(State(state): State<AppState>) -> ApiResult<Json<Vec<Value>>>
 
 /// `GET /api/backends/{id}/models` → the models the backend itself advertises.
 ///
-/// An empty list is an honest "this backend offers no menu" (opencode's ACP
-/// server advertises none): the client then shows a free-text field instead
-/// of a fabricated list. Like `probe`, this may spawn an agent or dial a
+/// An empty list is an honest "this backend offers no menu": the client then
+/// shows a free-text field instead of a fabricated list. It is a real answer,
+/// not a gap — an agent that advertises nothing over ACP and configures no
+/// `options.models_command` has no list to give, and inventing one would put
+/// models in the menu that the agent would then refuse (opencode used to
+/// advertise nothing; as of its 2.x ACP server it does, so its list is no
+/// longer the empty case). Like `probe`, this may spawn an agent or dial a
 /// gateway, so clients call it with the probe-style timeout.
 pub async fn models(
     State(state): State<AppState>,

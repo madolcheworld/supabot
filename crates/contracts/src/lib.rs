@@ -52,7 +52,7 @@ pub use conversation::{Conversation, ConversationKind, MAX_GROUP_MEMBERS, MIN_GR
 pub use delivery::{CausalChain, Delivery, DeliveryKind, DeliveryState, HOP_LIMIT, Urgency};
 pub use entry::{
     Attachment, Author, CardEntry, Entry, EntryKind, EventEntry, MessageEntry, NoticeEntry,
-    NoticeLevel, PostState, ReasoningEntry, ToolCallEntry, ToolCallStatus,
+    NoticeLevel, PostState, ReasoningEntry, ToolCallEntry, ToolCallOrigin, ToolCallStatus,
 };
 pub use error::{DomainError, not_found};
 pub use id::{

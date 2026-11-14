@@ -163,6 +163,10 @@ cargo run -p swarmbot-ui -- --offline       # spawn a fake-backend brain and ope
 cargo run -p swarmbot-ui -- --selftest      # fabricated events → reducer → render → report → exit
 cargo run -p swarmbot-ui -- --selftest --report /tmp/ui-selftest.log
 cargo run -p swarmbot-ui -- --brain http://127.0.0.1:8787 --token "$TOK"
+# real models on this box: point it at the roster that has them. It discovers
+# `config/swarmbot.toml` (opencode, model pinned) by itself and reads the owner
+# token from `<data-dir>/owner-token`, so no `--token` is needed.
+cargo run -p swarmbot-ui -- --data-dir ./data
 cargo build -p swarmbot-ui --features runtime_shaders
 ```
 
@@ -172,7 +176,7 @@ cargo build -p swarmbot-ui --features runtime_shaders
 | `--token <tok>` | a one-time login token, the highest-precedence credential source; the type is `SecretToken`, so `Debug` redacts it (§7) |
 | `--spawn-brain` | start `swarmbot-brain` as a child, wait for `GET /api/health` to answer `ok` (≤ 20 s), kill it on exit. `std::process` only |
 | `--offline` | implies `--spawn-brain` and passes the brain its own `--offline` (scripted `fake` backend) plus `--team` when the demo roster file is present. A missing roster file is reported, not invented |
-| `--data-dir <dir>` | data dir for a spawned brain; defaults to a fresh temp dir removed on exit |
+| `--data-dir <dir>` | data dir for a spawned brain; defaults to a fresh temp dir removed on exit. **Use `./data` to get the real roster**: the default `$XDG_DATA_HOME/swarmbot` on this machine has a database but no bots, and a brain given an existing database gets no `--team`, so the app would open an empty roster (see D9.28) |
 | `--brain-addr <addr>` | port for a spawned brain to listen on; defaults to the `--brain` port |
 | `--selftest` | drive fabricated `LiveEvent`s through the **real** reducer, render, write a report, exit 0. The machine-checkable proof that a window opens and paints on this compositor |
 | `--report <path>` | where the selftest report goes (stdout when omitted) |

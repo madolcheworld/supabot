@@ -54,6 +54,6 @@ pub use harness::ClaudeCli;
 pub use openai::{BodyStream, HttpError, HttpTransport, OpenAiCompat, ReqwestTransport};
 pub use registry::{BackendInfo, BackendRegistry, FAKE_BACKEND_ID};
 pub use types::{
-    BackendStatus, Capabilities, ChatMessage, ChatRequest, ChatResponse, FinishReason, LlmEvent,
-    McpServerSpec, ModelList, ModelOption, Role, ToolCall,
+    AgentToolCall, AgentToolState, BackendStatus, Capabilities, ChatMessage, ChatRequest,
+    ChatResponse, FinishReason, LlmEvent, McpServerSpec, ModelList, ModelOption, Role, ToolCall,
 };

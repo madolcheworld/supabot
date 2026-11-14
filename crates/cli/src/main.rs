@@ -34,7 +34,7 @@ use clap::{Parser, Subcommand};
 use crossterm::style::Color;
 use swarmbot_contracts::bot::{Bot, normalize_name};
 use swarmbot_contracts::conversation::Conversation;
-use swarmbot_contracts::entry::Author;
+use swarmbot_contracts::entry::{Author, Entry};
 use swarmbot_contracts::id::ConversationId;
 use swarmbot_contracts::node::{NodeInfo, NodeKind, RootMode};
 use swarmbot_core::swarm::Swarm;
@@ -785,6 +785,13 @@ async fn cmd_run(
         cli.quiet,
         notice::embedded_unscripted_fake(&embedded.swarm, &conversation),
     );
+    // And, for the other kind of barer answer: an ACP agent has no SwarmBot
+    // team tools in this process (no MCP gateway without the brain), so a
+    // delegation it claims to have made is one it could not have made.
+    notice::warn_agent_on_stderr(
+        cli.quiet,
+        notice::embedded_agent_without_team_tools(&embedded.swarm, &conversation),
+    );
     let result = run_once(
         &embedded,
         &RunOnce {
@@ -1042,11 +1049,66 @@ fn print_run_summary<W: Write, S: Session>(
     }
     let lines = session.delegation_lines(conversation)?;
     if lines.is_empty() {
-        printer.line("delegated: nothing")?;
+        // `delegation_lines` counts **handoff tasks**. A team that coordinated
+        // with `message_bot` made no task and is not a team that did nothing —
+        // observed 2026-11-14 on this box: `@lead` asked `@dev` for a file list
+        // with `message_bot`, `@dev` woke, read the tree and answered, and the
+        // closing line still said only "delegated: nothing". Naming the tool
+        // that was really used keeps the line true without inventing a task.
+        match team_tool_hint(&tail) {
+            Some(used) => printer.line(&format!(
+                "delegated: nothing — no handoff_task; the team reached each other with {used}"
+            ))?,
+            None => printer.line("delegated: nothing")?,
+        }
     } else {
         printer.line(&format!("delegated: {}", lines.join("; ")))?;
     }
     Ok(())
+}
+
+/// The bot-to-bot tools a transcript shows, in the order they were first used,
+/// when the run made no task: `message_bot ×2, post_to_group`.
+///
+/// Only the tools a bot uses **instead of** a handoff count here: a
+/// `handoff_task` entry would have produced a `delegated:` line already, so
+/// reaching this function means the team talked rather than delegated.
+fn team_tool_hint(entries: &[Entry]) -> Option<String> {
+    const COORDINATION: [&str; 2] = ["message_bot", "post_to_group"];
+    let mut order: Vec<&str> = Vec::new();
+    let mut counts: Vec<usize> = Vec::new();
+    for entry in entries {
+        let Some(call) = entry.as_tool_call() else {
+            continue;
+        };
+        if !COORDINATION.contains(&call.tool.as_str()) {
+            continue;
+        }
+        match order.iter().position(|name| *name == call.tool) {
+            Some(index) => counts[index] += 1,
+            None => {
+                order.push(call.tool.as_str());
+                counts.push(1);
+            }
+        }
+    }
+    if order.is_empty() {
+        return None;
+    }
+    Some(
+        order
+            .iter()
+            .zip(counts)
+            .map(|(name, count)| {
+                if count > 1 {
+                    format!("{name} ×{count}")
+                } else {
+                    (*name).to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 async fn cmd_chat(
@@ -1104,6 +1166,11 @@ async fn cmd_chat(
     notice::warn_on_stderr(
         cli.quiet,
         notice::embedded_unscripted_fake(&embedded.swarm, resolved.conversation_id()),
+    );
+    // Same second notice as `run`: an ACP agent here cannot delegate.
+    notice::warn_agent_on_stderr(
+        cli.quiet,
+        notice::embedded_agent_without_team_tools(&embedded.swarm, resolved.conversation_id()),
     );
     let result = repl::chat(&embedded, &resolved, &mut printer).await;
     // Shut down before propagating an error, same as `run`.
@@ -1852,6 +1919,78 @@ mod tests {
         assert!(out.contains("── reply ──"), "{out}");
         assert!(out.contains("delegated: nothing"), "{out}");
         embedded.shutdown().await;
+    }
+
+    #[test]
+    fn a_message_bot_run_names_the_tool_instead_of_a_bare_nothing() {
+        // `delegated:` counts handoff tasks. A team that coordinated with
+        // `message_bot` (observed 2026-11-14: lead asked dev, dev answered,
+        // the run still printed "delegated: nothing") made no task, and a
+        // bare "nothing" reads like the team did nothing at all.
+        let conversation = ConversationId::new();
+        let mut entries = Vec::new();
+        for (seq, tool) in [(1u64, "message_bot"), (2, "message_bot"), (3, "read_file")] {
+            entries.push(Entry::tool_call(
+                conversation.clone(),
+                seq,
+                None,
+                swarmbot_contracts::id::ToolCallId::new(),
+                tool,
+                serde_json::json!({}),
+                None,
+                None,
+            ));
+        }
+        assert_eq!(
+            team_tool_hint(&entries).as_deref(),
+            Some("message_bot ×2"),
+            "the coordination tool is named once, with its count; a task tool would \
+             have written a delegated line instead"
+        );
+
+        // Order is first-use, and only coordination tools are named: neither
+        // an unrelated tool nor `handoff_task` belongs in this line.
+        entries.push(Entry::tool_call(
+            conversation.clone(),
+            4,
+            None,
+            swarmbot_contracts::id::ToolCallId::new(),
+            "post_to_group",
+            serde_json::json!({}),
+            None,
+            None,
+        ));
+        entries.push(Entry::tool_call(
+            conversation,
+            5,
+            None,
+            swarmbot_contracts::id::ToolCallId::new(),
+            "handoff_task",
+            serde_json::json!({}),
+            None,
+            None,
+        ));
+        assert_eq!(
+            team_tool_hint(&entries).as_deref(),
+            Some("message_bot ×2, post_to_group")
+        );
+
+        // A transcript with no coordination call keeps the plain line: the
+        // hint must never appear where nothing used it.
+        let quiet: Vec<Entry> = entries
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .as_tool_call()
+                    .is_some_and(|call| call.tool == "read_file")
+            })
+            .collect();
+        assert_eq!(team_tool_hint(&quiet), None, "no coordination, no hint");
+        assert_eq!(
+            team_tool_hint(&[]),
+            None,
+            "an empty transcript says nothing"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

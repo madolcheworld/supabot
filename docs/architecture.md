@@ -151,7 +151,9 @@ execute_turn:
                       extra_body, extra_headers}
           spawn stream_pump → StreamRenderer: a bot message entry is created on the
           first delta and grown in place (flush every 120 ms / 240 chars), held back
-          while the text is still a prefix of NO_REPLY
+          while the text is still a prefix of NO_REPLY. `LlmEvent::AgentToolCall`
+          (an ACP agent's own call) is merged into one transcript row per call id,
+          marked `origin = agent`, no node — see D9.31
           backend.chat(request, events, turn_cancel.child_token())
           merge usage → finalize_reply (empty or NO_REPLY → no entry at all)
           turn spend reached `max_tokens_per_turn`? → warning notice, keep the
@@ -416,7 +418,7 @@ Each of these is a hole with a shape, not a hole in the dark:
 | ~~`NodeExecutor::exec` carrying the `Invocation`~~ | **Built (D9.12).** The port takes `&Invocation`, the dispatcher forwards it verbatim, and `attribute()` is gone. `unattributed()` survives only for `node.requestApproval` when a node names a bot this brain cannot place | — |
 | A remote dispatcher in the embedded CLI | Not a missing wire but a property of the mode: a node dials the brain's gateway, and the embedded CLI has no listener, so nothing can pair with it. `LocalExecutor` knows its own `node_id` and **refuses** a call addressed elsewhere instead of absorbing it (D9.11 — absorbing ran a remote bot's tools on the brain's machine, invisibly). Use `--brain` when remote nodes matter; see [`node-protocol.md`](node-protocol.md) §13 item 6 | — |
 | Data streams (pty, file transfer) | **Transfer built on both sides (D9.21).** Tokens, `StreamKind`, `StreamFrame`, `GET /node/stream/:id`, `StreamHub`, and the node's dialer (`node/src/stream.rs`) all exist; `fs.download` moved from the refused table to the implemented one, and `crates/node/tests/real_brain.rs` drives a real node child sending a binary file to a real brain over a loopback WebSocket. Missing: **a caller** (no route, tool or CLI command asks for a download yet) and pty (`pty.open` is still refused). See [`node-protocol.md`](node-protocol.md) §8 | M7 (in progress) |
-| ~~`codex app-server` backend~~ | **Deleted (D9.19), not built.** Codex is reached as `codex-acp` over the ACP adapter — the protocol this crate already speaks, and what the shipped config uses. The variant existed only as a typed `Unavailable` that still appeared as a selectable provider, and a config naming it now fails to load instead of refusing every turn | — |
+| ~~`codex app-server` backend~~ | **Deleted (D9.19), not built.** Codex is reached as `codex-acp` over the ACP adapter — the protocol this crate already speaks (the shipped config uses the same adapter with **opencode**, the only ACP agent on this machine that completes a turn — D9.28). The variant existed only as a typed `Unavailable` that still appeared as a selectable provider, and a config naming it now fails to load instead of refusing every turn | — |
 | A skill *library* UI, and per-skill enable/disable | `Bot.skills` is rendered from `<data>/skills/<name>/SKILL.md` (or `<name>.md`), capped per skill and per turn; there is no editor and no discovery, so the owner writes the files | M7 |
 | ~~TLS~~ | **Built (D9.25).** `brain::tls::TlsListener` terminates TLS for the public listener over the same router and shutdown path, and the node's `--brain-ca` trusts a private CA. Proven with the real binaries (`brain/tests/tls.rs`, `node/tests/tls_brain.rs`). Not claimed: certificate hot reload, and a public-CA chain | — |
 | Any non-unix host | `crates/node` calls `libc::gethostname` and `killpg` unconditionally, so the daemon is unix-only in practice | — |

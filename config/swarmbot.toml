@@ -1,4 +1,26 @@
-# SwarmBot Brain Configuration with Installed ACP Providers
+# SwarmBot brain configuration.
+#
+# The one backend this machine can actually complete a turn with is
+# `opencode` (native ACP agent). Verified 2026-11-14 on this box: handshake,
+# `session/new`, a real model turn, and a full `swarmbot run` whose reply came
+# back through the brain. Every bot in the roster uses it; `default_backend`
+# points at it so a bot that names no backend inherits it too.
+#
+# The other two ACP agents (Claude via `claude-code-acp`, Codex via
+# `codex-acp`) are left configured but commented out. On this machine both
+# *handshake* fine — `GET /api/backends/probe` reports `ok: true` for them —
+# yet a real turn fails at their own account/credentials layer:
+#   * `claude-code-acp`: `session/prompt` → "Authentication required"
+#     (the `claude` CLI itself answers "Not logged in · Please run /login");
+#   * `codex-acp`: the ChatGPT account rejects every model the agent
+#     advertises ("The 'gpt-5.5' model is not supported when using Codex with
+#     a ChatGPT account"), which is a fact about the account, not the adapter.
+# A probe that passes while a turn cannot is exactly the "available but broken"
+# row a provider menu should not offer, so they are off until one of them is
+# logged in. To bring one back: uncomment its block below, log the agent in,
+# and prove it with `scripts/opencode-live.sh <backend-id>` (the script checks
+# the same handshake *and* one real turn).
+
 data_dir = "data"
 public_addr = "127.0.0.1:8787"
 
@@ -11,38 +33,69 @@ default_backend = "opencode"
 
 # ACP backends run their own sandboxed tools and answer ACP permission asks
 # using `permission_mode`:
-#   - "reject" (default): refuse every ACP permission ask so the agent reads,
-#     answers, and uses SwarmBot's MCP team/task tools without mutating files.
+#   - "reject" (default): refuse every ACP permission ask, so the agent reads
+#     and answers but does not mutate files.
 #   - "allow": explicit opt-in that picks the agent's allow-once option per
 #     action (never `*_always`, so no blanket grant outlives a turn).
+#
+# **`reject` only has teeth if the agent asks.** Measured on this machine
+# 2026-11-14 against `opencode acp`: with its stock configuration it sends **no**
+# `session/request_permission` at all — a "write NOTES.md" turn created the file
+# with `permission_mode = "reject"` in force, because our answer was never
+# needed. The moment opencode's own config says `permission: {edit: "ask"}`, the
+# ask arrives, `reject` answers `reject-once`, and the write fails (the file was
+# not created). So the model_env below carries both the model **and** opencode's
+# permission settings: that is what turns our `reject` from a comment into a
+# boundary. Without it the only thing bounding an agent's writes is the
+# directory it starts in (`settings.agent_cwd`).
 
-# 1. OpenCode (Native ACP Agent installed on this machine)
+# 1. OpenCode — the working backend on this machine (native ACP agent).
 [[backends]]
 id = "opencode"
 kind = "acp"
+# Pinned so a bot with no `model` of its own still gets a model that answers.
+# Leaving this out is what makes opencode fail with
+# `no provider's ask matches your max-per-mtok bid`: with no model the agent
+# picks its own default, and its own default is not routable here.
+# Verified working on this box (one cheap turn each):
+#   inferhub/ali/qwen3.8-2.4t-a95b     ← default below
+#   omniroute/yeta/deepseek-v4.1-flash (faster, but needs the local OmniRoute
+#                                       daemon on 127.0.0.1:20128 to be up)
+# `opencode models` lists the full menu, including free `opencode/*` models.
+model = "inferhub/ali/qwen3.8-2.4t-a95b"
 [backends.options]
 command = "opencode"
 args = ["acp"]
 models_command = ["opencode", "models"]
 permission_mode = "reject"
+# Pin the picked model inside the child: opencode ignores ACP model selection
+# for some providers, so the per-process env is the reliable channel. One
+# agent process per distinct model.
 [backends.options.model_env]
-OPENCODE_CONFIG_CONTENT = '{"model":"{model}"}'
+# Both the model and opencode's own permission policy: `ask` is what makes our
+# `permission_mode` decisive (see above). `bash` is included so a shell command is
+# asked about too, not just an edit.
+OPENCODE_CONFIG_CONTENT = '{"model":"{model}","permission":{"edit":"ask","bash":"ask"}}'
 
-# 2. Claude Code (via ACP adapter)
-[[backends]]
-id = "claude"
-kind = "acp"
-[backends.options]
-command = "claude-code-acp"
-permission_mode = "reject"
+# 2. [CC] (via ACP adapter) — handshake OK, turns refused: not logged in on
+#    this machine. See the header. Exact enable snippet + proof command there.
+#
+# [[backends]]
+# id = "claude"
+# kind = "acp"
+# [backends.options]
+# command = "claude-code-acp"
+# permission_mode = "reject"
 
-# 3. Codex (via ACP adapter)
-[[backends]]
-id = "codex"
-kind = "acp"
-[backends.options]
-command = "codex-acp"
-permission_mode = "reject"
+# 3. Codex (via ACP adapter) — handshake OK, turns rejected by the ChatGPT
+#    account's model entitlement. See the header.
+#
+# [[backends]]
+# id = "codex"
+# kind = "acp"
+# [backends.options]
+# command = "codex-acp"
+# permission_mode = "reject"
 
 
 [settings]

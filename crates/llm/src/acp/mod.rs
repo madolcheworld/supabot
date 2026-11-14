@@ -29,8 +29,14 @@
 //!    ([`prompt_blocks`]);
 //! 3. streams `session/update` notifications into [`LlmEvent`]s:
 //!    `agent_message_chunk` → `TextDelta`, `agent_thought_chunk` →
-//!    `ReasoningDelta`, the agent's own `tool_call`s are logged (they are not
-//!    transcribed in this milestone — stated in the README, not hidden);
+//!    `ReasoningDelta`, and the agent's **own** `tool_call`s →
+//!    [`LlmEvent::AgentToolCall`], which the runner transcribes as a tool-call
+//!    row marked `origin = Agent` (D9.31). Deliberately **not**
+//!    `ToolCallStart`: those events mean "the runner is about to run this
+//!    through `ToolRegistry`", and an agent's call was decided by the agent, in
+//!    the agent's sandbox, with no `PolicyEngine`, `AuditLog` or
+//!    `NodeExecutor` of ours anywhere in the path. The event type is what keeps
+//!    a consumer from executing what it was only told about;
 //! 4. maps `stopReason` onto [`FinishReason`] and returns the accumulated text
 //!    as the authoritative response.
 //!
@@ -804,22 +810,60 @@ impl AcpAgent {
                     return Err(LlmError::Cancelled);
                 }
             }
-            proto::SessionUpdate::ToolCall {
-                tool_call_id,
-                title,
-                kind,
-                status,
-            } => {
-                // The agent's own tool activity: logged, not transcribed
-                // (this milestone's honest limit — see the module docs).
+            proto::SessionUpdate::ToolCall(update) => {
+                let proto::ToolCallUpdate {
+                    announced,
+                    tool_call_id,
+                    title,
+                    name,
+                    kind,
+                    status,
+                    raw_input,
+                    content_text,
+                    locations,
+                } = *update;
+                // The agent's own tool activity. Emitted as `AgentToolCall`
+                // (never as `ToolCallStart`, which would mean "this runner is
+                // about to run it") so the transcript can show it without
+                // implying any policy, approval or audit of ours was involved.
+                // The state is announced here and merged by the consumer: one
+                // call arrives as several of these.
+                let state = crate::types::AgentToolState::from_acp(status.as_deref());
+                // The tool's identity, not its current display text: the
+                // announcement's `name` (`shell`) wins, and an update's
+                // `title` (which becomes the *command*) is only a fallback for
+                // agents that never send a `name`. Renaming a row mid-turn
+                // from `shell` to `ls crates | wc -l` is what this avoids.
+                let tool = tool_identity(announced, name.as_deref(), &title, kind.as_deref());
+                // Passed through as the agent sent them: no fallback here,
+                // because only the consumer that merges several notifications
+                // knows whether an earlier one already carried the real
+                // arguments (see `AgentToolCall::args`).
+                let args = raw_input;
                 tracing::debug!(
                     backend = %self.spec.id,
                     tool_call_id,
-                    title,
-                    kind = kind.unwrap_or_default(),
-                    status = status.unwrap_or_default(),
+                    tool = %tool,
+                    state = ?state,
                     "ACP agent tool call"
                 );
+                if emit(
+                    events,
+                    LlmEvent::AgentToolCall(Box::new(crate::types::AgentToolCall {
+                        id: tool_call_id,
+                        tool,
+                        args,
+                        locations,
+                        state,
+                        result_text: content_text,
+                    })),
+                )
+                .await
+                .is_err()
+                {
+                    conn.notify("session/cancel", json!({"sessionId": session_id}));
+                    return Err(LlmError::Cancelled);
+                }
             }
             proto::SessionUpdate::Ignored(reason) => {
                 tracing::debug!(backend = %self.spec.id, reason, "ACP session update ignored");
@@ -1274,8 +1318,25 @@ impl LlmBackend for AcpAgent {
         };
         conn.unsubscribe(&session_id);
         let stop = stop?;
+        // `cancelled` has two meanings and they are not the same fact. Our own
+        // stop token being set is the owner's stop, and the runner turns that
+        // into "stopped by the owner" — an error, but the right one. The agent
+        // cancelling **itself** is not an infrastructure failure: the common
+        // cause is a denied permission, and after `permission_mode = "reject"`
+        // it is the *expected* one. Reporting it as `Cancelled` made the CLI
+        // print "backend `opencode` is unavailable: cancelled" right after the
+        // transcript showed a denied tool call — a healthy backend blamed for
+        // our own policy. So this closes the turn normally and says so in a
+        // warning; the refused call is already in the transcript as `failed`.
         if stop == StopReason::Cancelled {
-            return Err(LlmError::Cancelled);
+            if cancel.is_cancelled() {
+                return Err(LlmError::Cancelled);
+            }
+            tracing::warn!(
+                backend = %self.spec.id,
+                "the agent cancelled its own turn (a denied permission does this); reporting the \
+                 turn as ended rather than as a backend failure"
+            );
         }
 
         let finish_reason = match stop {
@@ -1285,7 +1346,9 @@ impl LlmBackend for AcpAgent {
             // limit", so it maps to the honest unmapped bucket.
             StopReason::MaxTurnRequests => FinishReason::Error,
             StopReason::Refusal => FinishReason::ContentFilter,
-            StopReason::Cancelled => return Err(LlmError::Cancelled),
+            // Handled above: our cancel returned early, the agent's own cancel
+            // is an end of turn.
+            StopReason::Cancelled => FinishReason::Stop,
             StopReason::Unknown => {
                 tracing::warn!(backend = %self.spec.id, "the agent reported an unknown stopReason");
                 FinishReason::Error
@@ -1791,6 +1854,34 @@ fn render_transcript(messages: &[ChatMessage]) -> String {
     if any { lines.join("\n") } else { String::new() }
 }
 
+/// The name a transcript row should carry for one `tool_call` notification.
+///
+/// Agents are not consistent about what they put where, and the difference is
+/// not cosmetic. Captured from `opencode acp` on 2026-11-14:
+///
+/// ```text
+/// tool_call        name:"shell" title:"shell"        kind:"execute"
+/// tool_call_update name:—       title:"ls crates | wc -l"
+/// ```
+///
+/// So the **announcement** names the tool and its later updates rename the
+/// display text to the *command*. Taking "the first non-empty label" every time
+/// would turn a row's `shell` into `ls crates | wc -l` mid-turn — exactly what
+/// a live run of D9.31 showed. The rule: `name` always wins when present; a
+/// `title`/`kind` is only consulted on the announcing notification, i.e. only
+/// for an agent that sends no `name` at all; and an update with none of them
+/// contributes nothing, so the runner keeps the name it already has.
+fn tool_identity(announced: bool, name: Option<&str>, title: &str, kind: Option<&str>) -> String {
+    let pick = |value: &str| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    name.and_then(pick)
+        .or_else(|| announced.then(|| pick(title)).flatten())
+        .or_else(|| announced.then(|| kind.and_then(pick)).flatten())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2059,6 +2150,35 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Your turn")
         }));
+    }
+
+    /// The names `opencode acp` really sends, captured 2026-11-14: the
+    /// announcement names the tool, its updates carry the *command* as the
+    /// title. A row that followed the title would be renamed mid-turn.
+    #[test]
+    fn a_tool_keeps_the_name_its_announcement_gave_it() {
+        // The announcement: name and title agree.
+        assert_eq!(
+            tool_identity(true, Some("shell"), "shell", Some("execute")),
+            "shell"
+        );
+        // The updates: no name, and a title that is now the command. The
+        // adapter sends an empty tool, which the runner reads as "nothing new".
+        assert_eq!(
+            tool_identity(false, None, "ls crates | wc -l", None),
+            "",
+            "an update must not rename the call to its command line"
+        );
+        // An agent that never sends `name` still gets its title, from the
+        // announcement only.
+        assert_eq!(
+            tool_identity(true, None, "Edit src/main.rs", Some("edit")),
+            "Edit src/main.rs"
+        );
+        // And `kind` is the last resort, for an announcement with neither.
+        assert_eq!(tool_identity(true, None, "", Some("execute")), "execute");
+        // Nothing at all stays empty rather than inventing a label.
+        assert_eq!(tool_identity(true, None, "  ", None), "");
     }
 
     #[test]
