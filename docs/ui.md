@@ -4,10 +4,10 @@
 cooperate: the roster, the transcripts, the delegation graph, and the cards that
 need a human.
 
-**Current state: the app is built.** 16,613 lines across 29 source files, **85
+**Current state: the app is built.** 18,162 lines across 32 source files, **123
 tests**, one window with a sidebar, a transcript, a composer, a delegation-graph
-panel, cards, a nodes screen, a routines screen, a usage screen, a settings screen
-and a command palette. It is a pure client of the brain's REST + `/ws/live` API, so
+panel, cards, a nodes screen, a routines screen, a usage screen, a settings screen,
+an **approval-rules** screen and a command palette. It is a pure client of the brain's REST + `/ws/live` API, so
 it needs a brain to talk to — and `--offline --spawn-brain` starts one with the
 scripted `fake` backend, which is a genuine zero-credential demo (§5, §7).
 
@@ -68,15 +68,18 @@ Rules that follow from the split:
 | `pkg-config xkbcommon-x11` missing, `libxkbcommon-x11.so.0` present | `scripts/env.sh` creates `.cargo-home/link-shim/libxkbcommon-x11.so` → the runtime `.so.0` and exports `LIBRARY_PATH`. `LIBRARY_PATH` (unlike `RUSTFLAGS`) does not invalidate the cargo cache, so only the final link is redone. The clean fix is `sudo dnf install libxkbcommon-x11-devel` |
 | `gpui`'s build script runs `bindgen`; `libclang.so.22.1` exists without an unversioned `libclang.so` | `scripts/env.sh` exports `LIBCLANG_PATH=/usr/lib64` |
 | `gpui → gpui_http_client → zed-async-tar → xattr 0.2`, and `xattr 0.2.3` no longer compiles against modern `libc` (`ENOATTR` is `ENODATA` on Linux); it is an optional dep enabled by a default feature a downstream workspace cannot turn off | `vendor/xattr` is the crate with a one-line patch, wired in by `[patch.crates-io]` in the root `Cargo.toml`. See [`../vendor/xattr/VENDORED.md`](../vendor/xattr/VENDORED.md) |
-| **The GPU works (re-checked 2026-11-14).** `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-modeset`, `/dev/nvidia-uvm`, `/dev/dri/card1` and `/dev/dri/renderD128` all exist; `nvidia-smi` reports a GTX 1660 SUPER on driver 615.78.08; `nvidia_icd.json` is the ICD in use | `./target/debug/swarmbot-ui --selftest` **opens 11 windows and exits 0**, with `vulkan/renderer: icd=/usr/share/vulkan/icd.d/nvidia_icd.json`. The *render total* it prints is not stable — 22, 54, 55, 57 and 58 across five runs of one binary — so assert on the 11 windows and on `ok=true`, never on a render count. The 2026-11-13 entry here said the opposite (`NoSupportedDeviceFound` panic, no usable ICD) and that was true then; it is not true now. `scripts/env.sh` still prefers llvmpipe *when that ICD exists* and still warns on stderr when none does — a headless-box fallback, not a statement about this machine |
+| **A session with no GPU at all still renders (2026-11-15).** This session had no `/dev/nvidia0`, no `/dev/dri` and an `nvidia-smi` that could not reach the driver; `scripts/env.sh` exported the staged lavapipe ICD, and `./target/debug/swarmbot-ui --selftest` opened **12 windows**, `ok=true`, exit 0, with `vulkan/renderer: icd=…/.tmp-ui-gpu/lvp_local.json` | The D9.34 fallback, exercised for real rather than in a namespace. It proves the CPU path works end to end and says nothing about the hardware |
+| **The GPU works (re-checked 2026-11-14).** `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-modeset`, `/dev/nvidia-uvm`, `/dev/dri/card1` and `/dev/dri/renderD128` all exist; `nvidia-smi` reports a GTX 1660 SUPER on driver 615.78.08; `nvidia_icd.json` is the ICD in use | `./target/debug/swarmbot-ui --selftest` **opens 12 windows and exits 0**, with `vulkan/renderer: icd=/usr/share/vulkan/icd.d/nvidia_icd.json` (11 before the Rules screen existed; the count moves with the screens). The *render total* it prints is not stable — 22, 54, 55, 57 and 58 across five runs of one binary — so assert on the 11 windows and on `ok=true`, never on a render count. The 2026-11-13 entry here said the opposite (`NoSupportedDeviceFound` panic, no usable ICD) and that was true then; it is not true now. `scripts/env.sh` still prefers llvmpipe *when that ICD exists* and still warns on stderr when none does — a headless-box fallback, not a statement about this machine |
+| **A session can also see no GPU at all** — a sandbox whose `/dev` has only `null`/`zero`/`tty`, CI, a headless box. There is no render node and no system llvmpipe, so GPUI's own init panics (`Unable to init GPU context: NoSupportedDeviceFound`). Note the weaker check that looks right and is not: `test -e /dev/dri` answers **yes** for an empty bind-mounted directory, and a zero-length `/dev/nvidia0` is a placeholder — both measured on 2026-11-14 | `scripts/software-vulkan.sh` stages Mesa lavapipe **inside the checkout** (`.tmp-ui-gpu/`, gitignored) with no root: it downloads the distro package with `pacman -Sp` + `curl`, extracts it with `bsdtar`, and writes `.tmp-ui-gpu/lvp_local.json` naming the library by **absolute** path (so no `LD_LIBRARY_PATH`). `scripts/env.sh` then exports `VK_ICD_FILENAMES` to it, and `--selftest` **opens the same windows and exits 0** through the CPU renderer — proven twice: in a mount namespace with a blanked `/dev` on 2026-11-14 (`opened 11 window(s)`), and again on 2026-11-15 in a session whose host genuinely had no GPU (`opened 12 window(s)` after the Rules screen was added). Both report `vulkan/renderer: icd=…/.tmp-ui-gpu/lvp_local.json` and `ok=true` |
 | `pkg-config vulkan` missing, `libvulkan.so.1` present | enough: blade loads the Vulkan library at runtime |
 | the crate has a `runtime_shaders` feature (off by default) | enables it for shader iteration without a build-time shader toolchain; leave it off for normal builds |
 | `swarmbot-ui` is **not** in the workspace `default-members` | plain `cargo build`/`cargo test` skip it (its dependency chain is minutes long); `--workspace`, `scripts/check.sh` include it, `scripts/check.sh --fast` excludes it again |
 
 ## 3. Screens
 
-One window: a left sidebar (`SIDEBAR_W = 248 px`), a main pane, and a toggleable
-delegation-graph panel on the right (`GRAPH_W = 320 px`). Dark first; no xAI/Grok
+One window: a left sidebar (`SIDEBAR_W = 280 px`), a main pane, and a toggleable
+delegation-graph panel on the right (`GRAPH_W = 320 px`). Light theme (`theme.rs`);
+no xAI/Grok
 fonts, logos, icons or avatar art (D0.3) — an avatar is a tile in the bot's colour
 with its initial, and the colour comes from `Bot::effective_color` (FNV-1a over the
 id → hue → `#rrggbb`) unless the roster names one.
@@ -87,11 +90,12 @@ id → hue → `#rrggbb`) unless the roster names one.
 | Sidebar | `view/sidebar.rs` | bots (avatar tile, label, status line, activity), conversations (DM and group, preview, unread), nodes (online/offline, capabilities), settings | `BotUpsert`, `BotStatus`, `ConversationUpsert`, `NodeUpsert`, `NodePresence` |
 | Conversation | `view/conversation.rs` | transcript: **owner bubbles right, bot bubbles left**, event lines (`Messaged @scout`, `Handed off "…" to @dev`, `Stopped: too many hand-offs`, `@x had nothing to add`), collapsible tool-call cards (tool, arguments, result, duration, the node it ran on, a diff for `edit_file`), streaming text, `NEW` divider, timestamps, Stop while a turn runs | `EntryUpsert`, `TurnUpsert`, `RequestUpsert` |
 | Composer | `view/composer.rs` | multi-line input, `@` picker over the group's members, send / stop, a `queued` indicator when the bot is busy elsewhere | `EntryUpsert` on the owner's own message |
-| Provider menu | `view/provider_menu.rs` | two columns behind the header's `provider: …` button (DMs only): configured backends left, the selected backend's *self-advertised* models right with a search box; a backend with no advertised list says so and the search box becomes free text. Apply/Clear PATCH `/api/bots/{id}` | `BotUpsert` for the bot |
+| Provider menu | `view/provider_menu.rs` | two columns behind the header's `provider: …` button (DMs only): configured backends left with a per-provider connection dot, the selected backend's *self-advertised* models right with a search box; a backend with no advertised list says so and the search box becomes free text; below both, a **CONNECTION** strip: the state, the brain's `detail`, **Connect**, and one **Log in** button per login the agent advertises. A successful Connect also refetches the models, so the model column fills without a second click. Apply/Clear PATCH `/api/bots/{id}` | `BotUpsert` for the bot, `Connected` |
 | Delegation graph | `view/graph.rs` | the tree of work: `handoff_task` / `start_task` nodes with status, hop depth, owner, requester, and the line back to the origin conversation; click to jump | `TaskUpsert` (`parent_task_id`, `requester`, `origin` are the edges) |
 | Cards | `view/cards.rs` | approval (Allow once / Always allow / Deny, reason, expiry countdown), question (`ask_user` fields), handoff (Done / Skip) | `RequestUpsert` → `POST /api/requests/:id/respond` |
 | Nodes | `view/nodes.rs` | an 8-character pairing code (large, copyable, 10-minute TTL), the node list (label, platform, roots, effective capabilities = declared ∩ approved, ceiling, online), Revoke, the `swarmbot-node pair …` line to copy | `NodeUpsert`, `NodePresence` |
-| Settings | `view/settings.rs` | per-bot backend (base url, model, `extra_body` / `extra_headers` for a gateway's own parameters such as an inferhub bid, a masked key field), a **Probe** button showing `BackendStatus` verbatim, safety ceilings, the `bot_messaging` kill switch, `max_hops`, `max_tool_rounds`, the two token caps (`token cap / turn`, `token cap / day`, showing `off` for no cap), the roster | `Snapshot`, settings RPCs |
+| Settings | `view/settings.rs` | per-backend cards: the redacted config, a **connection state** (`not checked` / `connected` / `needs a login` / `not connected`) with a **Connect** button per backend, the logins that backend advertises as buttons plus the exact login command with **Copy**, and the brain's own `detail` verbatim; a global **Probe**; safety ceilings, the `bot_messaging` kill switch, `max_hops`, `max_tool_rounds`, the two token caps (`token cap / turn`, `token cap / day`, showing `off` for no cap), the roster | `Snapshot`, settings RPCs, `Connected` |
+| Approval rules | `view/rules.rs` | every saved `ApprovalRule`: scope (bot/surface/tool), the matcher, the decision, who saved it and when, with Delete. A rule with **no matcher** is called out in red, because it decides every request in its scope — the hazard `routes/rules.rs` warns about and that used to be visible only in SQLite | `Snapshot` (the rules travel with it), `FetchRules` |
 | Usage | `view/usage.rs` | `GET /api/usage` for a 24h / 7d / 30d window: totals (tokens, model calls, tool calls), a per-bot table with the biggest spender first, and the turn count. Read-only; three states kept apart (`not fetched`, `failed` with a retry, `a report`) | — (REST only; spend is not a live event) |
 | Palette | `view/palette.rs` | `ctrl-k`: jump to a bot, conversation or screen | — |
 
@@ -107,6 +111,30 @@ two are enforced in `reducer.rs`, not in a view:
   `status`, so an expiry has to look like an expiry.
 * **`post: queued` is the owner's only honest signal** that a message is waiting
   because the bot is busy elsewhere; it is rendered on the bubble, not hidden.
+* **`connected` means the handshake passed, and the card says so.** A backend row
+  whose handshake is green *and* that advertises a login carries one dim line
+  naming that login and the condition it matters under ("if a turn is refused
+  with an authentication error, run it and press Re-check") — not a prediction:
+  `opencode` advertises a login and answers turns, `claude-code-acp` advertises
+  one and refuses its first prompt (D9.28, D9.33). The login buttons carry the
+  agent's own method ids — an id nobody advertised is never sent — and a login
+  the agent cannot perform is displayed in the agent's words. A backend that
+  already answered offers **Re-check**, not "Connect": the action is the same
+  handshake and the label says so.
+* **a list that was never fetched, a list that failed, and an empty list are
+  three different screens.** `state.rs` holds `Fetched<T> { Unknown, Failed(reason),
+  Ready(T) }` for bots, conversations, nodes, routines and approval rules, because
+  a cold start or a dead brain used to render the same "nothing here yet" as a
+  genuinely empty installation. Only an answer *that was actually read* may say
+  empty; a live event does not promote `Failed` to `Ready` (one row is not a list).
+* **a snapshot merges, it does not replace.** Entries are merged by `EntryId` with
+  the existing revision guard, so a resync no longer deletes the older pages the
+  owner loaded with "Load earlier"; entries for a conversation the snapshot no
+  longer lists are still dropped.
+* **a timestamp names its day.** `time.rs` formats against the viewer's calendar
+  day ("Today 5:34 PM", "Yesterday 9:02 AM", "Nov 3, 5:34 PM"), with `now` and the
+  zone injected so the boundaries are testable; the transcript's message grouping
+  also breaks at midnight.
 * **`EntryKind::Unknown` renders a placeholder.** The contracts carry
   `#[serde(other)] Unknown` precisely so an older UI does not fail on a newer brain
   (D6.6).
@@ -135,21 +163,27 @@ repo is not published). These are hand-built in `crates/ui/src/widgets/`:
 Everything else is `div()` + the tailwind-style API, `svg()` for icons and
 `uniform_list` for virtualised scrolling.
 
-Theme tokens live in `theme.rs`; the values are the ones the original spike
-verified against this compositor, kept so the palette does not drift:
+Theme tokens live in `theme.rs`. **The app ships a light theme now** — the dark
+palette below is what the original spike used and what this table used to claim
+long after the code moved on (D9.35). The table lists the values in the source:
 
 | Token | Value | Used for |
 | --- | --- | --- |
-| `BACKGROUND` | `#1b1d21` | main pane |
-| `SURFACE` / `SURFACE_RAISED` | `#15171a` / `#20242a` | sidebar, raised panels |
-| `BORDER` | `#2a2d33` | separators |
-| `TEXT` / `TEXT_MUTED` / `TEXT_DIM` | `#e6e6e6` / `#8b9099` / `#6c737d` | primary / secondary / status |
-| `ACCENT` / `ACCENT_HOVER` | `#2f6fdb` / `#3d7ff0` | primary button |
-| `DANGER` / `SUCCESS` / `WARNING` | `#e5484d` / `#30a46c` / `#f5a524` | deny, allow, pending |
-| `OWNER_BUBBLE` / `BOT_BUBBLE` | `#2b3a55` / `#23272e` | transcript bubbles |
-| `CODE_BG` | `#111318` | fenced code |
+| `BACKGROUND` | `#ffffff` | main pane |
+| `SURFACE` / `SURFACE_RAISED` | `#f7f7f8` / `#ececee` | sidebar, raised panels |
+| `BORDER` | `#e5e7eb` | separators |
+| `TEXT` / `TEXT_MUTED` / `TEXT_DIM` | `#111827` / `#6b7280` / `#9ca3af` | primary / secondary / status |
+| `ACCENT` / `ACCENT_HOVER` | `#2563eb` / `#1d4ed8` | primary button |
+| `DANGER` / `SUCCESS` / `WARNING` | `#ef4444` / `#10b981` / `#f59e0b` | deny, allow, pending |
+| `OWNER_BUBBLE` / `BOT_BUBBLE` | `#000000` / `#f3f4f6` | transcript bubbles |
+| `CODE_BG` | `#f3f4f6` | fenced code |
+| notice | `#fef2f2` bg / `#fecdd3` border / `#991b1b` fg | error banner |
 | spacing | `XS 4`, `SM 8`, `MD 12`, `LG 16` | gaps and padding |
-| metrics | `SIDEBAR_W 248`, `GRAPH_W 320`, `AVATAR 26`, `HEADER_H 52` | layout |
+| metrics | `SIDEBAR_W 280`, `GRAPH_W 320`, `AVATAR 32`, `HEADER_H 56` | layout |
+
+The module header of `theme.rs` said "dark-first (the only variant the app ships)"
+while every token was light. That comment is the thing that was wrong, not the
+pixels: it is corrected to match, and this table with it.
 
 Bot colours default to the demo team's: `#599ce7` lead, `#a78bfa` scout, `#34d399`
 dev, `#fbbf24` sentinel (also their `color` in `config/team.example.toml`).
@@ -181,6 +215,29 @@ cargo build -p swarmbot-ui --features runtime_shaders
 | `--selftest` | drive fabricated `LiveEvent`s through the **real** reducer, render, write a report, exit 0. The machine-checkable proof that a window opens and paints on this compositor |
 | `--report <path>` | where the selftest report goes (stdout when omitted) |
 
+**A machine with no Vulkan driver says so instead of panicking.** `gpu.rs` decides
+before GPUI does, and its rule is narrow on purpose: a driver is proven present by a
+configured `VK_ICD_FILENAMES`/`VK_DRIVER_FILES` (the caller chose), a **render node**
+inside `/dev/dri` (`renderD*`/`card*`) or a device `/dev/nvidia0`, or a *software*
+ICD the loader scans by itself (`/usr/share/vulkan/icd.d/lvp_icd*.json`). Presence is
+checked by contents, not by `test -e`: an empty `/dev/dri` and a zero-length
+`/dev/nvidia0` both pass the weak check and then panic, which is the failure being
+prevented. Only when all three miss does the run print one actionable sentence
+(`vulkan/driver: no Vulkan driver is reachable`, then the script and
+`source scripts/env.sh`), write `exit: renders=0 … ok=false`, and exit **2** — not
+1, because "this machine cannot open a window" is not "the app failed". Everything
+else (a brain, a config, a token) works without a driver, so nothing is disabled;
+the window is simply the one thing that cannot happen. The staged ICD is
+deliberately *not* counted as "software present": the loader never scans inside a
+checkout, so it becomes usable exactly when `env.sh` exports it — and that is the
+`Configured` case.
+
+```bash
+scripts/software-vulkan.sh        # no root: stages lavapipe inside the checkout
+source scripts/env.sh             # picks it up (hardware still wins when present)
+cargo run -p swarmbot-ui -- --selftest
+```
+
 `--selftest` exists because an agent cannot look at a window: it turns "does the
 render path work on this machine" into an exit code and a log line, and because it
 pushes fabricated events through the same reducer the live thread uses, "what
@@ -192,7 +249,7 @@ and a child counts as started only once `/api/health` answers `ok`.
 
 ## 6. Testing
 
-39 tests, none of which needs a compositor, a brain, a model or a network:
+123 tests, none of which needs a compositor, a brain, a model or a network:
 
 * the **reducer** is a pure function (`LiveEvent` + `AppState` → `AppState`), so
   snapshot → upserts → resync, card answers, task-tree edges and connection state
@@ -206,6 +263,10 @@ and a child counts as started only once `/api/health` answers `ok`.
   events is tested directly instead;
 * **token resolution** is tested for all four sources and for the bounded owner-token
   re-read, with the sleeps injectable so the loop is exercised without waiting (§7);
+* **driver detection** is a pure table (`gpu.rs`): configured environment, device
+  node, software ICD, absent — including the case that matters, an `nvidia_icd.json`
+  sitting on the box whose device is not (a naive "any ICD file exists" check would
+  pass there and then panic);
 * **`--selftest`** is the smoke test that needs a real compositor; it is the only
   thing here that opens a window.
 
@@ -282,11 +343,31 @@ state, and only the main thread touches GPUI.** Anything that needs to change a
 view goes through that path, which is why a resync, a reconnect and a cold start
 are the same code.
 
+### 9.1 The seam the brain grew in the honesty pass (D9.35)
+
+The client gained routes this screen set does **not** use yet. They are listed so
+nobody reads their absence as a bug:
+
+| Client method | Route | In the UI? |
+| --- | --- | --- |
+| `metrics()` | `GET /api/metrics` | no — `swarmbot status` (CLI) reads it |
+| `secrets()` / `set_secret()` / `delete_secret()` | `/api/secrets` | no — `swarmbot config key` (CLI) |
+| `export_transcript()` | `GET …/export` | no — `swarmbot transcript --out` (CLI) |
+| `update_node()` | `PATCH /api/nodes/{id}` | no — the Nodes screen still only pairs and revokes |
+| `entries_before()` | `GET …/entries?before_seq=` | **yes** — the "Load earlier" row |
+| `rules()` / `delete_rule()` | `/api/rules` | **yes** — the Approval rules screen |
+
+The gap is deliberate rather than forgotten: each of those is a *terminal* action
+(inspect, copy a secret in, export a file) where the CLI is the cheaper surface, and
+the two that change what the transcript shows are in the UI. A future screen that
+needs them has a client method waiting.
+
 ## 10. What is not verified
 
 * **What the pixels look like.** The windowing half is verified: on 2026-11-14,
-  `--selftest` opened 11 windows, rendered every screen, and exited 0 on the
-  NVIDIA ICD (§2). The number of render calls it reports differs per run (frames
+  `--selftest` opened **12 windows**, rendered every screen, and exited 0 (§2) —
+  on the NVIDIA ICD in the 2026-11-14 session, and on the staged lavapipe ICD in
+  a session that had no GPU at all on 2026-11-15. The number of render calls it reports differs per run (frames
   are timing-dependent), so it is evidence that painting happened, not a figure
   to quote. What that does **not** prove is that any of it
   looks right — and on 2026-11-14 the desktop session was locked, so a screenshot

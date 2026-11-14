@@ -330,6 +330,30 @@ pub fn contract_entries<S: Persistence>(store: &S) -> anyhow::Result<()> {
         vec![3, 4, 5],
         "entry_tail returns the newest window, ascending"
     );
+    // Paging backwards: exclusive bound, newest page that fits, ascending order.
+    ensure_eq!(
+        seqs(&store.entries_before(&conversation, 4, 2)?),
+        vec![2, 3],
+        "entries_before returns the newest page older than the cursor, ascending"
+    );
+    ensure_eq!(
+        seqs(&store.entries_before(&conversation, 6, 10)?),
+        vec![1, 2, 3, 4, 5],
+        "a cursor past the end still pages from the newest row back"
+    );
+    ensure_eq!(
+        seqs(&store.entries_before(&conversation, 2, 10)?),
+        vec![1],
+        "the cursor row itself is never repeated"
+    );
+    ensure_that!(
+        store.entries_before(&conversation, 1, 10)?.is_empty(),
+        "nothing older than the first row is an empty page, not an error"
+    );
+    ensure_that!(
+        store.entries_before(&conversation, 4, 0)?.is_empty(),
+        "entries_before with a zero limit reads nothing"
+    );
     ensure_that!(
         store.entry_tail(&conversation, 0)?.is_empty(),
         "a zero limit reads nothing"

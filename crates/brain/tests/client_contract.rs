@@ -85,7 +85,11 @@ async fn the_blocking_client_drives_the_whole_api() {
         c.create_bot(
             &NewBotRequest::new("scribe", "Scribe", "writes the release notes", "fake")
                 .color("#abcdef")
-                .toolsets(vec![Toolset::Bot]),
+                .toolsets(vec![Toolset::Bot])
+                // `skills` is new on `NewBotRequest`: before it, no front end
+                // could name a skill even though the brain has always accepted
+                // one, so the brain's support was unreachable from this client.
+                .skills(vec!["release-notes".to_string()]),
         )
     })
     .await
@@ -94,6 +98,11 @@ async fn the_blocking_client_drives_the_whole_api() {
     assert_eq!(created.label, "Scribe");
     assert_eq!(created.color.as_deref(), Some("#abcdef"));
     assert_eq!(created.toolsets, vec![Toolset::Bot]);
+    assert_eq!(
+        created.skills,
+        vec!["release-notes".to_string()],
+        "a skill named at create time is stored"
+    );
 
     // A duplicate handle is a conflict, and the client can tell.
     let err = step(&client, (), |c, ()| {
@@ -607,6 +616,264 @@ async fn the_client_reports_an_unknown_bot_as_not_found() {
         .expect_err("refused");
     assert!(err.is_not_found(), "{err:?}");
     assert_eq!(err.code(), Some("not_found"));
+
+    brain.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_blocking_client_pages_backwards_and_exports_a_transcript() {
+    let brain = TestBrain::start().await;
+    let client = BrainClient::new(&brain.base_url)
+        .expect("a client")
+        .with_token(brain.token());
+    let dm = brain.bot("lead").direct_conversation_id.clone();
+
+    for index in 0..4 {
+        step(&client, (dm.clone(), index), |c, (id, index)| {
+            c.send_message(&id, &format!("page back {index}"), &[], None)
+        })
+        .await
+        .expect("sent");
+    }
+    brain.settle().await;
+
+    let tail = step(&client, dm.clone(), |c, id| c.tail(&id, 1000))
+        .await
+        .expect("the tail");
+    assert!(tail.len() >= 4, "the transcript grew: {tail:?}");
+    let newest = tail.last().expect("an entry").seq;
+
+    // Ask for the two entries older than `newest + 1`: that is the newest page,
+    // and it must end exactly at the row whose seq is `newest`.
+    let page = step(&client, (dm.clone(), newest + 1), |c, (id, before)| {
+        c.entries_before(&id, before, 2)
+    })
+    .await
+    .expect("a backward page");
+    assert_eq!(page.len(), 2, "the page honours its limit");
+    assert!(
+        page.iter().all(|entry| entry.seq < newest + 1),
+        "`before_seq` is exclusive: {page:?}"
+    );
+    assert_eq!(
+        page.last().expect("a last entry").seq,
+        newest,
+        "a backward page ends at the cursor it was given, minus one"
+    );
+    let seqs: Vec<u64> = page.iter().map(|entry| entry.seq).collect();
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    assert_eq!(seqs, sorted, "a backward page is still ascending");
+
+    // Walking off the front is an empty page, which is how a client learns it has
+    // reached the beginning.
+    let empty = step(&client, (dm.clone(), 1), |c, (id, before)| {
+        c.entries_before(&id, before, 50)
+    })
+    .await
+    .expect("an empty page");
+    assert!(empty.is_empty(), "{empty:?}");
+
+    // The export is the whole transcript, one entry per line, verbatim.
+    let text = step(&client, dm.clone(), |c, id| c.export_transcript(&id))
+        .await
+        .expect("the export");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), tail.len(), "one line per entry of the tail");
+    let exported: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("each line is one Entry"))
+        .collect();
+    assert_eq!(exported.len(), tail.len());
+    assert_eq!(
+        exported[0]["id"],
+        json!(tail[0].id.to_string()),
+        "the export starts where the tail starts"
+    );
+    assert!(text.ends_with('\n'), "the last line is terminated");
+
+    // An unknown conversation is a typed 404, not an empty string.
+    let missing = ConversationId::new();
+    let err = step(&client, missing, |c, id| c.export_transcript(&id))
+        .await
+        .expect_err("refused");
+    assert!(err.is_not_found(), "{err:?}");
+
+    brain.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_blocking_client_reads_metrics_and_edits_a_node() {
+    let brain = TestBrain::start().await;
+    let client = BrainClient::new(&brain.base_url)
+        .expect("a client")
+        .with_token(brain.token());
+
+    let metrics = step(&client, (), |c, ()| c.metrics())
+        .await
+        .expect("metrics");
+    assert_eq!(metrics.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(metrics.epoch, brain.state.epoch());
+    assert_eq!(metrics.bots_total, 4, "{metrics:?}");
+    assert_eq!(metrics.runners, 4, "{metrics:?}");
+    assert_eq!(metrics.turns_running, 0, "{metrics:?}");
+    assert_eq!(metrics.nodes_total, 1, "{metrics:?}");
+    assert_eq!(metrics.nodes_online, 1, "{metrics:?}");
+    assert!(metrics.deliveries_parked == 0, "{metrics:?}");
+
+    // PATCH the local node: narrow its capabilities and rename it, through the
+    // client's own JSON patch — the same shape `swarmbot nodes approve` sends.
+    let node = step(&client, NodeId::local(), |c, id| {
+        c.update_node(&id, &json!({"label": "cli machine", "approved": ["shell"]}))
+    })
+    .await
+    .expect("patched");
+    assert_eq!(node.label, "cli machine");
+    assert_eq!(node.approved.as_slice(), ["shell@1"]);
+    assert_eq!(
+        node.declared.as_slice(),
+        ["fs@1", "shell@1"],
+        "declared is untouched"
+    );
+    assert!(node.can("shell") && !node.can("fs"), "{node:?}");
+
+    // Approving something the node never declared is a typed 400 the client can
+    // show, and the message names the capability.
+    let err = step(&client, NodeId::local(), |c, id| {
+        c.update_node(&id, &json!({"approved": ["pty"]}))
+    })
+    .await
+    .expect_err("refused");
+    assert_eq!(err.code(), Some("invalid_input"), "{err:?}");
+    assert!(err.to_string().contains("pty@1"), "{err}");
+
+    // A revoked node is a conflict rather than a silent re-approval.
+    let mut revoked = swarmbot_contracts::node::NodeInfo::local(
+        "gone",
+        Vec::new(),
+        swarmbot_contracts::node::PolicyMap::default(),
+    );
+    revoked.id = NodeId::new();
+    revoked.kind = swarmbot_contracts::node::NodeKind::Remote;
+    revoked.revoked = true;
+    revoked.online = false;
+    let revoked_id = revoked.id.clone();
+    brain
+        .swarm
+        .store
+        .insert_node(&revoked)
+        .expect("a revoked row");
+    let err = step(&client, revoked_id, |c, id| {
+        c.update_node(&id, &json!({"label": "back"}))
+    })
+    .await
+    .expect_err("refused");
+    assert!(err.is_conflict(), "{err:?}");
+
+    brain.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_blocking_client_manages_secrets_without_ever_reading_one() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let brain = TestBrain::start_durable_in(dir.path()).await;
+    let client = BrainClient::new(&brain.base_url)
+        .expect("a client")
+        .with_token(brain.token());
+
+    assert!(
+        step(&client, (), |c, ()| c.secrets())
+            .await
+            .expect("the list")
+            .is_empty()
+    );
+
+    let written = step(&client, (), |c, ()| {
+        c.set_secret("INFERHUB_API_KEY", "sk-contract-do-not-print")
+    })
+    .await
+    .expect("written");
+    assert_eq!(written.name, "INFERHUB_API_KEY");
+    // The client surfaces the brain's word rather than a guess of its own.
+    assert_eq!(written.applies, "restart");
+
+    let listed = step(&client, (), |c, ()| c.secrets())
+        .await
+        .expect("the list");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].name, "INFERHUB_API_KEY");
+    assert!(listed[0].used_by.is_empty(), "{listed:?}");
+    // `SecretName` has no value field at all: a client cannot even ask for one.
+    assert!(
+        !serde_json::to_string(&listed)
+            .expect("serializes")
+            .contains("sk-contract"),
+        "{listed:?}"
+    );
+
+    let removed = step(&client, (), |c, ()| c.delete_secret("INFERHUB_API_KEY"))
+        .await
+        .expect("removed");
+    assert_eq!(removed.name, "INFERHUB_API_KEY");
+    assert_eq!(removed.applies, "restart");
+    assert!(
+        step(&client, (), |c, ()| c.secrets())
+            .await
+            .expect("the list")
+            .is_empty()
+    );
+
+    // A second delete is a typed 404 the caller can tell from a transport error.
+    let err = step(&client, (), |c, ()| c.delete_secret("INFERHUB_API_KEY"))
+        .await
+        .expect_err("refused");
+    assert!(err.is_not_found(), "{err:?}");
+
+    brain.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_blocking_client_revokes_sessions_and_keeps_working_with_its_token() {
+    let brain = TestBrain::start_durable().await;
+    let client = BrainClient::new(&brain.base_url).expect("a client");
+    let token = brain.printed_token();
+
+    // A real login, so there is a session to revoke and a cookie in the jar.
+    step(&client, token.clone(), |c, token| c.login(&token))
+        .await
+        .expect("login");
+    step(&client, (), |c, ()| c.health())
+        .await
+        .expect("health works before the revoke");
+
+    let revoked = step(&client, (), |c, ()| c.revoke_sessions())
+        .await
+        .expect("revoked");
+    assert_eq!(revoked, 1, "the session `login` minted was live");
+
+    // The client keeps its bearer token, which is exactly what the route
+    // promises: logging browsers out is not rotating the owner token.
+    step(&client, (), |c, ()| c.health())
+        .await
+        .expect("the token still works");
+
+    // A cookie-only client is locked out — which is the point of the route.
+    let cookie_only = BrainClient::new(&brain.base_url).expect("a client");
+    step(&cookie_only, token.clone(), |c, token| c.login(&token))
+        .await
+        .expect("login again");
+    step(&client, (), |c, ()| c.revoke_sessions())
+        .await
+        .expect("revoked again");
+    let err = step(&cookie_only, (), |c, ()| {
+        // Drop the bearer the login remembered, so only the jar is left.
+        c.with_token("").health()
+    })
+    .await;
+    assert!(
+        matches!(err, Err(ClientError::Unauthorized)),
+        "a revoked cookie must not authenticate: {err:?}"
+    );
 
     brain.stop().await;
 }

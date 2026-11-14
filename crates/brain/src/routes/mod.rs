@@ -25,7 +25,7 @@ use axum::extract::{FromRequest, Request, State};
 use axum::http::{HeaderMap, Method, Uri};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{any, delete, get, post};
+use axum::routing::{any, delete, get, patch, post};
 use serde::de::DeserializeOwned;
 use tracing::debug;
 
@@ -41,11 +41,13 @@ pub mod bots;
 pub mod conversations;
 pub mod health;
 pub mod messages;
+pub mod metrics;
 pub mod node_gateway;
 pub mod nodes;
 pub mod requests;
 pub mod routines;
 pub mod rules;
+pub mod secrets;
 pub mod session;
 pub mod settings;
 pub mod streams;
@@ -86,6 +88,7 @@ pub fn router(state: AppState) -> Router {
             get(conversations::entries),
         )
         .route("/api/conversations/{id}/tail", get(conversations::tail))
+        .route("/api/conversations/{id}/export", get(conversations::export))
         .route("/api/conversations/{id}/messages", post(messages::send))
         .route(
             "/api/conversations/{id}/interrupt",
@@ -106,7 +109,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/routines/{id}/runs", get(routines::list_runs))
         .route("/api/nodes", get(nodes::list))
         .route("/api/nodes/pairing-codes", post(nodes::create_pairing_code))
-        .route("/api/nodes/{id}", delete(nodes::revoke))
+        // The owner's edit of one roster row: a label, and which of the
+        // capabilities the node declared are actually approved.
+        .route("/api/nodes/{id}", patch(nodes::patch).delete(nodes::revoke))
+        .route("/api/metrics", get(metrics::get))
+        .route("/api/secrets", get(secrets::list).put(secrets::put_secret))
+        .route("/api/secrets/{name}", delete(secrets::delete_secret))
+        .route("/api/auth/revoke-sessions", post(session::revoke_sessions))
         .route("/api/rules", get(rules::list).post(rules::create))
         .route("/api/rules/{id}", delete(rules::delete))
         .route("/api/settings", get(settings::get).patch(settings::patch))
@@ -114,6 +123,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/backends", get(backends::list))
         .route("/api/backends/probe", get(backends::probe))
         .route("/api/backends/{id}/models", get(backends::models))
+        // The Settings screen's Connect button: one backend, a handshake (and
+        // the owner's chosen login, when there is one), no model call.
+        .route("/api/backends/{id}/connect", post(backends::connect))
         .route("/api/shutdown", post(health::shutdown))
         .route("/ws/live", get(crate::live::handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));

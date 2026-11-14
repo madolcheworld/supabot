@@ -109,6 +109,9 @@ impl BackendSet {
                         detail: err.to_string(),
                         model: None,
                         version: None,
+                        auth_methods: Vec::new(),
+                        auth_required: false,
+                        login_command: None,
                     },
                 },
                 Err(err) => BackendStatus {
@@ -117,12 +120,59 @@ impl BackendSet {
                     detail: err.to_string(),
                     model: None,
                     version: None,
+                    auth_methods: Vec::new(),
+                    auth_required: false,
+                    login_command: None,
                 },
             };
             info!(backend = %id, ok = status.ok, detail = %status.detail, "backend probe");
             out.push((id, status));
         }
         out
+    }
+
+    /// The Settings screen's **Connect** action for one backend: the handshake
+    /// (plus, when `method` names one of the backend's own advertised logins,
+    /// that login), reported as a status.
+    ///
+    /// Same contract as [`BackendSet::probe_all`] — no model call, and the
+    /// result is a report rather than a promise — with three differences that
+    /// are the whole point of a separate action: it touches **one** backend
+    /// (a global probe spawns every configured agent), it may change the
+    /// agent's own auth state when the owner picked a method, and it is logged
+    /// with the method name so an operator can tell the two apart in a log.
+    ///
+    /// An unknown backend id is a [`DomainError`] (the caller named something
+    /// that is not configured); a refusal from the backend itself is a status
+    /// with `ok: false`, because the Settings screen has to render it.
+    pub async fn connect(
+        &self,
+        id: &str,
+        method: Option<&str>,
+    ) -> Result<BackendStatus, DomainError> {
+        let backend = self.backend(id)?;
+        let status = match backend.connect(method).await {
+            Ok(status) => status,
+            Err(err) => BackendStatus {
+                backend: id.to_string(),
+                ok: false,
+                detail: err.to_string(),
+                model: self.spec(id).and_then(|spec| spec.model.clone()),
+                version: None,
+                auth_methods: Vec::new(),
+                auth_required: false,
+                login_command: None,
+            },
+        };
+        info!(
+            backend = %id,
+            method = method.unwrap_or("-"),
+            ok = status.ok,
+            auth_required = status.auth_required,
+            detail = %status.detail,
+            "backend connect"
+        );
+        Ok(status)
     }
 
     /// True when a backend runs its own tool loop, so the runner must not drive

@@ -64,6 +64,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::LlmError;
 use crate::openai::truncate_utf8;
+use crate::types::BackendAuthMethod;
 
 use super::proto::{
     self, Incoming, InitializeResult, McpCapabilities, PROTOCOL_VERSION, PermissionRequest,
@@ -290,9 +291,11 @@ pub(crate) struct Connection {
     watchers: Watchers,
     dead: Arc<AtomicBool>,
     exit_status: Arc<Mutex<Option<String>>>,
-    /// Filled after the handshake when the agent advertises auth methods:
-    /// the hint that turns "session refused" into "log the agent in".
-    auth_hint: Arc<Mutex<Option<String>>>,
+    /// Filled after the handshake with the logins the agent advertises, mapped
+    /// into the crate's own shape (`BackendAuthMethod`). One source for two
+    /// consumers: the hint that turns a refused session into "log the agent
+    /// in", and the Settings screen's Connect panel.
+    auth_methods: Arc<Mutex<Vec<BackendAuthMethod>>>,
     /// Advertised `agentCapabilities.mcpCapabilities` from `initialize`.
     mcp_capabilities: OnceLock<McpCapabilities>,
     /// Advertised `agentCapabilities.sessionCapabilities.close`: the protocol
@@ -328,7 +331,7 @@ impl Drop for Connection {
 impl Connection {
     /// Spawn the agent and run the `initialize` handshake. The returned
     /// connection is ready for `session/new`; the agent's advertised auth
-    /// methods live on in [`Connection::auth_hint`].
+    /// methods live on in [`Connection::auth_methods`].
     pub(crate) async fn connect(
         backend: String,
         transport: &Arc<dyn AcpTransport>,
@@ -379,7 +382,7 @@ impl Connection {
             ));
         }
 
-        let auth_hint: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let auth_methods: Arc<Mutex<Vec<BackendAuthMethod>>> = Arc::new(Mutex::new(Vec::new()));
         let connection = Arc::new(Self {
             backend: backend.clone(),
             label: label.clone(),
@@ -389,7 +392,7 @@ impl Connection {
             watchers,
             dead,
             exit_status,
-            auth_hint: Arc::clone(&auth_hint),
+            auth_methods: Arc::clone(&auth_methods),
             mcp_capabilities: OnceLock::new(),
             session_close: OnceLock::new(),
             setup_timeouts: AtomicU32::new(0),
@@ -454,18 +457,23 @@ impl Connection {
                 .and_then(|caps| caps.close)
                 .is_some(),
         );
+        // Keep the advertised logins verbatim, in one shape for two readers:
+        // the hint a refused session renders, and the Settings screen's Connect
+        // panel. `command` is only ever what the agent itself named.
         if !init.auth_methods.is_empty() {
-            let names: Vec<&str> = init
+            let mapped: Vec<BackendAuthMethod> = init
                 .auth_methods
                 .iter()
-                .map(|method| method.id.as_str())
+                .map(|method| BackendAuthMethod {
+                    id: method.id.clone(),
+                    name: method.name.clone(),
+                    description: method.description.clone(),
+                    command: method.command(),
+                })
                 .collect();
-            *auth_hint
+            *auth_methods
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(format!(
-                "the agent advertises auth methods: {}; if it refuses sessions, log the agent in with its own CLI or provide its API key environment variable",
-                names.join(", ")
-            ));
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = mapped;
         }
         Ok(connection)
     }
@@ -504,14 +512,30 @@ impl Connection {
         self.setup_timeouts.load(Ordering::SeqCst)
     }
 
-    /// The login hint built from the agent's advertised auth methods, when it
-    /// advertised any. Rendered next to a refused `session/new` so "not logged
-    /// in" reads as an actionable sentence, not a mystery error code.
-    pub(crate) fn auth_hint(&self) -> Option<String> {
-        self.auth_hint
+    /// The logins the agent advertised in `initialize`, in the crate's own
+    /// shape. Empty when it named none — or when the handshake never ran.
+    pub(crate) fn auth_methods(&self) -> Vec<BackendAuthMethod> {
+        self.auth_methods
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// The login hint, built from the agent's advertised auth methods, when it
+    /// advertised any. Rendered next to a refused `session/new` so "not logged
+    /// in" reads as an actionable sentence, not a mystery error code. Derived
+    /// from [`Connection::auth_methods`], so the sentence and the Connect panel
+    /// can never disagree about what the agent offers.
+    pub(crate) fn auth_hint(&self) -> Option<String> {
+        let methods = self.auth_methods();
+        if methods.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = methods.iter().map(|method| method.id.as_str()).collect();
+        Some(format!(
+            "the agent advertises auth methods: {}; if it refuses sessions, log the agent in with its own CLI or provide its API key environment variable",
+            names.join(", ")
+        ))
     }
 
     pub(crate) fn alive(&self) -> bool {

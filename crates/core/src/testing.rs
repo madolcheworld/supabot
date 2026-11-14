@@ -252,7 +252,7 @@ mod tests {
         let bot = fixture.bot("lead");
         fixture
             .transcript
-            .owner_message(&bot.direct_conversation_id, "hello")
+            .owner_message(&bot.direct_conversation_id, "hello", None)
             .unwrap();
         let snapshot = fixture.hub.snapshot(None).unwrap();
         assert_eq!(snapshot.bots.len(), 1);
@@ -268,7 +268,7 @@ mod tests {
             let bot = fixture.bot("lead");
             fixture
                 .transcript
-                .owner_message(&bot.direct_conversation_id, "remember me")
+                .owner_message(&bot.direct_conversation_id, "remember me", None)
                 .unwrap();
         }
         let reopened = Fixture::durable(dir.path()).unwrap();

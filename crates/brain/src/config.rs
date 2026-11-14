@@ -634,34 +634,16 @@ pub fn load_secrets(
         );
         return Ok(secrets);
     }
-    let text = std::fs::read_to_string(&file)
-        .with_context(|| format!("cannot read {}", file.display()))?;
-    let value: Value = serde_json::from_str(&text)
-        .with_context(|| format!("{} is not valid JSON", file.display()))?;
-    let Some(object) = value.as_object() else {
-        bail!(
-            "{} must be a JSON object of \"ENV_NAME\": \"key\"",
-            file.display()
-        );
-    };
-    for (name, key) in object {
-        let Some(key) = key.as_str() else {
-            bail!("{}: the value of `{name}` must be a string", file.display());
-        };
-        if key.trim().is_empty() {
-            warn!(key = %name, "an empty secret is treated as absent");
-            continue;
-        }
-        // The file wins over the environment, which is the registry's own
-        // precedence: an operator who wrote a key down meant it.
-        secrets.insert(name.clone(), key.to_string());
-    }
+    let from_file = read_secret_file(paths)?;
     if !is_owner_only(&file) {
         warn!(
             path = %file.display(),
             "secrets.json is readable by more than its owner; run `chmod 600` on it"
         );
     }
+    // The file wins over the environment, which is the registry's own
+    // precedence: an operator who wrote a key down meant it.
+    secrets.extend(from_file);
     // Only the *names* are ever logged: a key that reaches the log file has
     // already leaked.
     info!(
@@ -671,6 +653,119 @@ pub fn load_secrets(
         "secrets loaded"
     );
     Ok(secrets)
+}
+
+/// Exactly what `<data>/secrets.json` holds — the file, never the environment.
+///
+/// Split out of [`load_secrets`] so `GET/PUT/DELETE /api/secrets` and the boot
+/// path read one format, not two: the route must not report a name it cannot
+/// also rewrite, and a rewrite must not drop a key the boot path would honour.
+///
+/// A missing file is an empty map (a brain with no credentials still runs); a
+/// file that exists and is malformed is an error, because "your key file is
+/// broken" must not look like "you have no keys".
+pub fn read_secret_file(paths: &Paths) -> anyhow::Result<BTreeMap<String, String>> {
+    let file = paths.secrets();
+    let text = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("cannot read {}", file.display()));
+        }
+    };
+    let value: Value = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON", file.display()))?;
+    let Some(object) = value.as_object() else {
+        bail!(
+            "{} must be a JSON object of \"ENV_NAME\": \"key\"",
+            file.display()
+        );
+    };
+    let mut secrets = BTreeMap::new();
+    for (name, key) in object {
+        let Some(key) = key.as_str() else {
+            bail!("{}: the value of `{name}` must be a string", file.display());
+        };
+        if key.trim().is_empty() {
+            warn!(key = %name, "an empty secret is treated as absent");
+            continue;
+        }
+        secrets.insert(name.clone(), key.to_string());
+    }
+    Ok(secrets)
+}
+
+/// Replace `<data>/secrets.json` **atomically**, with mode 0600 from the moment
+/// the bytes exist.
+///
+/// `write_private` writes the file and tightens the mode afterwards, which leaves
+/// a window in which the key is on disk world-readable — acceptable for a token
+/// file written once at boot, not for a credential an owner rotates. So this
+/// writes a sibling temp file that is created 0600, `fsync`s it, then `rename`s it
+/// over the real path: a reader either sees the old file or the new one, never
+/// half of either, and the mode is never briefly 0644.
+///
+/// The temp name carries the pid and a nanosecond stamp so two writers (the API
+/// and an operator's editor, or two requests racing) cannot share one scratch
+/// file. A stale temp from a crash is harmless: it is 0600 and it is not the file
+/// the brain reads.
+pub fn write_secret_file(paths: &Paths, secrets: &BTreeMap<String, String>) -> std::io::Result<()> {
+    let target = paths.secrets();
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(secrets)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let scratch = target.with_file_name(format!(".secrets.{}.{stamp}.tmp", std::process::id()));
+    write_atomic_private(&target, &scratch, json.as_bytes())
+}
+
+/// The mode-aware half of [`write_secret_file`], so the `cfg` split stays in one
+/// place.
+#[cfg(unix)]
+fn write_atomic_private(target: &Path, scratch: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(scratch)?;
+    let written = file
+        .write_all(bytes)
+        // `sync_all` before the rename: a rename is atomic in the directory, not
+        // in the data blocks, and a crash between the two would otherwise leave a
+        // complete-looking file full of zeroes.
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(scratch);
+        return Err(err);
+    }
+    match std::fs::rename(scratch, target) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(scratch);
+            Err(err)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn write_atomic_private(target: &Path, scratch: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // No mode bits exist here, so the only promise kept is the atomic one.
+    match std::fs::write(scratch, bytes).and_then(|()| std::fs::rename(scratch, target)) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(scratch);
+            Err(err)
+        }
+    }
 }
 
 /// Write a file that only its owner may read, creating it atomically enough for
@@ -1332,6 +1427,60 @@ mod tests {
             rendered.contains("inferhub"),
             "the id is useful: {rendered}"
         );
+    }
+
+    #[test]
+    fn the_secret_file_round_trips_and_is_written_owner_only() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let paths = Paths::new(dir.path());
+        // A missing file is "no keys", not an error: a brain with no credentials
+        // still runs the offline demo.
+        assert!(
+            read_secret_file(&paths)
+                .expect("missing is empty")
+                .is_empty()
+        );
+
+        let written = BTreeMap::from([
+            ("A_KEY".to_string(), "sk-a".to_string()),
+            ("B_KEY".to_string(), "sk-b".to_string()),
+        ]);
+        write_secret_file(&paths, &written).expect("written");
+        assert_eq!(read_secret_file(&paths).expect("read back"), written);
+        // 0600 from the first byte, and no readable-by-others intermediate: the
+        // whole point of the atomic write is that the key is never world-readable.
+        assert!(
+            is_owner_only(&paths.secrets()),
+            "the secrets file must be 0600, not readable by group or others"
+        );
+        // No scratch file is left behind, so a later reader cannot mistake one for
+        // the real file.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".secrets."))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // A replacement is whole: the old key is gone, not merged.
+        let replaced = BTreeMap::from([("A_KEY".to_string(), "sk-new".to_string())]);
+        write_secret_file(&paths, &replaced).expect("rewritten");
+        assert_eq!(read_secret_file(&paths).expect("read back"), replaced);
+        assert!(is_owner_only(&paths.secrets()));
+    }
+
+    #[test]
+    fn a_malformed_secret_file_is_an_error_not_an_empty_map() {
+        // "You have no keys" and "your key file is broken" send an owner in
+        // opposite directions, and the API must not report the second as the first.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let paths = Paths::new(dir.path());
+        std::fs::write(paths.secrets(), "{not json").expect("write");
+        assert!(read_secret_file(&paths).is_err());
+        std::fs::write(paths.secrets(), "[1,2]").expect("write");
+        assert!(read_secret_file(&paths).is_err());
+        std::fs::write(paths.secrets(), "{\"A\": 3}").expect("write");
+        assert!(read_secret_file(&paths).is_err());
     }
 
     #[test]

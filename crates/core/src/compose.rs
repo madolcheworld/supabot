@@ -44,7 +44,6 @@ pub fn durable(
     // inside `store`). See `store::threaded`'s module docs for the full limit.
     let store: Arc<dyn Persistence> =
         Arc::new(ThreadedStore::open(&data_dir.join("swarmbot.sqlite"))?);
-    let mirror = Arc::new(JsonlMirror::new(data_dir.join("transcripts")));
     // A brand-new data dir has no stored settings, and `settings()` answers with
     // the built-in defaults in that case — which would silently throw away the
     // `[settings]` the operator wrote (their safety ceilings above all). Seed it
@@ -55,6 +54,19 @@ pub fn durable(
         store.put_settings(&config.settings)?;
     }
     let settings = store.settings().unwrap_or_default();
+    // `settings.transcript_mirror` is the owner's switch for the append-only
+    // JSONL copy of every entry. It used to be read by the Settings screen and
+    // nobody else — `durable` always installed the mirror — so turning it off
+    // changed a picture and nothing else. It is read *after* the seed above, so
+    // the switch the operator wrote in `[settings]` is the one that applies;
+    // SQLite stays authoritative either way, which is why this is a mirror and
+    // not the transcript itself.
+    let mirror = if settings.transcript_mirror {
+        Some(Arc::new(JsonlMirror::new(data_dir.join("transcripts"))))
+    } else {
+        info!("transcript mirror is off: entries live in SQLite only");
+        None
+    };
     let backends = BackendSet::from_config(&config, secrets)?;
     let parts = parts_for(&config, data_dir, &settings, store.clone(), extra_roots)?;
     let swarm = Swarm::new(
@@ -63,7 +75,7 @@ pub fn durable(
         store,
         backends,
         parts,
-        Some(mirror),
+        mirror,
     )?;
     info!(data_dir = %data_dir.display(), "brain state loaded");
     Ok(swarm)
@@ -242,6 +254,47 @@ mod tests {
                 .iter()
                 .any(|e| e.kind.text() == Some("remember this"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_durable_brain_with_the_mirror_off_writes_no_jsonl() {
+        // `settings.transcript_mirror` was displayed on the Settings screen and
+        // read by nobody: `durable` installed the mirror unconditionally, so
+        // switching it off changed a picture and nothing else.
+        let mut cfg = config();
+        cfg.settings.transcript_mirror = false;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let swarm = durable(cfg, dir.path(), vec![], &BTreeMap::new()).expect("a swarm");
+        swarm.boot().expect("boot");
+        assert!(
+            !swarm.settings.get().transcript_mirror,
+            "the configured switch is the stored one"
+        );
+        let lead = swarm.bots.by_name("lead").expect("the lead");
+        swarm
+            .send(&lead.direct_conversation_id, "this is not mirrored")
+            .expect("sent");
+
+        let transcripts = dir.path().join("transcripts");
+        let files: Vec<_> = std::fs::read_dir(&transcripts)
+            .map(|entries| entries.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        assert!(
+            files.is_empty(),
+            "nothing may be written to {transcripts:?}: {files:?}"
+        );
+        // The transcript itself is unaffected — SQLite is authoritative and the
+        // mirror is a copy, not the record.
+        let entries = swarm
+            .conversations
+            .tail(&lead.direct_conversation_id, 10)
+            .expect("entries");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.kind.text() == Some("this is not mirrored"))
+        );
+        swarm.shutdown().await;
     }
 
     #[tokio::test]

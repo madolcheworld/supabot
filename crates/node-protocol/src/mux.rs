@@ -262,7 +262,30 @@ pub struct PeerConfig {
     /// The handler installed at construction; [`Peer::serve`] can replace it
     /// before traffic starts.
     pub handler: Option<Handler>,
+    /// The most inbound requests this peer will run **at the same time**
+    /// (default [`DEFAULT_MAX_IN_FLIGHT`]).
+    ///
+    /// The mux used to spawn one task per inbound request with no ceiling, so a
+    /// brain (or a compromised one) could start an unbounded number of process
+    /// groups on a node by pipelining `shell.exec` frames, and the node's own
+    /// memory would grow with the queue. This is the ceiling: a request that
+    /// arrives while the limit is reached is answered with
+    /// `PolicyRefused { retry: true }` — the same honest shape as any other
+    /// refusal, and `retry: true` because "busy" is not "forbidden".
+    ///
+    /// It is a per-connection cap, not a per-node one: a node that accepts two
+    /// connections gets two of these, which is deliberate — this is a backstop
+    /// against a runaway client, not a global scheduler.
+    pub max_in_flight: usize,
 }
+
+/// How many inbound requests one connection serves at once.
+///
+/// One bot's turn makes one call at a time, and the streaming `shell.exec` path
+/// is the only long-lived one; 16 leaves room for several bots on one node plus
+/// a probe or two, and stays far below the point where each call's child process
+/// stops fitting in memory on a small machine.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 16;
 
 // `Handler` is a trait object without Debug; the config should still print
 // usefully in logs and test failures.
@@ -284,6 +307,7 @@ impl Default for PeerConfig {
             liveness_timeout: Duration::from_secs(20),
             require_hello: false,
             handler: None,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
         }
     }
 }
@@ -332,6 +356,7 @@ impl<S: Socket> Peer<S> {
             state: State::new(config.require_hello),
             ping_interval: config.ping_interval,
             liveness_timeout: config.liveness_timeout,
+            max_in_flight: config.max_in_flight.max(1),
         };
         tokio::spawn(driver.run(closed_tx));
         Peer {
@@ -791,12 +816,13 @@ impl State {
         frame: Frame,
         cmd_tx: &mpsc::UnboundedSender<Cmd>,
         handler_slot: &Arc<RwLock<Option<Handler>>>,
+        max_in_flight: usize,
     ) {
         match frame {
             Frame::Request {
                 id, method, params, ..
             } => {
-                self.on_request(id, method, params, cmd_tx, handler_slot);
+                self.on_request(id, method, params, cmd_tx, handler_slot, max_in_flight);
             }
             Frame::Response { id, result } => match self.pending.remove(&id) {
                 Some(Pending::Unary(resp)) => {
@@ -864,6 +890,7 @@ impl State {
         params: Value,
         cmd_tx: &mpsc::UnboundedSender<Cmd>,
         handler_slot: &Arc<RwLock<Option<Handler>>>,
+        max_in_flight: usize,
     ) {
         // §3.2: until node.hello succeeded, a gated (node-side) peer answers
         // every request NotAuthenticated — a hijack cannot drive the node.
@@ -872,6 +899,24 @@ impl State {
                 id,
                 error: CauseError::fail(TypedError::not_authenticated(
                     "node.hello has not completed on this connection",
+                )),
+            });
+            return;
+        }
+        // Admission control, before any bookkeeping: a peer that pipelines more
+        // requests than this connection will run gets a typed "busy" instead of
+        // an unbounded number of spawned tasks (and, for `shell.exec`, an
+        // unbounded number of process groups). `retry: true` because that is
+        // the truth — nothing about the request is forbidden.
+        if self.in_flight.len() >= max_in_flight {
+            self.queue(&Frame::Error {
+                id,
+                error: CauseError::fail(TypedError::policy_refused(
+                    method.clone(),
+                    format!(
+                        "this connection is already serving {max_in_flight} requests; retry when                          one finishes (the cap is PeerConfig::max_in_flight)"
+                    ),
+                    true,
                 )),
             });
             return;
@@ -995,6 +1040,10 @@ struct Driver<S> {
     state: State,
     ping_interval: Duration,
     liveness_timeout: Duration,
+    /// Inbound requests this connection may run at once. See
+    /// [`PeerConfig::max_in_flight`]: the cap is enforced here because this is
+    /// the only place that spawns the per-request task.
+    max_in_flight: usize,
 }
 
 impl<S: Socket> Driver<S> {
@@ -1009,6 +1058,7 @@ impl<S: Socket> Driver<S> {
             mut state,
             ping_interval,
             liveness_timeout,
+            max_in_flight,
         } = self;
 
         let mut deadline = Instant::now() + liveness_timeout;
@@ -1053,7 +1103,9 @@ impl<S: Socket> Driver<S> {
                             Err(error) => tracing::warn!(%error, "ignoring an unparseable frame"),
                             Ok(frame) => match cmd_tx.upgrade() {
                                 Some(cmd_tx) => {
-                                    state.on_frame(frame, &cmd_tx, &handler_slot).await
+                                    state
+                                        .on_frame(frame, &cmd_tx, &handler_slot, max_in_flight)
+                                        .await
                                 }
                                 // Every handle is gone: nobody can answer this
                                 // frame, so close instead of leaking the socket.
@@ -2272,6 +2324,104 @@ mod tests {
         assert!(clone.is_cancelled());
         clone.cancel(); // idempotent
         assert!(token.is_cancelled());
+    }
+
+    /// A handler that never finishes, so the in-flight table stays full.
+    struct Stalls;
+
+    impl RpcHandler for Stalls {
+        fn handle<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Value,
+            _tx: Option<ChunkSink>,
+        ) -> BoxFuture<'a, Result<Value, TypedError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// The mux used to spawn one task per inbound request with no ceiling, so a
+    /// peer that pipelined requests started an unbounded number of them (and,
+    /// for `shell.exec`, an unbounded number of process groups). The cap is
+    /// `PeerConfig::max_in_flight`, and the refusal is a typed `PolicyRefused`
+    /// with `retry: true` — "busy" is not "forbidden", and a caller must be able
+    /// to tell the two apart.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_serves_only_max_in_flight_requests_at_once() {
+        let (server_sock, client_sock) = duplex_pair(64 * 1024);
+        let server = Peer::new(
+            server_sock,
+            PeerConfig {
+                handler: Some(Arc::new(Stalls)),
+                max_in_flight: 2,
+                ..quiet_cfg()
+            },
+        );
+        let client = Peer::new(client_sock, quiet_cfg());
+
+        // Two calls fill the table; they will never finish.
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.call("stall.one", json!(null)).await }
+        });
+        let second = tokio::spawn({
+            let client = client.clone();
+            async move { client.call("stall.two", json!(null)).await }
+        });
+        // Give the driver a moment to register both, without asserting on time.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // The third is refused instead of being spawned.
+        let refused = client.call("stall.three", json!(null)).await;
+        let error = refused.expect_err("the third call is refused, not queued");
+        // The refusal crosses as a typed remote error, and `retry: true`
+        // survives the round trip: "busy" must not read as "forbidden", which
+        // is the difference between a caller backing off and one giving up.
+        let typed = error
+            .typed()
+            .expect("the refusal is a typed error, not a bare defect");
+        match typed {
+            TypedError::PolicyRefused { reason, retry, .. } => {
+                assert!(retry, "a busy connection is retryable: {typed}");
+                assert!(
+                    reason.contains("already serving 2 requests"),
+                    "the refusal must name the cap: {reason}"
+                );
+            }
+            other => panic!("expected PolicyRefused, got {other:?}"),
+        }
+
+        // The two that fit are still running: the cap refused, it did not fail
+        // the connection or cancel the work in flight.
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        assert!(!client.is_closed());
+        first.abort();
+        second.abort();
+        drop(server);
+        drop(client);
+    }
+
+    /// The default is not zero and not "unbounded by accident": a peer built
+    /// from `PeerConfig::default()` must serve at least a couple of requests.
+    #[test]
+    fn the_default_in_flight_cap_is_a_real_number() {
+        // A cap of 0 or 1 would make the connection useless (one long stream
+        // would block every other call), which is why the default is checked
+        // rather than left to whoever edits the constant next.
+        assert_eq!(PeerConfig::default().max_in_flight, DEFAULT_MAX_IN_FLIGHT);
+        assert_eq!(DEFAULT_MAX_IN_FLIGHT, 16);
+        let explicit = PeerConfig {
+            max_in_flight: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            explicit.max_in_flight, 0,
+            "a configured zero is carried as written; `Peer::new` clamps it to 1 so the \
+             connection still answers one call at a time"
+        );
     }
 
     #[tokio::test(start_paused = true)]

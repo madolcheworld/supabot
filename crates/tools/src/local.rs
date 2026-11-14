@@ -364,6 +364,109 @@ impl NodeExecutor for LocalExecutor {
         }
         self.run(call).await
     }
+
+    /// A download on *this* machine: a policy-resolved copy, no socket.
+    ///
+    /// It exists so the tool layer has one shape for local and remote: the
+    /// handler asks "copy `path` from `node` to `dest`" and does not care which
+    /// kind of node it is. A local copy is still two policy decisions — reading
+    /// the source and writing the destination — because the source may live in a
+    /// read-only root while the destination is the bot's workspace.
+    async fn download(
+        &self,
+        node: &NodeId,
+        _invocation: &Invocation,
+        path: &str,
+        dest: &std::path::Path,
+    ) -> Result<ToolResult, ToolError> {
+        if node != &self.node_id {
+            return Err(ToolError::PolicyRefused {
+                reason: format!(
+                    "node {node} is not this executor (it serves {}), and a file from another \
+                     machine must not be read here",
+                    self.node_id
+                ),
+                retry: false,
+            });
+        }
+        let source = self.resolve(path, false)?;
+        self.check_ceiling(Surface::ReadFile, path)?;
+        let dest = dest.to_path_buf();
+        let requested = path.to_string();
+        crate::handlers::blocking(move || copy_to(&source, &dest, &requested)).await
+    }
+}
+
+/// Copy `source` to `dest`, reporting what was written and its digest.
+///
+/// Written to a temporary file and renamed, so a copy that fails halfway leaves
+/// no truncated file wearing the destination's name. One pass: the bytes are
+/// hashed as they are written, and that `sha256` is the same value a remote node
+/// reports in its `FsDownloadResult` — one vocabulary for "which bytes arrived".
+fn copy_to(source: &Path, dest: &Path, requested: &str) -> Result<ToolResult, ToolError> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut input = std::fs::File::open(source)
+        .map_err(|error| ToolError::failed(format!("cannot read {}: {error}", source.display())))?;
+    let temp = dest.with_extension("part");
+    let mut out = std::fs::File::create(&temp)
+        .map_err(|error| ToolError::failed(format!("cannot create {}: {error}", temp.display())))?;
+    let mut hasher = Sha256::new();
+    let mut size: u64 = 0;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = match std::io::Read::read(&mut input, &mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(ToolError::failed(format!(
+                    "cannot read {requested} after {size} bytes: {error}"
+                )));
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        if let Err(error) = std::io::Write::write_all(&mut out, &buffer[..read]) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(ToolError::failed(format!(
+                "cannot write {} after {size} bytes: {error}",
+                temp.display()
+            )));
+        }
+        hasher.update(&buffer[..read]);
+        size += read as u64;
+    }
+    if let Err(error) = std::io::Write::flush(&mut out) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(ToolError::failed(format!(
+            "cannot flush {}: {error}",
+            temp.display()
+        )));
+    }
+    drop(out);
+    std::fs::rename(&temp, dest).map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
+        ToolError::failed(format!(
+            "cannot move the copy into {}: {error}",
+            dest.display()
+        ))
+    })?;
+    Ok(crate::handlers::download_result(
+        &dest.display().to_string(),
+        size,
+        &hex_lower(&hasher.finalize()),
+    ))
+}
+
+/// Lowercase hex, the spelling both endpoints use for a digest.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// `FsStat`: the small metadata summary a bot needs to decide between

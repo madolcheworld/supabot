@@ -105,7 +105,22 @@ impl Orchestrator {
             ));
         }
 
-        let entry = self.transcript.owner_message(conversation_id, text)?;
+        // `reply_to` is worth two things, and it used to be thrown away after
+        // the first: it picks the addressee in a group, and it is what lets a
+        // transcript say "this answers that". It is recorded only when the
+        // entry exists and lives in *this* conversation — a reply id from
+        // somewhere else is a client bug, and writing it would make the
+        // transcript point across conversations.
+        let replied = match reply_to {
+            Some(id) => self
+                .store
+                .get_entry(id)?
+                .filter(|entry| entry.conversation_id == *conversation_id),
+            None => None,
+        };
+        let entry =
+            self.transcript
+                .owner_message(conversation_id, text, replied.map(|entry| entry.id))?;
 
         let mut queued = Vec::new();
         for target in &route.targets {
@@ -511,6 +526,47 @@ mod tests {
         assert_eq!(stored.status, TurnStatus::Interrupted);
         let bot = store.get_bot(&lead.id).unwrap().unwrap();
         assert_eq!(bot.status, BotStatus::Idle, "the roster does not lie");
+    }
+
+    #[test]
+    fn a_reply_records_what_it_answers() {
+        // `reply_to` was accepted, used to pick the addressee, and then thrown
+        // away: every owner entry was stored with `reply_to: None`, so no
+        // transcript could show a thread.
+        let (orchestrator, store, _lead, group) = rig();
+        let asked = orchestrator
+            .send_owner_message(&group.id, "@scout is it done?", &[], None)
+            .unwrap();
+        let answered = orchestrator
+            .send_owner_message(&group.id, "thanks", &[], Some(&asked.entry.id))
+            .unwrap();
+
+        let stored = store.get_entry(&answered.entry.id).unwrap().unwrap();
+        let message = stored.as_message().expect("a message entry");
+        assert_eq!(
+            message.reply_to.as_ref(),
+            Some(&asked.entry.id),
+            "the entry remembers which message it answers"
+        );
+        assert!(
+            asked.entry.as_message().unwrap().reply_to.is_none(),
+            "and a first message is not a reply"
+        );
+    }
+
+    #[test]
+    fn a_reply_from_another_conversation_is_not_recorded() {
+        // A reply id is a transcript cursor. Recording one from elsewhere would
+        // make the entry point at a row the reader's conversation never shows.
+        let (orchestrator, store, lead, group) = rig();
+        let elsewhere = orchestrator
+            .send_owner_message(&lead.direct_conversation_id, "hello", &[], None)
+            .unwrap();
+        let sent = orchestrator
+            .send_owner_message(&group.id, "hi team", &[], Some(&elsewhere.entry.id))
+            .unwrap();
+        let stored = store.get_entry(&sent.entry.id).unwrap().unwrap();
+        assert_eq!(stored.as_message().unwrap().reply_to, None);
     }
 
     #[test]

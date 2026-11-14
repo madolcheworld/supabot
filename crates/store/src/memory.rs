@@ -283,6 +283,28 @@ impl EntryRepo for MemoryStore {
         Ok(entries)
     }
 
+    fn entries_before(
+        &self,
+        conversation: &ConversationId,
+        before_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<Entry>, DomainError> {
+        let mut entries: Vec<Entry> = guard(&self.entries)?
+            .values()
+            .filter(|entry| entry.conversation_id == *conversation && entry.seq < before_seq)
+            .cloned()
+            .collect();
+        entries.sort_by_key(|entry| entry.seq);
+        // Keep the *newest* page that fits, like `entry_tail` does — the store
+        // returns a window ending just before `before_seq`, not the oldest rows
+        // of the conversation.
+        let keep = limit as usize;
+        if entries.len() > keep {
+            entries = entries.split_off(entries.len() - keep);
+        }
+        Ok(entries)
+    }
+
     fn delete_entries(&self, conversation: &ConversationId) -> Result<u64, DomainError> {
         let mut entries = guard(&self.entries)?;
         let before = entries.len();

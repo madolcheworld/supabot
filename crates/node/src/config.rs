@@ -148,6 +148,10 @@ struct ConfigFile {
     deny: Vec<PathBuf>,
     #[serde(default)]
     ceilings: Option<PolicyMap>,
+    /// Inbound requests served at once. `0` is refused rather than clamped
+    /// silently: a node that cannot serve anything is a typo, not a policy.
+    #[serde(default)]
+    max_in_flight: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -190,7 +194,20 @@ pub struct NodeConfig {
     pub auto_approve_read_only: bool,
     pub shell_enabled: bool,
     pub heartbeat_secs: u64,
+    /// How many inbound RPCs this node serves at once
+    /// ([`swarmbot_node_protocol::mux::PeerConfig::max_in_flight`]).
+    ///
+    /// The mux used to spawn one task per request with no ceiling, so a brain
+    /// (or a bug in one) could start an unbounded number of process groups here
+    /// by pipelining `shell.exec`. This is the owner's own backstop, enforced on
+    /// this machine — exactly like a ceiling, it is the node's number and the
+    /// brain cannot raise it.
+    pub max_in_flight: usize,
 }
+
+/// The default concurrent-request cap, from the wire crate so the two cannot
+/// drift: the mux's `PeerConfig::default()` and this node's file default agree.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = swarmbot_node_protocol::mux::DEFAULT_MAX_IN_FLIGHT;
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -205,6 +222,7 @@ impl Default for NodeConfig {
             auto_approve_read_only: true,
             shell_enabled: true,
             heartbeat_secs: DEFAULT_HEARTBEAT_SECS,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             data_dir,
         }
     }
@@ -263,6 +281,7 @@ impl NodeConfig {
             auto_approve_read_only: true,
             shell_enabled: true,
             heartbeat_secs: DEFAULT_HEARTBEAT_SECS,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             data_dir,
         }
     }
@@ -305,6 +324,15 @@ impl NodeConfig {
         if let Some(ceilings) = file.ceilings {
             config.ceilings = ceilings;
         }
+        if let Some(cap) = file.max_in_flight {
+            if cap == 0 {
+                return Err(NodeError::Config(format!(
+                    "{}: max_in_flight must be at least 1 (0 would refuse every request)",
+                    path.display()
+                )));
+            }
+            config.max_in_flight = cap;
+        }
         config.deny = file.deny;
         if !file.roots.is_empty() {
             config.roots = roots_from(file.roots.into_iter().map(|root| {
@@ -332,6 +360,7 @@ impl NodeConfig {
             brain_url: self.brain_url.clone(),
             brain_ca: self.brain_ca.clone(),
             heartbeat_secs: Some(self.heartbeat_secs),
+            max_in_flight: Some(self.max_in_flight),
             shell: Some(self.shell_enabled),
             auto_approve_read_only: Some(self.auto_approve_read_only),
             roots: self
@@ -920,5 +949,49 @@ shell = "never"
                 "{absent} must never be declared"
             );
         }
+    }
+    /// The cap is the node's own number and it cannot be turned into "serve
+    /// nothing": a `0` in the file is a typo, and clamping it silently would
+    /// leave an owner wondering why every call was refused.
+    #[test]
+    fn a_zero_in_flight_cap_is_refused_and_the_default_comes_from_the_wire_crate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write(tmp.path(), "max_in_flight = 0\n");
+        let error = NodeConfig::load(tmp.path()).expect_err("0 is a config error");
+        let message = error.to_string();
+        assert!(
+            message.contains("max_in_flight") && message.contains("at least 1"),
+            "{message}"
+        );
+
+        write(tmp.path(), "max_in_flight = 3\n");
+        let config = NodeConfig::load(tmp.path()).expect("loads");
+        assert_eq!(config.max_in_flight, 3);
+
+        // No file at all: the default is the wire crate's own constant, so the
+        // mux and the node cannot disagree about what "the default" is.
+        let empty = tempfile::tempdir().expect("tempdir");
+        let config = NodeConfig::load(empty.path()).expect("loads");
+        assert_eq!(config.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
+        assert_eq!(
+            DEFAULT_MAX_IN_FLIGHT,
+            swarmbot_node_protocol::mux::DEFAULT_MAX_IN_FLIGHT
+        );
+    }
+
+    /// The flag reaches the config, and `--max-in-flight 0` is refused with a
+    /// sentence rather than becoming "serve nothing".
+    #[test]
+    fn the_cli_flag_sets_the_cap_and_refuses_zero() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut options = crate::cli::tests::tests_support_run_options();
+        options.max_in_flight = Some(2);
+        let resolved = crate::cli::resolve_config(Some(tmp.path()), &options).expect("resolves");
+        assert_eq!(resolved.max_in_flight, 2);
+
+        options.max_in_flight = Some(0);
+        let error =
+            crate::cli::resolve_config(Some(tmp.path()), &options).expect_err("zero is refused");
+        assert!(error.to_string().contains("--max-in-flight"), "{error}");
     }
 }

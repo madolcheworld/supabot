@@ -604,6 +604,7 @@ async fn per_turn_mcp_endpoint_runs_bot_tools_filters_by_request_and_returns_404
             toolsets: vec![Toolset::Bot, Toolset::Task],
             node_caps: None,
             in_task: true,
+            cancel: tokio_util::sync::CancellationToken::new(),
         })
         .expect("register turn 1");
 
@@ -741,6 +742,7 @@ async fn per_turn_mcp_endpoint_runs_bot_tools_filters_by_request_and_returns_404
             toolsets: vec![Toolset::Bot, Toolset::Task],
             node_caps: None,
             in_task: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         })
         .expect("register turn 2");
     let normal_turn_url = match &normal_turn_reg.servers[0] {
@@ -870,6 +872,7 @@ async fn unbound_internal_listener_returns_empty_mcp_turn_registration() {
             toolsets: vec![Toolset::Bot],
             node_caps: None,
             in_task: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         })
         .expect("register_turn succeeds with empty servers");
     assert!(
@@ -934,6 +937,7 @@ async fn an_mcp_tool_call_lands_a_transcript_card_and_counts_for_the_turn() {
             toolsets: vec![Toolset::Bot],
             node_caps: None,
             in_task: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         })
         .expect("register turn");
     let url = match &reg.servers[0] {
@@ -1028,5 +1032,144 @@ async fn an_mcp_tool_call_lands_a_transcript_card_and_counts_for_the_turn() {
 
     drop(reg);
     let _ = scout;
+    running.stop().await;
+}
+
+/// A stopped turn must not keep acting, and that has to be true for a tool the
+/// **agent** calls through the per-turn MCP server — the path every ACP bot's
+/// tools take.
+///
+/// This is a regression test for a real hole: `ToolContext::local` minted a
+/// private `CancellationToken` that nobody ever tripped, so the registry's own
+/// "a stopped turn must not act" check (`ToolRegistry::run`) could never fire on
+/// the MCP path. The agent's `session/cancel` stopped the agent; a `shell` our
+/// handler was already running, or a `write_file` it had not started yet, kept
+/// going. `McpTurnRequest::cancel` carries the turn's token now, and the
+/// context is built with it.
+///
+/// Cancelling *before* the call is the deterministic shape: the same code path
+/// runs either way, and there is no window to guess about.
+#[tokio::test]
+async fn a_stopped_turns_mcp_call_is_refused_and_never_runs_the_tool() {
+    use swarmbot_contracts::{Toolset, TurnId};
+    use swarmbot_core::McpTurnRequest;
+    use swarmbot_llm::McpServerSpec;
+
+    let running = RunningInternalBrain::start().await;
+    let client = Client::builder().timeout(TIMEOUT).build().expect("client");
+
+    let lead = running.brain.swarm.bots.by_name("lead").expect("lead bot");
+    let conversation = lead.direct_conversation_id.clone();
+    let provider = running
+        .brain
+        .swarm
+        .runner_env()
+        .mcp_provider
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .expect("Brain wires McpTurnProvider onto Swarm");
+    let workspace = running
+        .brain
+        .swarm
+        .ensure_bot_workspace(&lead.name)
+        .expect("lead workspace");
+
+    // The token the runner holds for this turn.
+    let turn_token = tokio_util::sync::CancellationToken::new();
+    let turn_id = TurnId::new();
+    let reg = provider
+        .register_turn(McpTurnRequest {
+            bot_id: lead.id.clone(),
+            conversation_id: conversation.clone(),
+            turn_id: turn_id.clone(),
+            task_id: None,
+            workspace: workspace.clone(),
+            spool_dir: workspace.join(".spool"),
+            // `Node` gives this turn `write_file`, so the refused call would
+            // really have touched the disk if the guard were missing.
+            toolsets: vec![Toolset::Bot, Toolset::Node],
+            node_caps: None,
+            in_task: false,
+            cancel: turn_token.clone(),
+        })
+        .expect("register turn");
+    let url = match &reg.servers[0] {
+        McpServerSpec::Http { url, .. } => url.clone(),
+        other => panic!("expected http spec, got {other:?}"),
+    };
+
+    // Stop the turn *before* the agent asks for a tool, so the refusal is
+    // deterministic: there is no window between the cancel and the call.
+    turn_token.cancel();
+    let sid = mcp_initialize(&client, &url).await;
+
+    // 1. A read-only tool: the registry refuses **before** any handler runs
+    //    ("a stopped turn must not act, not even `just` read"). This assertion
+    //    comes first because it needs no approval and therefore fails fast and
+    //    with a readable message if the token is ever dropped again — a
+    //    `write_file` would instead block on the approval gate and present as a
+    //    HTTP timeout, which is true but teaches the reader nothing.
+    let (status, _, read_value) = mcp_post(
+        &client,
+        &url,
+        sid.as_deref(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": { "name": "read_file", "arguments": { "path": "README.md" } }
+        }),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let read_value = read_value.expect("read_file response");
+    assert_eq!(
+        read_value["result"]["isError"],
+        json!(true),
+        "a stopped turn must not read through the MCP server; the tool ran: {read_value}"
+    );
+    let text = read_value["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.to_lowercase().contains("cancel") || text.to_lowercase().contains("stopped"),
+        "the refusal must say the turn was stopped, not look like a tool failure: {text}"
+    );
+
+    // 2. A write: the proof that the refusal is a refusal and not a message. If
+    //    the token were missing the call would block on the approval gate rather
+    //    than write, so the file check below is only meaningful together with the
+    //    cancellation assertion above — both are asserted, neither is inferred
+    //    from the other.
+    let (status, _, write_value) = mcp_post(
+        &client,
+        &url,
+        sid.as_deref(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "write_file",
+                "arguments": { "path": "stopped-turn.txt", "content": "should not exist" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let write_value = write_value.expect("write_file response");
+    assert_eq!(
+        write_value["result"]["isError"],
+        json!(true),
+        "a stopped turn's write must come back as an error result: {write_value}"
+    );
+    assert!(
+        !workspace.join("stopped-turn.txt").exists(),
+        "a stopped turn wrote a file through the MCP server: {}",
+        workspace.join("stopped-turn.txt").display()
+    );
+
+    drop(reg);
     running.stop().await;
 }

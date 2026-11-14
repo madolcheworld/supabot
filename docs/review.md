@@ -715,3 +715,125 @@ sebagai potret keadaan saat itu, bukan sebagai daftar hidup:
   `post: "posted"` **dan** status bot kembali `idle`. Pelajarannya umum: "turn
   selesai" adalah status bot, bukan sesuatu yang bisa disimpulkan dari isi
   transkrip.
+
+---
+
+## 17. Tindak lanjut — putaran kesepuluh (2026-11-15)
+
+Putaran ini dimulai dari pertanyaan pemilik "analisa kodenya, saya ingin
+mengembangkan", dan jawabannya bukan "belum ada fitur" — seluruh milestone sudah
+tertutup. Yang ditemukan adalah **jarak antara klaim dan perilaku**: kode dan
+dokumen menyebut sesuatu yang tidak terjadi. Aturan yang dipakai sepanjang
+putaran ini: *kalau klaim dan perilaku berbeda, perbaiki salah satunya, sebutkan
+yang mana, dan kunci dengan tes.*
+
+Basis: `scripts/check.sh` penuh **exit 0** sebelum pekerjaan dimulai (fmt +
+clippy `-D warnings` + 1.419 tes terdaftar, 5 `#[ignore]`).
+
+### Yang diperbaiki, per kelompok
+
+**Kebenaran orkestrasi (`crates/core`).**
+1. Rutin milik bot `Disabled`/terhapus tidak lagi menembak tiap detik; delivery
+   yang sudah ter-park dibuang saat bot di-disable/di-delete.
+2. Task milik bot disabled ditutup `Failed` (bukan `Interrupted`, yang akan
+   di-recover boot recovery; bukan `Cancelled`, yang mengklaim ada yang
+   membatalkan), dan `abandon_task` juga menutup baris `Task` — sebelumnya
+   delivery-nya dibuang tetapi barisnya tetap `Running`.
+3. Waiter approval didaftarkan **sebelum** kartu diterbitkan, jadi jawaban yang
+   cepat tidak bisa membuat tool call menunggu sampai expiry.
+4. `reply_to` disimpan (dan id dari percakapan lain sengaja tidak dicatat).
+5. `max_task_restarts` dan `transcript_mirror` benar-benar dibaca.
+
+**Permukaan yang bisa dicapai (`brain`, `client`, `cli`, `ui`).**
+6. `PATCH /api/nodes/{id}` (label, `approved`, validasi `approved ⊆ declared`
+   dengan 400 yang menyebut namanya, revision CAS lewat `mutate_node`).
+7. `GET …/entries?before_seq=` + `entries_before` di klien + tombol "Load
+   earlier" di UI; **snapshot kini me-merge**, tidak lagi menghapus halaman yang
+   sudah dimuat.
+8. Layar **Rules** di UI dan perintah `swarmbot rules` — aturan "always allow"
+   yang dulu hanya bisa dilihat lewat SQLite.
+9. `swarmbot requests ls|answer` — kartu dari rutin/percakapan lain bisa
+   dijawab di luar REPL.
+10. `GET /api/metrics` + `swarmbot status`; `GET …/export` + `swarmbot
+    transcript --out`; `GET/PUT/DELETE /api/secrets` (nama saja, tulis atomik
+    0600, `applies: "restart"` karena registry backend dibaca sekali saat
+    compose); `POST /api/auth/revoke-sessions` (sebelumnya `revoke_sessions`
+    nol pemanggil).
+11. `skills` bisa diisi dari klien dan diedit di Settings; `enabled`, `node`,
+    `toolsets` bisa di-PATCH lewat `BotPatch` bertipe.
+12. UI: tipe `Fetched<T>` supaya "belum dimuat", "gagal", dan "kosong" tidak lagi
+    tampil sama; tanggal transkrip memakai hari kalender (`time.rs`); palette
+    ikut berubah saat state berubah; empat affordance mati (Search, More
+    unreads, Plugins, profil hardcoded) **dihapus**, bukan disambungkan ke
+    sesuatu yang tidak ada.
+
+**Kapabilitas (`tools`, `llm`, `node-protocol`, `node`).**
+13. `PeerConfig::max_in_flight` — mux tidak lagi men-spawn request tanpa batas;
+    kelebihannya dijawab `PolicyRefused { retry: true }`. Node punya
+    `max_in_flight` di `node.toml` dan `--max-in-flight`, menolak `0`.
+14. `ClaudeCli` sekarang menulis berkas `--mcp-config` **per turn** (0600,
+    dihapus lewat RAII) alih-alih memakai registry statis; alasan menolak turn
+    bila berkasnya tak bisa ditulis.
+15. `rpc.rs` tidak lagi menyebut `fs.download` sebagai tidak diimplementasikan.
+
+### Yang diukur dan ternyata tidak bisa diklaim
+
+* **Usage ACP tidak ada di wire.** `session/prompt` hanya mengembalikan
+  `stopReason`; satu-satunya angka di ACP v1 (`session/update` → `usage_update`)
+  adalah *occupancy* context window + cost kumulatif, bukan token turn. Adapter
+  tetap melaporkan `llm_calls: 1` dan token `0`, dan `0` berarti "tidak
+  dilaporkan". Konsekuensi yang harus dibaca pemilik: **`max_tokens_per_turn`
+  tidak bisa menahan backend ACP.** Dua tes mengunci keputusan untuk tidak
+  memetakan `used` → `input_tokens`.
+* **Rupa piksel UI belum terbukti.** `--selftest` membuka **12 jendela**
+  (sebelumnya 11; satu untuk layar Rules) dan exit 0, `ok=true` — itu bukti
+  render path, bukan tata letak. Tidak ada klik nyata di jendela, dan tidak ada
+  tes UI yang menyentuh jaringan, jadi `GET /api/rules`, `DELETE /api/rules/{id}`
+  dan `entries_before` belum pernah dipanggil dari UI ke brain sungguhan.
+* **`secrets` bukan hot-reload.** `applies: "restart"` adalah fakta, bukan
+  pilihan gaya: `BackendRegistry` me-resolve key sekali saat compose.
+
+### Yang tetap terbuka setelah putaran ini
+
+| Jalur | Kenapa |
+| --- | --- |
+| `fs.download` sebagai tool | separuh brain + separuh node terbukti dengan binary nyata, tetapi masih belum ada tool/route yang memintanya; `StreamHub` juga merakit ke `Vec<u8>` (cap 64 MiB), jadi pemanggil butuh sink berkas |
+| Token cancel turn → MCP | `McpTurnRequest` belum membawa token dan `ToolContext::local` membuat token privat, jadi `shell` yang dijalankan lewat MCP tidak ikut mati saat turn di-Stop |
+| `pty.open`, `fs.upload`, browser/desktop/screen | tetap ditolak dengan tipe yang jujur; membangunnya keputusan produk, bukan kode |
+| Windows | `libc::gethostname`/`killpg` tanpa syarat di `crates/node` |
+| Metrik | 18 field dari store/runners; tidak ada rate/histori (route tidak menyimpannya) dan tidak ada memori/CPU (brain tidak bisa memverifikasinya sendiri) |
+| `secrets` "hot" | butuh registry backend yang bisa di-rebuild di `core`/`llm` |
+
+### Putaran kesepuluh, lanjutan: dua item terakhir Tahap C (D9.36)
+
+Dua hal yang saya tinggalkan di daftar "terbuka" di atas ditutup setelahnya, dan
+keduanya bukan pekerjaan kosmetik:
+
+1. **Token cancel turn tidak sampai ke tool lewat MCP** — ini lubang
+   keselamatan, bukan fitur: `ToolRegistry::run` punya penjaga "turn yang di-Stop
+   tidak boleh bertindak, bahkan sekadar membaca", dan penjaga itu **tidak pernah
+   bisa menyala** di jalur MCP karena `ToolContext::local` memberi token privat
+   yang tidak pernah di-trip. Artinya `session/cancel` menghentikan agen, sementara
+   `shell` kita yang sedang berjalan dan `write_file` yang belum mulai tetap
+   lanjut. Sekarang `McpTurnRequest::cancel` membawa `turn_cancel.child_token()`.
+   Tes: `a_stopped_turns_mcp_call_is_refused_and_never_runs_the_tool` (dua
+   asersi — `read_file` harus kembali sebagai cancellation, dan berkas yang
+   dinamai `write_file` tidak boleh ada). Mutation check: tanpa fix, asersi
+   pertama gagal dengan jawaban tool sendiri ("cannot open …"), yaitu bentuk
+   "ternyata jalan juga".
+2. **`download_file`** — pemanggil yang selama dua putaran tidak ada untuk data
+   stream yang sudah terbukti. Ia memakai method port baru
+   (`NodeExecutor::download`), bukan `NodeCall`, karena payload-nya lewat data
+   stream dan jawabannya adalah klaim `{size, sha256}` yang diperiksa penerima.
+   Berkas mendarat di `<workspace>/.downloads/<name>`; `name` berseparator atau
+   `..` ditolak; gate-nya `Surface::ReadFile` (di mesin jauh ia *membaca*);
+   dan jalur lokal memakai policy serta bentuk hasil yang sama, sehingga bot tidak
+   bisa membedakan transpor dari hasilnya. Terbukti end-to-end di
+   `real_brain.rs` melawan binary node sungguhan.
+
+**Yang jujur belum terbukti di sini:** cabang *digest mismatch* di dalam
+`download_to` tidak punya tes yang benar-benar memicu perbandingan itu — node yang
+jujur selalu mengirim klaim yang cocok, jadi mutasi yang mematikan perbandingan
+tersebut tidak menggugurkan tes end-to-end. Pemeriksaan rakitan-vs-`Done` di
+lapisan bawah tetap terkunci (`streams.rs`), dan perbandingan klaim-vs-payload
+tetap ada sebagai pemeriksaan kedua yang independen.

@@ -1,8 +1,14 @@
 //! Theme tokens: colours, spacing, radii and the type scale.
 //!
-//! Dark-first (the only variant the app ships). The palette is seeded from the
-//! verified spike literals recorded in [`../../../docs/ui.md`] §4 so the colours
-//! a reviewer sees match the ones that were proven to render through llvmpipe.
+//! **One light theme**, which is the only variant the app ships: `BACKGROUND` is
+//! `#ffffff`, `TEXT` is `#111827`, the sidebar surface is `#f7f7f8` at
+//! `SIDEBAR_W = 280`, and the header is `HEADER_H = 56`. This file used to say
+//! "dark-first" while the tokens had already gone light — a header comment that
+//! contradicts the constants below it is the kind of drift a reader trusts and
+//! then gets bitten by, so the comment states the palette the code actually has
+//! and [`../../../docs/ui.md`] §4 records the same values. A dark variant would
+//! be a real change here (a `Theme` value threaded through every view, not a
+//! constant), and nobody has asked for one.
 //!
 //! No vendor art (D0.3): every "avatar" is a colour tile derived from
 //! [`swarmbot_contracts::Bot::effective_color`] plus the bot's initial. Nothing

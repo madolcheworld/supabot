@@ -537,6 +537,16 @@ pub async fn patch(client: &reqwest::Client, url: &str, body: &Value) -> reqwest
         .unwrap_or_else(|err| panic!("PATCH {url} failed in transport: {err}"))
 }
 
+/// PUT a JSON body and decode the answer (`PUT /api/secrets`).
+pub async fn put(client: &reqwest::Client, url: &str, body: &Value) -> reqwest::Response {
+    client
+        .put(url)
+        .json(body)
+        .send()
+        .await
+        .unwrap_or_else(|err| panic!("PUT {url} failed in transport: {err}"))
+}
+
 pub async fn delete(client: &reqwest::Client, url: &str) -> reqwest::Response {
     client
         .delete(url)

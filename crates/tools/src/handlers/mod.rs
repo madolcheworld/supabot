@@ -1,4 +1,4 @@
-//! The seven built-in node tools, and the plumbing they share.
+//! The built-in node tools, and the plumbing they share.
 //!
 //! Every handler follows the same five steps, and the helpers here keep those
 //! steps identical across tools so a fix lands everywhere at once:
@@ -21,6 +21,7 @@
 //! as the handlers: a node daemon and the brain's local node cannot drift
 //! apart in behaviour.
 
+pub mod download_file;
 pub mod edit_file;
 pub mod glob;
 pub mod grep;
@@ -39,6 +40,7 @@ use swarmbot_contracts::{DomainError, NodeId, Surface, ToolError, ToolResult, To
 use crate::handler::{ApprovalAsk, NodeCall, ToolContext, ToolHandler};
 use crate::policy::{Decision, PathPolicy, PolicyEngine, destructive_label};
 
+pub use download_file::DownloadFileHandler;
 pub use edit_file::EditFileHandler;
 pub use glob::GlobHandler;
 pub use grep::GrepHandler;
@@ -56,6 +58,7 @@ pub const TOOL_EDIT_FILE: &str = "edit_file";
 pub const TOOL_LIST_DIR: &str = "list_dir";
 pub const TOOL_GLOB: &str = "glob";
 pub const TOOL_GREP: &str = "grep";
+pub const TOOL_DOWNLOAD_FILE: &str = "download_file";
 
 /// Default line window of `read_file`; matches the paging advice its result
 /// text gives.
@@ -104,10 +107,11 @@ pub fn builtin_handlers(
         Arc::new(ListDirHandler::new(Arc::clone(&env))),
         Arc::new(GlobHandler::new(Arc::clone(&env))),
         Arc::new(GrepHandler::new(Arc::clone(&env))),
+        Arc::new(DownloadFileHandler::new(Arc::clone(&env))),
     ]
 }
 
-/// The specs of the seven built-ins — what a model sees before any gating.
+/// The specs of the built-ins — what a model sees before any gating.
 pub fn builtin_specs() -> Vec<ToolSpec> {
     vec![
         shell::spec(),
@@ -117,6 +121,7 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         list_dir::spec(),
         glob::spec(),
         grep::spec(),
+        download_file::spec(),
     ]
 }
 
@@ -242,6 +247,25 @@ pub(crate) fn target_node(ctx: &ToolContext, args: &Value) -> Result<NodeId, Too
         Some(name) => NodeId::parse(&name)
             .map_err(|error| ToolError::invalid(format!("`node` is not a valid node id: {error}"))),
     }
+}
+
+/// The one result shape a successful transfer reports, local or remote.
+///
+/// Both halves of a download end here so a bot cannot tell — from the *result* —
+/// whether the bytes came off a socket or off the local disk, which is the point:
+/// the tool asks for a file, not for a transport. What the model gets is the
+/// destination path, the size and the digest; the same three facts a remote node
+/// claims in `FsDownloadResult`, which is what lets the brain check the claim
+/// against the bytes that actually arrived.
+///
+/// Public so the brain's dispatcher reports a remote transfer in *this* shape
+/// rather than with a format string of its own: two copies of "what a download
+/// result looks like" would drift, and a bot that can tell the transports apart
+/// from its result would be reading an implementation detail.
+pub fn download_result(dest: &str, size: u64, sha256: &str) -> ToolResult {
+    ToolResult::text(format!(
+        "downloaded {size} bytes to {dest}\nsha256: {sha256}"
+    ))
 }
 
 /// Ask the gate, then forward a remote call. Shared by every handler so the

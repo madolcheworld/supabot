@@ -18,6 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::Value as JsonValue;
 use swarmbot_contracts::bot::normalize_name;
 use swarmbot_contracts::config::{BackendKind, BackendSpec, BrainConfig, Settings, TeamSpec};
+use swarmbot_contracts::error::DomainError;
 use swarmbot_contracts::node::NodeRoot;
 
 /// One line describing the token budget, in the words the rest of the CLI uses.
@@ -45,7 +46,6 @@ pub enum ConfigSource {
     File(PathBuf),
     Defaults,
 }
-
 impl ConfigSource {
     pub fn describe(&self) -> String {
         match self {
@@ -429,6 +429,59 @@ fn merge_json(base: &mut JsonValue, overlay: JsonValue) {
         }
         (slot, value) => *slot = value,
     }
+}
+
+/// The settings keys an owner may name, sorted — the list a refusal prints.
+///
+/// Derived from the serialized type rather than written out by hand, so a field
+/// added to [`Settings`] is a key `config set` accepts (and appears in the
+/// refusal's list) the day it lands. The brain's `PATCH /api/settings` builds its
+/// own list the same way, which is what keeps the two answers identical.
+pub fn settings_keys() -> Vec<String> {
+    let Ok(value) = serde_json::to_value(Settings::default()) else {
+        return Vec::new();
+    };
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = object.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// A **partial** settings object merged over `base`, validated.
+///
+/// The in-process twin of the brain's own `merge_settings`, for the same reason
+/// [`Settings::validate`] is shared by the config file and the API: two copies of
+/// "a budget of zero is not a budget" drift, and the copy that drifts is the one
+/// nobody tests. The rules kept here are the ones the brain applies — an object
+/// body, unknown keys refused by name with the valid list, a value the type
+/// cannot hold refused by the deserializer's own sentence, and the ceiling checks
+/// from [`Settings::validate`].
+pub fn merge_settings(base: &Settings, patch: &JsonValue) -> Result<Settings, DomainError> {
+    let Some(patch) = patch.as_object() else {
+        return Err(DomainError::invalid("settings must be a JSON object"));
+    };
+    let mut merged = serde_json::to_value(base)
+        .map_err(|err| DomainError::internal(format!("cannot read the settings: {err}")))?;
+    let Some(object) = merged.as_object_mut() else {
+        return Err(DomainError::internal(
+            "the settings did not serialize to an object",
+        ));
+    };
+    for (key, value) in patch {
+        if !object.contains_key(key) {
+            return Err(DomainError::invalid(format!(
+                "unknown setting `{key}`; known settings are {}",
+                settings_keys().join(", ")
+            )));
+        }
+        object.insert(key.clone(), value.clone());
+    }
+    let settings: Settings = serde_json::from_value(merged)
+        .map_err(|err| DomainError::invalid(format!("invalid settings: {err}")))?;
+    settings.validate()?;
+    Ok(settings)
 }
 
 /// Secrets from the process environment (only the variables the configured

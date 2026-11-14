@@ -1030,3 +1030,237 @@ what it is holding back.
     stands between the agent and that directory. A bot pointed at a checkout
     with `allow` can change it; that is why `reject` is the default and why
     `agent_cwd` is absent by default.
+
+- **D9.33 Connect is a handshake, and it promises only what a handshake proves.**
+  The Settings screen could *show* backends and run one global **Probe**, so the
+  answer to "opencode has stopped answering — do something about it" was a
+  button that re-checked every configured backend and a card that said "not
+  probed yet". D9.28 is the reason the fix is not simply "make probe the
+  connect": on this machine `claude-code-acp` and `codex-acp` both pass the
+  handshake and both refuse their first `session/prompt` for account reasons, so
+  a green light labelled "connected" would teach the owner to trust a lie. The
+  rule this entry records: **a Connect action may promise exactly what it
+  performed.**
+  * **One backend, not all of them.** `POST /api/backends/{id}/connect` runs
+    the same sequence `probe` does (spawn → `initialize` → `session/new`, no
+    model call) and answers a row in the *same shape*, from one serializer
+    (`routes::backends::status_row`), so the two routes cannot drift into two
+    vocabularies for one fact. The global Probe stays for "check everything".
+  * **The agent's own logins, verbatim.** `BackendStatus` now carries
+    `auth_methods` (ACP `initialize` → `authMethods`, mapped once in
+    `Connection`), `auth_required` (ACP's `-32000`, a missing `api_key_env` key,
+    or an HTTP 401/403 — a code, never a phrase from a message), and
+    `login_command` (`options.login_command`, the owner's own instruction text).
+    The UI renders the methods as buttons and never invents one: an id nobody
+    advertised is *reported*, not sent.
+  * **A login that cannot be performed is reported as that.** `authenticate`
+    is sent only for an advertised id, its failure keeps the agent's own words
+    (`claude-code-acp` answers `Method not implemented.`), and the method stays
+    offered because it is still what the agent says it needs. Nothing marks the
+    backend connected on that path.
+  * **The adapter does not run an interactive login, and does not claim it
+    can.** `options.login_command` and the agent's `_meta["terminal-auth"]` are
+    data for a Copy button; ACP's `terminal-auth` client capability is
+    deliberately *not* declared, because this build never opens a terminal. The
+    shown limit is D9.28's, printed by the card itself: a green handshake on an
+    agent that advertises a login carries one dim line naming that login — the
+    fact ("this agent also offers a login") plus the condition ("if a turn is
+    refused with an authentication error, run it and press Re-check"), never a
+    prediction. Measured on both shapes before the wording was chosen:
+    `opencode` advertises `opencode-login` and answers turns, while
+    `claude-code-acp` advertises `claude-login` and refuses `session/prompt`;
+    the handshake data cannot tell them apart, so an amber "may still be refused"
+    would have been an alarm on the healthy default backend.
+  * **One handshake per backend.** The row's Connect and its login buttons share
+    one in-flight mark (`AppState::connecting`, keyed by backend id), so a
+    double click cannot spawn two agents, and the mark is cleared by the answer
+    — including a transport failure, which would otherwise spin forever.
+  * **Success is what refetches the model menu.** The worker folds the follow-up
+    `GET /api/backends/{id}/models` into the Connect result on `ok`, so picking
+    a provider and pressing Connect fills its model column without a second
+    click (and without a view sending commands from `render`).
+  **Verified against the real agent on this machine (2026-11-14), not only the
+  scripted one:** `POST /api/backends/opencode/connect` with an empty body
+  answers `ok: true`, `auth_methods: [{id: "opencode-login", name: "Login with
+  opencode", description: "Run \`opencode auth login\` in the terminal"}]`, no
+  `command` (this agent names no `_meta["terminal-auth"]`), `login_command:
+  null`, `auth_required: false`; asking for `claude-login` is refused with
+  `advertises no auth method \`claude-login\` (it advertised: opencode-login)` and
+  **no** `authenticate` on the wire; asking for `opencode-login` really logs in
+  (`detail: "authenticated via \`opencode-login\`; …"`, `ok: true`), and the
+  follow-up `GET /api/backends/opencode/models` then answers its list. So the
+  three branches are proven live, not just in the scripted agent.
+  Tests: five in `crates/llm/tests/acp.rs` (`LoginRequired`, `AuthNotImplemented`
+  and `TerminalAuthMeta` scripted agents — probe reports the login, a plain
+  connect sends no `authenticate`, a chosen one does and then passes, an
+  unimplemented one is reported verbatim, an unadvertised id is never sent), the
+  `login_command` parse/serialize test, `a_backend_without_auth_surface_probes_on_connect_and_refuses_a_login`,
+  `connect_one_backend_is_a_handshake_in_the_probe_shape` +
+  `connect_posts_the_chosen_method_and_decodes_the_login_it_needs` (brain and
+  client, with a 502 and a 401 path),
+  `connection_state_never_promotes_a_login_refusal_to_connected`,
+  `a_green_handshake_with_an_advertised_login_states_its_limit`, and two reducer
+  tests for the upsert/refetch/clear-the-spinner behaviour.
+
+- **D9.34 "No GPU" is an environment fact with a one-command fix, not a panic —
+  and the check must be stronger than `test -e`.** `--selftest` is the only
+  machine-checkable proof that a window opens and paints, so a session where it
+  panics is a session that cannot verify the UI at all. In a sandbox whose `/dev`
+  holds only `null`/`zero`/`tty`, GPUI's own init panicked with
+  `Unable to init GPU context: NoSupportedDeviceFound` — a sentence about a GPU
+  context, which reads like a bug in this app rather than a missing driver. Three
+  pieces, and the third is why the first two are not enough on their own:
+  * **`crates/ui/src/gpu.rs` decides before GPUI does**, from three inputs:
+    a configured `VK_ICD_FILENAMES`/`VK_DRIVER_FILES` (the caller chose — trust
+    it), a **real** render node, or a *software* ICD the loader scans by itself.
+    The device probe is the part that had to be written twice: the first version
+    tested `Path::exists("/dev/dri")`, and an empty bind-mounted directory
+    satisfies that, so it would have declared a driver present and let the panic
+    happen anyway. It now lists the directory for a `renderD*`/`card*` entry and
+    requires `/dev/nvidia0` to be non-empty or a character device. `decide` is a
+    pure function over three booleans with a test per state.
+  * **The refusal is a sentence and exit 2**, not a stack trace: `vulkan/driver:
+    no Vulkan driver is reachable` is printed before anything else, then the
+    command that fixes it. 2 rather than 1 because "this machine cannot open a
+    window" is not "the app failed", and nothing else in `run()` is disabled by a
+    missing driver.
+  * **The fix is in the tree**: `scripts/software-vulkan.sh` resolves the distro
+    package with `pacman -Sp`, downloads it with `curl`, extracts it with
+    `bsdtar` into `.tmp-ui-gpu/` (gitignored), and writes an ICD naming the
+    library by **absolute** path — Arch's own `lvp_icd.json` names a bare soname,
+    which would force `LD_LIBRARY_PATH` on every process in the shell.
+    `scripts/env.sh` then exports `VK_ICD_FILENAMES` to it, *last* in its chain,
+    so hardware still wins where hardware exists.
+  Verified on 2026-11-14 in a `unshare --map-root-user --mount` namespace whose
+  `/dev/dri` and `/usr/share/vulkan/icd.d` were empty bind mounts and whose
+  `/dev/nvidia0` was a zero-length file: (A) nothing exported → the sentence,
+  `exit: renders=0 … ok=false`, **exit code 2**; (B) after
+  `scripts/software-vulkan.sh && source scripts/env.sh` in that same namespace →
+  `vulkan/renderer: icd=…/.tmp-ui-gpu/lvp_local.json`, **11 windows**, exit 0
+  (lavapipe, the CPU renderer). The hardware path was re-run in the normal
+  session and still reports `icd=/usr/share/vulkan/icd.d/nvidia_icd.json` with 11
+  windows, so the fallback sits behind the real driver. The staged ICD is
+  deliberately **not** counted by `software_present()`: the loader never scans
+  inside a checkout, so its presence proves nothing until `env.sh` exports it —
+  counting the file would have re-created the very panic this entry removes.
+  What is still not proven: the pixels. These runs prove a window opened and the
+  root view rendered; nobody has looked at an unlocked screen.
+
+- **D9.35 The honesty pass: a bug is a lie the code tells, and each one gets the
+  test that reproduces it.** Round two of the review (`review.md` §17) found no
+  broken build and no missing milestone — it found places where the tree
+  *claimed* something and did not do it. The rule this entry records: **when the
+  claim and the behaviour disagree, fix one of them, name which, and pin it.**
+  * **A routine kept feeding a bot that could not be woken.** `fire_due` never
+    looked at the bot's status, so a disabled (or deleted) bot's routine still
+    created a `Delivery` and a `RoutineRun` every tick, and `RunnerMap::deliver`
+    parked the delivery for a runner that would never exist. `wait_for_idle`
+    believes `parked_count() == 0` on purpose, so `swarmbot run --wait` could
+    never report a quiet team again — and for a deleted bot that was permanent.
+    Fixed at both ends: `fire_due` skips a bot that is gone or `Disabled`, and
+    `set_enabled(false)`/`delete` abandon what was already parked for it
+    (`RunnerMap::drop_parked`). A queued **task** had the same hole
+    (`pump` never checked `BotStatus::Disabled`), and a task whose bot was
+    disabled stayed `Running` forever; it is now closed as `Failed` with a
+    reason naming the bot, because `Interrupted` means "cut off by a restart"
+    and boot recovery would try to revive it, while `Cancelled` would claim
+    somebody cancelled it on purpose.
+  * **An approval could be granted and still time out.** `ask` published the
+    card and only then registered its waiter, so a `respond` landing in that
+    window found nobody: the answer was delivered as a queued message *and* the
+    tool call parked until `approval_expiry_secs` (600 s by default) before
+    reading the row and agreeing. The waiter is now registered before the card
+    exists, `publish_card` re-reads the row so a fresh answer is not overwritten
+    with a stale `Pending`, and a card that cannot be published leaves no waiter.
+    Tested through a `#[cfg(test)]` hook that runs *after* registration, so the
+    race is reproduced deterministically instead of hoped away with a sleep.
+  * **`reply_to` was routed on and then thrown away.** The route accepted it and
+    the orchestrator used it to choose a target, and the written entry said
+    `reply_to: None` — so a transcript could never show what a message answered.
+    It is stored now, and an id from another conversation is deliberately *not*
+    recorded (that is a cross-conversation reference, not a reply).
+  * **Two settings had no readers and a screen that showed them.**
+    `max_task_restarts` was accepted, validated and displayed while the restart
+    decision used the built-in constant; `transcript_mirror` was read only by
+    the UI. Both are wired (`Task::can_restart_with`, a conditional mirror), and
+    `can_restart()` survives only for callers with no settings in hand.
+  * **A long-lived UI lost history two ways.** `SNAPSHOT_ENTRIES = 100` with no
+    way to page backwards, and a snapshot used to `clear()` the transcript, so
+    every resync deleted the pages the owner had already loaded. The store grew
+    `entries_before` (exclusive bound, newest page, ascending — pinned in the
+    shared contract suite for both stores), the brain answers `before_seq`, the
+    client pages, and the reducer **merges** a snapshot by `EntryId` instead of
+    replacing the list.
+  * **"Today" was a constant.** Every transcript date said `Today %-I:%M %p`, so
+    restored history from yesterday was labelled today. `ui/src/time.rs` formats
+    against the viewer's calendar day with the clock injected, and a bot's
+    message group also breaks at midnight — otherwise a 00:01 message is filed
+    under yesterday's label.
+  * **A light theme documented as dark, in two places.** `docs/ui.md` §4 listed
+    the original spike's dark palette and `theme.rs`'s own header said
+    "dark-first (the only variant the app ships)" while every token was light.
+    The code was right and the prose was wrong, so the prose was corrected; the
+    token values did not move. Same rule as `rpc.rs`'s subset list, which still
+    described `fs.download` as unimplemented after the wire had started serving
+    it (the reference table in `node-protocol.md` §9 was already correct — the
+    code comment was the stale half).
+  * **`capabilities` that no surface could reach.** Approval rules, pending
+    cards outside an interactive chat, node scope, secrets, metrics, transcript
+    export and a bot's skills were all supported by `core` and reachable by curl
+    and nothing else. This round gives each a route, a client method and a front
+    end, and the ones that are genuinely limited say so: secrets report
+    `applies: "restart"` because the backend registry resolves its keys once at
+    compose, and no route ever answers `"hot"` until that changes.
+  **Verified, and not:** the whole gate is fmt + clippy `-D warnings` + tests,
+  green; the pixel question is still open (`--selftest` opens 12 windows with
+  the new Rules screen, exit 0 — a render path, not a layout judgement), no real
+  window was clicked, and no UI test touches the network.
+
+- **D9.36 A stopped turn must not act through MCP either, and a transport with no
+  caller is not a feature.** Round three of the review left two items in the
+  capability layer that were *built and unreachable*, and one that was reachable
+  and wrong. Both are closed here, and the shape of each is worth remembering.
+  * **The turn's cancellation token now reaches the MCP server, and that is a
+    safety fix rather than tidying.** `core` built the per-turn MCP registration
+    without a token and `brain::state` built its `ToolContext` with
+    `ToolContext::local`, which mints a private `CancellationToken` nobody ever
+    trips. The registry's own guard — "a stopped turn must not act, not even just
+    read" — therefore could never fire on the MCP path, which is the path every
+    ACP bot's tools take: the agent's `session/cancel` stopped the agent, and a
+    `shell` our handler was already running (or a `write_file` it had not started)
+    kept going. `McpTurnRequest::cancel` carries `turn_cancel.child_token()` and
+    the context is built with `with_cancel`. `a_stopped_turns_mcp_call_is_refused_and_never_runs_the_tool`
+    pins it: the turn is cancelled first, `read_file` must come back as a
+    cancellation error, and the file `write_file` named must not exist. Without
+    the fix the *first* of those fails with the tool's own answer — "cannot open
+    …: No such file or directory" — which is exactly the "it ran anyway" shape
+    the test exists to catch.
+  * **`download_file` is the caller the data stream never had.** D9.21 built the
+    transfer and `node-protocol.md` §13 said in two consecutive rounds that
+    nothing asked for one, so a proven transport had no user surface. The tool
+    calls a new port method (`NodeExecutor::download`) rather than a `NodeCall`,
+    because the payload travels on a data stream and its answer is the
+    `{size, sha256}` claim the receiver checks — expressing that as a `NodeCall`
+    would need base64 inside a string (which this protocol refuses) or a
+    `ToolResult` holding a file. Three decisions fall out of it and each is
+    stated in the code: it lands in `<workspace>/.downloads/<name>` and refuses a
+    `name` with a separator or `..` (so it never becomes a remote-*write*
+    surface); it is gated on `Surface::ReadFile` because on the far machine it
+    *reads*, and the destination needs no second card because this tool chose it
+    inside a workspace the owner already granted; and local is not a special case
+    with different semantics — `LocalExecutor::download` copies through the same
+    policy and reports the same `{bytes, sha256}` shape, so a bot cannot tell from
+    its result which transport carried the file. The port's default impl is a
+    typed `PolicyRefused { retry: false }` naming the missing data-stream support,
+    so a double or a future transport says "I cannot" instead of pretending.
+    Proven end to end in `crates/node/tests/real_brain.rs` against the **real**
+    `swarmbot-node` binary: the file on the brain's disk is the node's file byte
+    for byte, a decoy with the same name on the brain's side is not what lands,
+    and no `.part` file is left behind.
+  **Not claimed:** the digest-mismatch branch inside `download_to` has no test
+  that exercises *that* comparison — the assembled-bytes-vs-`Done`-digest check
+  one layer down is pinned (`streams.rs`), and a mutation that disables the
+  claim-vs-payload comparison does not fail the end-to-end test because an honest
+  node's claim always matches. A node that lies, or a link that corrupts a frame,
+  is caught by the assembler before the comparison is reached; the comparison
+  stays as the second, independent check the module documents.

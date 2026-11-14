@@ -4,11 +4,13 @@
 //! Subset policy (documented deviations from the OpenBot table in §5):
 //!
 //! * a node serves `node.hello`, `fs.read/write/edit/stat/list/glob/grep/
-//!   mkdir/move/remove` and the streaming `shell.exec`;
+//!   mkdir/move/remove`, `fs.download` (its bytes travel over a **data
+//!   stream**, not this socket — the RPC names the grant, §8) and the
+//!   streaming `shell.exec`;
 //! * a brain serves `node.requestApproval`, `node.event`, `node.heartbeat`;
 //! * everything else in the reference table (`pty.*`, `tunnel.*`,
-//!   `browser.*`, `desktop.*`, `computer.*`, `screen.*`, `fs.download`,
-//!   `fs.upload`, `service.*`, `forward.listen`, `lease.set`,
+//!   `browser.*`, `desktop.*`, `computer.*`, `screen.*`, `fs.upload`,
+//!   `service.*`, `forward.listen`, `lease.set`,
 //!   `node.openStream`) answers with a typed
 //!   `PolicyRefused { retry: false, reason: "not implemented by this node" }`
 //!   via [`unimplemented`]. Honesty over silence: a caller must be able to

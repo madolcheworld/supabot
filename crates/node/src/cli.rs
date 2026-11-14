@@ -125,6 +125,15 @@ pub struct RunOptions {
     #[arg(long, value_name = "N")]
     pub heartbeat_secs: Option<u64>,
 
+    /// How many inbound requests this node serves at once [default: 16].
+    ///
+    /// A backstop against a brain that pipelines more work than this machine
+    /// should run: requests beyond the cap are answered
+    /// `PolicyRefused { retry: true }`, not queued. It is the *node's* number —
+    /// like a ceiling, the brain cannot raise it.
+    #[arg(long, value_name = "N")]
+    pub max_in_flight: Option<usize>,
+
     /// Back off this long before the first redial, in milliseconds. Hidden: it
     /// exists so a test can compress the documented 250 ms…30 s curve, not so
     /// an operator can make a reconnect storm.
@@ -200,6 +209,14 @@ pub fn resolve_config(
     }
     if let Some(secs) = options.heartbeat_secs {
         resolved.heartbeat_secs = secs.max(1);
+    }
+    if let Some(cap) = options.max_in_flight {
+        if cap == 0 {
+            return Err(NodeError::Config(
+                "--max-in-flight must be at least 1 (0 would refuse every request)".to_string(),
+            ));
+        }
+        resolved.max_in_flight = cap;
     }
     if options.no_shell {
         // One-way on purpose: the file cannot re-enable what this run withdrew,
@@ -548,7 +565,7 @@ async fn wait_for_signal(terminate: &mut Option<tokio::signal::unix::Signal>) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use base64::Engine as _;
     use clap::CommandFactory as _;
@@ -556,6 +573,12 @@ mod tests {
 
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("parses")
+    }
+
+    /// The empty `RunOptions` the config tests also need, so the flag-and-file
+    /// precedence is asserted from both crates' tests without a second copy.
+    pub(crate) fn tests_support_run_options() -> RunOptions {
+        run_options()
     }
 
     fn run_options() -> RunOptions {
@@ -568,6 +591,7 @@ mod tests {
             label: None,
             no_shell: false,
             heartbeat_secs: None,
+            max_in_flight: None,
             redial_initial_ms: None,
         }
     }

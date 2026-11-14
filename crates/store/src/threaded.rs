@@ -657,6 +657,16 @@ impl EntryRepo for ThreadedStore {
         self.read(move |store| store.entry_tail(&conversation, limit))
     }
 
+    fn entries_before(
+        &self,
+        conversation: &ConversationId,
+        before_seq: Seq,
+        limit: u32,
+    ) -> Result<Vec<Entry>, DomainError> {
+        let conversation = conversation.clone();
+        self.read(move |store| store.entries_before(&conversation, before_seq, limit))
+    }
+
     fn delete_entries(&self, conversation: &ConversationId) -> Result<u64, DomainError> {
         let conversation = conversation.clone();
         self.write(move |store| store.delete_entries(&conversation))

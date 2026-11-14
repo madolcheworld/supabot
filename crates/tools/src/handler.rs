@@ -81,6 +81,12 @@ impl ToolContext {
     }
 
     /// Share one cancellation token, e.g. the token of the whole turn.
+    ///
+    /// This is the *only* field a builder here replaces: everything else
+    /// (workspace, node, services, spool) belongs to the call and stays put.
+    /// The token matters because `ToolContext::local` mints a private one that
+    /// nobody ever trips; a caller that owns the turn's token must hand it in,
+    /// or Stop stops the turn while a tool keeps running.
     pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = cancel;
         self
@@ -177,6 +183,34 @@ pub trait NodeExecutor: Send + Sync {
         invocation: &Invocation,
         call: NodeCall,
     ) -> Result<ToolResult, ToolError>;
+
+    /// Copy one file *from* `node` to `dest` on this machine.
+    ///
+    /// Separate from [`exec`](Self::exec) on purpose: a download is not a
+    /// `NodeCall`, because its payload travels on a **data stream** and its
+    /// answer is a `{size, sha256}` claim the receiver checks against the bytes
+    /// that actually arrived (`node-protocol.md` §8). Expressing it as a
+    /// `NodeCall` would have meant either base64 inside a JSON string — which
+    /// this protocol refuses for good reason — or a fake `ToolResult` holding a
+    /// file.
+    ///
+    /// The default is a **typed refusal**, not a silent no-op: an executor that
+    /// has no stream support (a test double, a future foreign transport) says so
+    /// and names what is missing, and `retry: false` because waiting will not
+    /// add the capability.
+    async fn download(
+        &self,
+        _node: &NodeId,
+        _invocation: &Invocation,
+        _path: &str,
+        _dest: &std::path::Path,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::PolicyRefused {
+            reason: "this executor cannot transfer files: it has no data-stream support, so a                      download cannot be expressed (see the node protocol's §8)"
+                .to_string(),
+            retry: false,
+        })
+    }
 }
 
 /// A node RPC, as data, so the same type can cross a socket later.
@@ -431,5 +465,88 @@ mod tests {
         let text = call.describe();
         assert!(text.contains("secrets.env"));
         assert!(!text.contains("hunter2"), "{text}");
+    }
+
+    /// `with_cancel` is the seam that makes a tool call die with its turn:
+    /// `ToolContext::local` mints a private token nobody ever trips, so a
+    /// caller that owns the turn's token has to hand it in. This test pins
+    /// both halves of that promise — the builder changes *only* the token, and
+    /// the handler observes the very token the caller holds (tripping the
+    /// caller's handle cancels the handler's clone, which a fresh token could
+    /// not do).
+    #[tokio::test]
+    async fn with_cancel_hands_the_turn_token_to_the_handler() {
+        use std::sync::Mutex;
+
+        use swarmbot_contracts::{BotId, ConversationId, ToolSpec, Toolset};
+
+        use crate::handlers::testkit::{TestGate, TestNodes};
+
+        struct CancelProbe {
+            seen: Mutex<Option<CancellationToken>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ToolHandler for CancelProbe {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec::new(
+                    "cancel_probe",
+                    "records the cancellation token it was given",
+                    serde_json::json!({"type": "object"}),
+                    Toolset::Node,
+                )
+            }
+
+            async fn call(
+                &self,
+                ctx: &ToolContext,
+                _args: serde_json::Value,
+            ) -> Result<ToolResult, ToolError> {
+                *self.seen.lock().expect("test mutex") = Some(ctx.cancel.clone());
+                Ok(ToolResult::text("ok"))
+            }
+        }
+
+        let invocation = Invocation::new(
+            BotId::from_suffix(&"1".repeat(32)),
+            ConversationId::from_suffix(&"2".repeat(32)),
+        );
+        let turn = CancellationToken::new();
+        let ctx = ToolContext::local(
+            invocation.clone(),
+            PathBuf::from("/nonexistent/workspace"),
+            TestGate::allowing() as Arc<dyn ApprovalGate>,
+            TestNodes::new() as Arc<dyn NodeExecutor>,
+            PathBuf::from("/nonexistent/spool"),
+        )
+        .with_cancel(turn.clone());
+
+        // A pure builder: everything but the token is untouched.
+        assert_eq!(ctx.node_id, NodeId::local());
+        assert_eq!(ctx.invocation, invocation);
+        assert_eq!(ctx.workspace, PathBuf::from("/nonexistent/workspace"));
+        assert_eq!(ctx.spool_dir, PathBuf::from("/nonexistent/spool"));
+
+        let probe = CancelProbe {
+            seen: Mutex::new(None),
+        };
+        probe
+            .call(&ctx, serde_json::json!({}))
+            .await
+            .expect("the probe handler runs");
+        let seen = probe
+            .seen
+            .lock()
+            .expect("test mutex")
+            .clone()
+            .expect("the handler was given a token");
+        assert!(!seen.is_cancelled(), "the turn is still running");
+
+        // The caller's handle and the handler's clone are one token.
+        turn.cancel();
+        assert!(
+            seen.is_cancelled(),
+            "the handler must see the turn's cancellation, not a private token"
+        );
     }
 }

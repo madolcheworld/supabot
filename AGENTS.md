@@ -38,8 +38,10 @@ and pins `VK_ICD_FILENAMES` to llvmpipe **when that ICD exists**. Without it a
 (`/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-modeset`, `/dev/nvidia-uvm`,
 `/dev/dri/card1`, `/dev/dri/renderD128`; `nvidia-smi` reports a GTX 1660 SUPER on
 driver 615.78.08) and `nvidia_icd.json` is the ICD in use. `swarmbot-ui
---selftest` therefore opens **11 windows** and exits 0 — the window count is
-deterministic and is the number to assert on. The **total render count is not**:
+--selftest` therefore opens **12 windows** and exits 0 — the window count is
+deterministic and is the number to assert on. (It was 11 until the
+approval-rules screen was added on 2026-11-15; a new screen means a new window,
+so the number is only meaningful against a named build.) The **total render count is not**:
 it was 22, 54, 55, 57 and 58 across five runs of the same binary, because it
 counts frames and frames depend on timing. Quote the window count, or say
 "renders"; do not quote a render total as if it were a fact. The
@@ -48,6 +50,38 @@ panic") described that day, not this one — do not resurrect it without running
 `./target/debug/swarmbot-ui --selftest` first. `scripts/env.sh` still prefers
 llvmpipe **when that ICD exists** and still says so on stderr when no ICD is
 found; that fallback is for headless boxes, not a claim about this one.
+
+**A session can also see no GPU at all, and that is a different environment, not a
+bug.** In a sandbox whose `/dev` holds only `null`/`zero`/`tty` (no render node, no
+usable `/dev/nvidia0`, no system llvmpipe), GPUI's own init panics with `Unable to
+init GPU context: NoSupportedDeviceFound`, which reads like a broken app. The check
+that looks right and is not: `test -e /dev/dri` is **yes** for an empty
+bind-mounted directory, so `crates/ui/src/gpu.rs` lists the directory for a
+`renderD*`/`card*` node instead. Two things now
+prevent that: `scripts/software-vulkan.sh` stages Mesa lavapipe **inside the
+checkout** (`.tmp-ui-gpu/`, gitignored) using `pacman -Sp` + `curl` + `bsdtar`, with
+no root and no system change, and `scripts/env.sh` exports `VK_ICD_FILENAMES` to it
+when no device is reachable; and `crates/ui/src/gpu.rs` checks *before* GPUI does —
+`vulkan/driver: no Vulkan driver is reachable` plus the one command that fixes it,
+exit code **2** instead of a panic. Proven on 2026-11-14 in a
+`unshare --map-root-user --mount` namespace with an empty `/dev/dri`, an empty
+`/usr/share/vulkan/icd.d` and a zero-length `/dev/nvidia0`: nothing exported → the
+`no Vulkan driver` line and exit 2; then `source scripts/env.sh` → the staged ICD,
+`--selftest` opened **11 windows**, exit 0. The hardware path was re-run for the
+same commit and still reports `icd=/usr/share/vulkan/icd.d/nvidia_icd.json` with 11
+windows, so the fallback sits behind the real driver, not in front of it. D9.34.
+
+**And on 2026-11-15 the same box lost and regained the GPU within one session,
+which is why a GPU claim needs a timestamp.** At ~01:41 `/dev/nvidia0` was absent,
+`/dev/dri` was absent and `nvidia-smi` could not reach the driver; `scripts/env.sh`
+exported the staged lavapipe ICD and `--selftest` opened **12 windows**, `ok=true`,
+exit 0, at `icd=…/.tmp-ui-gpu/lvp_local.json`. At ~01:52 the same commands found
+`/dev/nvidia0` and `/dev/dri/card1` again, `nvidia-smi` reported the GTX 1660 SUPER,
+and `--selftest` opened the same **12 windows**, `ok=true`, at
+`icd=/usr/share/vulkan/icd.d/nvidia_icd.json`. Two lessons, both already earned
+elsewhere in this file: the D9.34 fallback works in a real headless session and
+not only in a mount namespace, and **"the GPU is missing" describes an instant,
+not a machine** — re-run the selftest before repeating either claim.
 
 What is *still* not proven is the pixels: `--selftest` proves a window opened and
 the root view rendered, not that anything looked right. On 2026-11-14 the desktop
@@ -173,7 +207,7 @@ rewrite history unless the owner asks.
 | --- | --- | --- |
 | `contracts` | every domain type, the repository ports, the live-event shapes | `src/lib.rs` (module map), `src/repo.rs` (the ports) |
 | `llm` | `LlmBackend` + adapters (OpenAI-compatible, **ACP agents** — opencode/Claude Code/Codex over the Agent Client Protocol, Fake, Claude CLI skeleton), `BackendRegistry` | `src/backend.rs`, `src/openai.rs`, `src/acp/mod.rs` |
-| `tools` | `ToolRegistry`, the seven handlers, `PathPolicy`, `PolicyEngine`, `AuditLog`, `LocalExecutor` | `src/lib.rs`, `src/handler.rs` (the ports) |
+| `tools` | `ToolRegistry`, the eight handlers (incl. `download_file`), `PathPolicy`, `PolicyEngine`, `AuditLog`, `LocalExecutor` | `src/lib.rs`, `src/handler.rs` (the ports) |
 | `store` | `SqliteStore`, `MemoryStore`, `JsonlMirror`, the shared contract suite, backup/restore, and `AsyncStore` (the async facade) | `src/lib.rs`, `src/contract.rs`, `src/async_store.rs` |
 | `core` | runners, orchestrator, routing, messaging, tasks, approvals, transcript, live hub, instructions, composition | `src/lib.rs`, `src/runners.rs`, `src/swarm.rs` |
 | `client` | the blocking REST + live-WS client shared by CLI and UI | `src/lib.rs` |
@@ -301,6 +335,16 @@ them.
   and check first for a source rewrite or a stray process holding a port, because
   "the test hung" and "the thing it talks to was changing underneath it" look
   identical from a `futex_wait`.
+  **It happened a second time, 2026-11-14, in a different test** —
+  `repl::tests::an_approval_answered_from_the_input_path_settles_the_card`, parked
+  in `__futex_wait` at 0 % CPU for over ten minutes during a full gate. Followed to
+  the letter: the gate was stopped, the process state checked (6 threads, one in
+  `futex_wait`, 1.24 s of CPU total — parked, not spinning), the focused run passed
+  in **0.02 s**, the whole `swarmbot` test binary passed in **2.33 s**, and an
+  immediate clean gate passed **1.414/0**. Two differences in the stuck run are
+  plausible and unproven: the gate runs every test binary concurrently, and another
+  agent's `swarmbot-brain` was holding port 8796 for the whole window. Still
+  unexplained; the entry stays open rather than being renamed a flake.
 * **A green `probe` is not a working turn, and the difference cost a day.**
   `probe` is spawn + `initialize` + `session/new`, so on 2026-11-14 all three ACP
   agents on this box reported `ok: true` while only **opencode** could answer a
@@ -364,8 +408,8 @@ them.
 ## State of the tree
 
 Check before you assume — it moves while people work. **All twelve crates are
-built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.396
-passed, 0 failed, 5 ignored** — three live tests (two behind `PROTO_LIVE_LLM`, one
+built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.547
+registered, 1.542 passed, 0 failed, 5 ignored** — three live tests (two behind `PROTO_LIVE_LLM`, one
 behind `PROTO_LIVE_ACP`) and two doctests in `store/src/threaded.rs` marked
 `ignore` because a doctest has no runtime to await on): `contracts`,
 `store`, `llm`, `tools`, `core`, `client`, `node-protocol`, `brain`, `cli`, `node`,

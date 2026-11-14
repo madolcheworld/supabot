@@ -13,7 +13,7 @@ use swarmbot_contracts::{
 };
 
 use crate::proto::Command;
-use crate::state::AppState;
+use crate::state::{AppState, Fetched};
 use crate::theme;
 use crate::widgets::bits::{self, Tone};
 use crate::widgets::text_input::TextInput;
@@ -318,36 +318,125 @@ fn creator_section(
 }
 
 fn routines_list(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::Div {
-    if s.routines.is_empty() {
-        return div()
-            .w_full()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(theme::BORDER))
-            .bg(rgb(theme::SURFACE))
-            .p_6()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .child(
-                div()
-                    .text_base()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(theme::TEXT))
-                    .child("No routines scheduled"),
-            )
-            .child(div().text_sm().text_color(rgb(theme::TEXT_MUTED)).child(
-                "Routines run prompt deliveries on an interval, one-time, or cron schedule.",
-            ));
-    }
+    // An empty routine list is only ever reported when a fetch said so. While it
+    // is unknown or failed, the screen says that instead — "No routines
+    // scheduled" is a statement about the brain, and this screen has not read it.
+    let routines = match &s.routines {
+        Fetched::Unknown => return unknown_routines(s, commands),
+        Fetched::Failed(reason) => return failed_routines(reason, commands),
+        Fetched::Ready(routines) if routines.is_empty() => return no_routines(),
+        Fetched::Ready(routines) => routines,
+    };
 
     let mut list = div().flex().flex_col().gap_3();
-    for routine in &s.routines {
+    for routine in routines {
         list = list.child(routine_card(routine, s, state, commands));
     }
     list
+}
+
+/// The list has not been read. No claim is made about what it holds; the action
+/// that would settle it is right there, and the connection's own label says
+/// whether asking is even possible right now.
+fn unknown_routines(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
+    let cmds = commands.clone();
+    routine_notice_box()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(theme::TEXT))
+                .child("The routine list has not been read yet."),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_DIM))
+                .child(format!("connection: {}", s.conn.label())),
+        )
+        .child(
+            div().child(
+                bits::button("Load routines", Tone::Ghost)
+                    .id("load-routines")
+                    .on_click(move |_, _, _: &mut App| {
+                        let _ = cmds.send(Command::FetchRoutines);
+                    }),
+            ),
+        )
+}
+
+/// The fetch failed: the reason verbatim (which is the only thing that can be
+/// acted on) and a retry — never "No routines scheduled", which would blame the
+/// owner's schedule for a broken request.
+fn failed_routines(reason: &str, commands: &Sender<Command>) -> gpui::Div {
+    let cmds = commands.clone();
+    routine_notice_box()
+        .bg(rgb(theme::NOTICE_ERROR_BG))
+        .border_color(rgb(theme::NOTICE_ERROR_BORDER))
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(theme::NOTICE_ERROR_FG))
+                .child("Could not load the routines"),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::NOTICE_ERROR_FG))
+                .child(reason.to_string()),
+        )
+        .child(
+            div().child(
+                bits::button("Retry", Tone::Ghost)
+                    .id("retry-routines")
+                    .on_click(move |_, _, _: &mut App| {
+                        let _ = cmds.send(Command::FetchRoutines);
+                    }),
+            ),
+        )
+}
+
+/// The empty state, and it is only reachable from a `Ready(empty)` list.
+fn no_routines() -> gpui::Div {
+    div()
+        .w_full()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb(theme::SURFACE))
+        .p_6()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .child(
+            div()
+                .text_base()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(theme::TEXT))
+                .child("No routines scheduled"),
+        )
+        .child(
+            div().text_sm().text_color(rgb(theme::TEXT_MUTED)).child(
+                "Routines run prompt deliveries on an interval, one-time, or cron schedule.",
+            ),
+        )
+}
+
+/// The shared frame of the two "no answer" boxes, so they cannot drift apart.
+fn routine_notice_box() -> gpui::Div {
+    div()
+        .w_full()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb(theme::SURFACE))
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
 }
 
 fn routine_card(

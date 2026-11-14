@@ -118,6 +118,46 @@
 //! pinned to the new one, which is what makes "gonta-ganti model" actually
 //! true for opencode. With `model_env` configured the menu's list is
 //! authoritative again and the warning disappears.
+//!
+//! # Usage: `llm_calls` is real, token counts are not on the wire
+//!
+//! A completed turn reports `Usage { llm_calls: 1, .. }` with **zero tokens**.
+//! That is the honest reading of the protocol this adapter speaks, not an
+//! unfinished field: `session/prompt`'s result carries only `stopReason`
+//! (`proto::PromptResult`), and the one ACP v1 shape with numbers —
+//! `session/update` → `usage_update` — reports *context occupancy*
+//! (`used`/`size`) and cumulative cost, not the turn's input/output tokens.
+//! Both facts, and why neither is guessed, are stated in `proto`'s module docs.
+//! The zeros make an ACP turn look free, exactly as `FakeBackend`'s do, and
+//! `UsageReport`'s own doc already says zeros mean "nothing was reported"
+//! rather than "nothing was spent".
+//!
+//! # Connecting is a handshake — and a handshake is not a turn
+//!
+//! `probe` and `connect` run the same sequence (spawn → `initialize` →
+//! `session/new`), so neither spends a model call. `connect` adds one thing:
+//! when the caller names a login the agent itself advertised
+//! (`BackendStatus::auth_methods`), it sends ACP's `authenticate` first. Three
+//! limits are deliberate and stated rather than smoothed over:
+//!
+//! * **the adapter never picks a login.** An id nobody advertised is reported,
+//!   not attempted: guessing another program's auth API is how a "Connect"
+//!   button starts lying.
+//! * **a login that fails is a report, not an error.** `claude-code-acp`
+//!   advertises `claude-login` and answers `Method not implemented`; the owner
+//!   sees that sentence, the method stays offered, and nothing claims the agent
+//!   is connected.
+//! * **the adapter never runs the interactive login.** `options.login_command`
+//!   and the agent's own `_meta["terminal-auth"]` are carried into the status as
+//!   text for the UI to show and copy. This build does not claim ACP's
+//!   `terminal-auth` client capability either, because it never opens a
+//!   terminal — an option in the handshake that we cannot honour would be the
+//!   same lie one layer down.
+//!
+//! So `ok == true` from `probe`/`connect` means "the handshake passed". For an
+//! agent that advertises a login it does **not** mean a turn will answer
+//! (D9.28 — measured on this very machine), which is why the status carries the
+//! advertised logins and the UI prints the limit instead of a green "ready".
 
 mod client;
 mod proto;
@@ -346,6 +386,11 @@ pub struct AcpAgent {
     /// `["opencode", "models"]`) for agents whose ACP server advertises no
     /// model state. `None` = no list, and the menu says so.
     models_command: Option<Vec<String>>,
+    /// The command the owner's config names for logging this agent in, when it
+    /// names one (`options.login_command`). Rendered and copied by the Settings
+    /// screen; **never run** by this adapter — an agent login is interactive
+    /// and belongs to the owner's own terminal.
+    login_command: Option<String>,
     /// Env templates that pin the model inside the child itself (the only
     /// channel agents without ACP model selection understand), e.g.
     /// `OPENCODE_CONFIG_CONTENT = '{"model":"{model}"}'`. `{model}` is
@@ -523,6 +568,32 @@ impl AcpAgent {
                 ));
             }
         };
+        let login_command = match spec.options.get("login_command") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(command)) if !command.trim().is_empty() => {
+                Some(command.trim().to_string())
+            }
+            Some(Value::Array(items)) if !items.is_empty() => {
+                let mut argv = Vec::with_capacity(items.len());
+                for item in items {
+                    match item.as_str() {
+                        Some(arg) => argv.push(arg.to_string()),
+                        None => {
+                            return Err(invalid(
+                                "options.login_command must be an array of strings".to_string(),
+                            ));
+                        }
+                    }
+                }
+                Some(argv.join(" "))
+            }
+            Some(_) => {
+                return Err(invalid(
+                    "options.login_command must be a string or a non-empty array of strings"
+                        .to_string(),
+                ));
+            }
+        };
         let models_command = match spec.options.get("models_command") {
             None | Some(Value::Null) => None,
             Some(Value::String(command)) if !command.trim().is_empty() => {
@@ -559,6 +630,7 @@ impl AcpAgent {
             extra_env,
             inherit_env,
             models_command,
+            login_command,
             model_env,
             key,
             permissions: Arc::new(FixedPermissionPolicy { mode }),
@@ -583,6 +655,11 @@ impl AcpAgent {
 
     pub fn permission_mode(&self) -> Option<PermissionMode> {
         self.mode
+    }
+
+    /// The configured login command, when the owner named one.
+    pub fn login_command(&self) -> Option<&str> {
+        self.login_command.as_deref()
     }
 
     /// The configured fallback model lister, when any.
@@ -1364,6 +1441,11 @@ impl LlmBackend for AcpAgent {
             tool_calls: Vec::new(),
             finish_reason,
             usage: Usage {
+                // `llm_calls` is the one number this adapter can count itself
+                // (one `session/prompt` per turn). The tokens stay zero because
+                // the protocol carries none: see the module docs ("Usage") and
+                // `proto`'s — ACP's `usage_update` is context occupancy, not
+                // this turn's spend, and `_meta` is implementation-defined.
                 llm_calls: 1,
                 ..Usage::default()
             },
@@ -1392,118 +1474,13 @@ impl LlmBackend for AcpAgent {
 
     async fn probe(&self) -> Result<BackendStatus, LlmError> {
         // Like every probe in this crate: reports, never throws.
-        let backend = self.spec.id.clone();
-        let model = self.spec.model.clone();
-        if self.key.is_none() && self.key_env.is_some() {
-            return Ok(BackendStatus {
-                backend,
-                ok: false,
-                detail: format!(
-                    "no api key: set {}",
-                    self.key_env.as_deref().unwrap_or_default()
-                ),
-                model,
-                version: None,
-            });
-        }
-        let launch = self.launch();
-        let timeout = probe_budget(&self.spec);
-        let conn = match Connection::connect(
-            backend.clone(),
-            &self.transport,
-            &launch,
-            Arc::clone(&self.permissions),
-            timeout,
-        )
-        .await
-        {
-            Ok(conn) => conn,
-            Err(error) => {
-                return Ok(BackendStatus {
-                    backend,
-                    ok: false,
-                    detail: error.to_string(),
-                    model,
-                    version: None,
-                });
-            }
-        };
-        // Proving `session/new` works is what surfaces a missing login — and
-        // it costs no model call.
-        let status = match tokio::time::timeout(
-            timeout,
-            conn.rpc(
-                "session/new",
-                json!({"cwd": self.cwd.to_string_lossy(), "mcpServers": []}),
-            ),
-        )
-        .await
-        {
-            Err(_) => BackendStatus {
-                backend: backend.clone(),
-                ok: false,
-                detail: format!(
-                    "agent `{}` initialized but did not answer session/new within {}s",
-                    conn.label(),
-                    timeout.as_secs()
-                ),
-                model,
-                version: None,
-            },
-            Ok(Err(error)) => {
-                let mut detail = conn.map_error("session/new", error).to_string();
-                if let Some(hint) = conn.auth_hint() {
-                    detail.push_str(" — ");
-                    detail.push_str(&hint);
-                }
-                BackendStatus {
-                    backend: backend.clone(),
-                    ok: false,
-                    detail,
-                    model,
-                    version: None,
-                }
-            }
-            Ok(Ok(value)) => match serde_json::from_value::<NewSessionResult>(value) {
-                Err(err) => BackendStatus {
-                    backend: backend.clone(),
-                    ok: false,
-                    detail: format!("agent `{}` sent an unreadable session: {err}", conn.label()),
-                    model,
-                    version: None,
-                },
-                Ok(session) => {
-                    let mut detail = format!(
-                        "ACP v{PROTOCOL_VERSION} agent `{}` ready; sessions start in `{}`; permissions: {}",
-                        conn.label(),
-                        self.cwd.display(),
-                        self.policy_mode_label()
-                    );
-                    if session.models.is_some()
-                        || session.config_options.iter().any(|opt| opt.id == "model")
-                    {
-                        detail.push_str("; the agent advertises model selection");
-                    } else {
-                        detail.push_str("; the agent picks its own model (no ACP model selection)");
-                    }
-                    if let Some(hint) = conn.auth_hint() {
-                        detail.push_str(". ");
-                        detail.push_str(&hint);
-                    }
-                    BackendStatus {
-                        backend: backend.clone(),
-                        ok: true,
-                        detail,
-                        model,
-                        // ACP's initialize carries no agent version; the
-                        // protocol version is the honest number we have.
-                        version: Some(format!("acp v{PROTOCOL_VERSION}")),
-                    }
-                }
-            },
-        };
-        conn.shutdown();
-        Ok(status)
+        Ok(self.handshake(None).await)
+    }
+
+    async fn connect(&self, method: Option<&str>) -> Result<BackendStatus, LlmError> {
+        // Same discipline as `probe`: every outcome is a status the Settings
+        // screen can render, including a login this agent does not implement.
+        Ok(self.handshake(method).await)
     }
 
     async fn available_models(&self) -> Result<ModelList, LlmError> {
@@ -1619,6 +1596,216 @@ impl LlmBackend for AcpAgent {
         .await;
         self.close_session(&conn, &session_id).await;
         listed
+    }
+}
+
+/// One ACP request failure as an operator-facing sentence, keeping the
+/// agent's own message and code.
+///
+/// Deliberately not [`Connection::map_error`]: that form is tuned for *turn*
+/// errors (a missing optional method is "malformed for this agent"), while a
+/// login step has to say what the agent said. Losing `Method not implemented`
+/// behind "does not implement" makes the one action the owner has look
+/// indistinguishable from a broken agent.
+fn acp_error_text(error: &AcpRequestError) -> String {
+    match error {
+        AcpRequestError::Rpc(rpc) => format!("{} (JSON-RPC {})", rpc.message, rpc.code),
+        AcpRequestError::Exited(detail) => format!("the agent is gone: {detail}"),
+    }
+}
+
+impl AcpAgent {
+    /// The one connection check this adapter has: spawn → `initialize` →
+    /// (optional) `authenticate` → `session/new`, reported as a status.
+    ///
+    /// `method` names a login **the agent itself advertised**
+    /// ([`BackendStatus::auth_methods`]); `None` asks for the handshake only.
+    /// Sending a method nobody advertised would be a guess at another
+    /// program's API, so an unadvertised id is reported, never attempted.
+    ///
+    /// Nothing here spends a model call, and that is the honest limit (D9.28):
+    /// an agent can answer all of the above and still refuse `session/prompt`
+    /// for an account reason. `ok` therefore means "this handshake passed",
+    /// and the UI is required to say so rather than print "ready".
+    async fn handshake(&self, method: Option<&str>) -> BackendStatus {
+        let backend = self.spec.id.clone();
+        let mut status = BackendStatus::report(backend.clone(), false, String::new());
+        status.model = self.spec.model.clone();
+        status.login_command = self.login_command.clone();
+        // A key the config names but the registry could not resolve is a
+        // refusal of one named kind, before anything is spawned.
+        if self.key.is_none() && self.key_env.is_some() {
+            status.detail = format!(
+                "no api key: set {}",
+                self.key_env.as_deref().unwrap_or_default()
+            );
+            status.auth_required = true;
+            return status;
+        }
+        let launch = self.launch();
+        let timeout = probe_budget(&self.spec);
+        let conn = match Connection::connect(
+            backend,
+            &self.transport,
+            &launch,
+            Arc::clone(&self.permissions),
+            timeout,
+        )
+        .await
+        {
+            Ok(conn) => conn,
+            Err(error) => {
+                status.detail = error.to_string();
+                return status;
+            }
+        };
+        // One place that closes the process, on every exit path below.
+        status = self.session_status(&conn, method, timeout).await;
+        status.model = self.spec.model.clone();
+        status.login_command = self.login_command.clone();
+        conn.shutdown();
+        status
+    }
+
+    /// The `authenticate` + `session/new` half of [`AcpAgent::handshake`].
+    async fn session_status(
+        &self,
+        conn: &Connection,
+        method: Option<&str>,
+        timeout: Duration,
+    ) -> BackendStatus {
+        let backend = self.spec.id.clone();
+        let model = self.spec.model.clone();
+        let methods = conn.auth_methods();
+        let mut status = BackendStatus::report(backend.clone(), false, String::new());
+        status.model = model;
+        status.auth_methods = methods.clone();
+
+        // A login the owner picked has to be one the agent offered.
+        let mut authenticated: Option<&str> = None;
+        if let Some(id) = method {
+            if !methods.iter().any(|offered| offered.id == id) {
+                let offered = if methods.is_empty() {
+                    "it advertised none".to_string()
+                } else {
+                    format!(
+                        "it advertised: {}",
+                        methods
+                            .iter()
+                            .map(|method| method.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                status.detail = format!(
+                    "agent `{}` advertises no auth method `{id}` ({offered})",
+                    conn.label()
+                );
+                status.auth_required = true;
+                return status;
+            }
+            match tokio::time::timeout(timeout, conn.rpc("authenticate", json!({"methodId": id})))
+                .await
+            {
+                Err(_) => {
+                    status.detail = format!(
+                        "agent `{}` did not answer authenticate({id}) within {}s",
+                        conn.label(),
+                        timeout.as_secs()
+                    );
+                    status.auth_required = true;
+                    return status;
+                }
+                Ok(Err(error)) => {
+                    // The agent's own words, plus its code: `map_error` would
+                    // turn `-32601` into the generic "does not implement",
+                    // and the owner's next step depends on the difference
+                    // between "I cannot do that" and "I am not logged in".
+                    status.detail =
+                        format!("authenticate({id}) refused: {}", acp_error_text(&error));
+                    status.auth_required = true;
+                    return status;
+                }
+                // The agent accepted it. Whether its sessions now work is the
+                // `session/new` below, which is the only proof this build has.
+                Ok(Ok(_)) => authenticated = Some(id),
+            }
+        }
+        let prefix = match authenticated {
+            Some(id) => format!("authenticated via `{id}`; "),
+            None => String::new(),
+        };
+
+        // Proving `session/new` works is what surfaces a missing login — and
+        // it costs no model call.
+        match tokio::time::timeout(
+            timeout,
+            conn.rpc(
+                "session/new",
+                json!({"cwd": self.cwd.to_string_lossy(), "mcpServers": []}),
+            ),
+        )
+        .await
+        {
+            Err(_) => {
+                status.detail = format!(
+                    "{prefix}agent `{}` initialized but did not answer session/new within {}s",
+                    conn.label(),
+                    timeout.as_secs()
+                );
+                status
+            }
+            Ok(Err(error)) => {
+                // The code, not the prose, decides whether this was a login
+                // refusal: `-32000` is ACP's own "authentication required".
+                status.auth_required =
+                    matches!(&error, AcpRequestError::Rpc(rpc) if rpc.is_auth_required());
+                let mut detail = conn.map_error("session/new", error).to_string();
+                if let Some(hint) = conn.auth_hint() {
+                    detail.push_str(" — ");
+                    detail.push_str(&hint);
+                }
+                status.detail = format!("{prefix}{detail}");
+                status
+            }
+            Ok(Ok(value)) => match serde_json::from_value::<NewSessionResult>(value) {
+                Err(err) => {
+                    status.detail = format!(
+                        "{prefix}agent `{}` sent an unreadable session: {err}",
+                        conn.label()
+                    );
+                    status
+                }
+                Ok(session) => {
+                    let mut detail = format!(
+                        "{prefix}ACP v{PROTOCOL_VERSION} agent `{}` ready; sessions start in `{}`; permissions: {}",
+                        conn.label(),
+                        self.cwd.display(),
+                        self.policy_mode_label()
+                    );
+                    if session.models.is_some()
+                        || session.config_options.iter().any(|opt| opt.id == "model")
+                    {
+                        detail.push_str("; the agent advertises model selection");
+                    } else {
+                        detail.push_str("; the agent picks its own model (no ACP model selection)");
+                    }
+                    if let Some(hint) = conn.auth_hint() {
+                        detail.push_str(". ");
+                        detail.push_str(&hint);
+                    }
+                    BackendStatus {
+                        ok: true,
+                        detail,
+                        // ACP's initialize carries no agent version; the
+                        // protocol version is the honest number we have.
+                        version: Some(format!("acp v{PROTOCOL_VERSION}")),
+                        auth_required: false,
+                        ..status
+                    }
+                }
+            },
+        }
     }
 }
 
@@ -1946,6 +2133,46 @@ mod tests {
         let mut wrong = agent_spec();
         wrong.kind = BackendKind::OpenAiCompat;
         assert!(AcpAgent::from_spec(wrong, None).is_err());
+    }
+
+    /// `options.login_command` is the owner's own instruction text for the
+    /// Settings screen's Copy button: parsed leniently (a string or an argv),
+    /// rejected loudly when it is neither, and never executed by this adapter.
+    #[test]
+    fn login_command_parses_a_string_or_an_argv_and_nothing_else() {
+        let mut options = serde_json::Map::new();
+        options.insert("command".into(), json!("claude-code-acp"));
+        options.insert("login_command".into(), json!("claude /login"));
+        let agent = AcpAgent::from_spec(spec_with_options(options), None).expect("valid spec");
+        assert_eq!(agent.login_command(), Some("claude /login"));
+
+        let mut options = serde_json::Map::new();
+        options.insert("command".into(), json!("codex-acp"));
+        options.insert("login_command".into(), json!(["codex", "login"]));
+        let agent = AcpAgent::from_spec(spec_with_options(options), None).expect("valid spec");
+        assert_eq!(
+            agent.login_command(),
+            Some("codex login"),
+            "an argv is rendered as the line an operator would type"
+        );
+
+        // Absent or null is simply "the config names no command".
+        let mut options = serde_json::Map::new();
+        options.insert("command".into(), json!("opencode"));
+        options.insert("login_command".into(), Value::Null);
+        let agent = AcpAgent::from_spec(spec_with_options(options), None).expect("valid spec");
+        assert_eq!(agent.login_command(), None);
+
+        // A config mistake is named, not silently dropped.
+        let mut options = serde_json::Map::new();
+        options.insert("command".into(), json!("opencode"));
+        options.insert("login_command".into(), json!(42));
+        let error = AcpAgent::from_spec(spec_with_options(options), None)
+            .expect_err("login_command must be a string or an argv");
+        assert!(
+            error.to_string().contains("options.login_command"),
+            "{error}"
+        );
     }
 
     #[test]

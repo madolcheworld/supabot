@@ -241,6 +241,11 @@ impl McpTurnProvider for BrainMcpProvider {
         if !host_node.is_local() {
             ctx = ctx.with_node_id(host_node);
         }
+        // The turn's token, not the private one `ToolContext::local` minted: a
+        // tool the agent calls through this server is the agent's *action on our
+        // machine*, and Stop has to reach it. `with_cancel` is the only seam that
+        // makes a stopped turn stop acting here (see `McpTurnRequest::cancel`).
+        ctx = ctx.with_cancel(req.cancel);
 
         let recorder = self.call_recorder();
         let server = SwarmMcpServer::new(Arc::clone(&swarm.tools), ctx)
@@ -490,6 +495,7 @@ mod tests {
             toolsets: vec![swarmbot_contracts::Toolset::Bot],
             node_caps: None,
             in_task: false,
+            cancel: tokio_util::sync::CancellationToken::new(),
         };
 
         let unbound = provider

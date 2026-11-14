@@ -198,6 +198,28 @@ impl ConversationService {
             .entry_tail(id, if limit == 0 { HISTORY_PAGE } else { limit })
     }
 
+    /// A page of history **older than** `before_seq`, ascending.
+    ///
+    /// The other half of [`Self::history`]: a transcript opens on the tail, so
+    /// scrolling backwards needs a cursor that goes the other way. The bound is
+    /// exclusive on purpose (`seq < before_seq`), which is what makes "the page
+    /// before the first row I already have" never repeat that row — the bug a
+    /// caller would otherwise paper over by dropping the first entry and
+    /// accidentally losing it when the page is short.
+    pub fn history_before(
+        &self,
+        id: &ConversationId,
+        before_seq: Seq,
+        limit: u32,
+    ) -> Result<Vec<Entry>, DomainError> {
+        self.get(id)?;
+        self.store.entries_before(
+            id,
+            before_seq,
+            if limit == 0 { HISTORY_PAGE } else { limit },
+        )
+    }
+
     pub fn members(&self, conversation: &Conversation) -> Result<Vec<Bot>, DomainError> {
         let mut bots = Vec::new();
         for id in conversation.kind.participants() {
@@ -416,7 +438,7 @@ mod tests {
         for i in 0..5 {
             rig.service
                 .transcript
-                .owner_message(&group.id, format!("line {i}"))
+                .owner_message(&group.id, format!("line {i}"), None)
                 .unwrap();
         }
         // Creating the group wrote one event line, so the transcript holds six.
@@ -425,6 +447,67 @@ mod tests {
         let tail = rig.service.tail(&group.id, 2).unwrap();
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].seq, 5, "ascending, newest last");
+    }
+
+    #[test]
+    fn history_pages_backwards_without_repeating_a_row() {
+        // The store could page forwards and to the tail, but not backwards, so a
+        // client that opened on the tail had no way to load the start of a long
+        // conversation. The exclusive bound is what makes a second page start
+        // *before* the oldest row the caller already has.
+        let rig = rig();
+        let group = rig
+            .service
+            .create_group(
+                "Team",
+                vec![rig.lead.id.clone(), rig.scout.id.clone()],
+                None,
+            )
+            .unwrap();
+        for i in 0..9 {
+            rig.service
+                .transcript
+                .owner_message(&group.id, format!("line {i}"), None)
+                .unwrap();
+        }
+        let total = rig.service.history(&group.id, 0, 100).unwrap().len();
+        assert_eq!(total, 10, "nine lines plus the group-created event");
+
+        let newest = rig.service.history_before(&group.id, u64::MAX, 4).unwrap();
+        assert_eq!(newest.len(), 4);
+        assert_eq!(
+            newest.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![7, 8, 9, 10],
+            "the newest page, ascending"
+        );
+
+        let older = rig
+            .service
+            .history_before(&group.id, newest[0].seq, 4)
+            .unwrap();
+        assert_eq!(
+            older.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6],
+            "the page before it, ascending, with no repeated row"
+        );
+        assert!(
+            older.iter().all(|entry| entry.seq < newest[0].seq),
+            "the cursor is exclusive, so a second page never repeats a row"
+        );
+
+        // And the walk reaches the start without holes or duplicates.
+        let first = rig
+            .service
+            .history_before(&group.id, older[0].seq, 4)
+            .unwrap();
+        assert_eq!(first.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(
+            rig.service
+                .history_before(&group.id, 1, 4)
+                .unwrap()
+                .is_empty(),
+            "before the first entry is empty, not a wrap-around"
+        );
     }
 
     #[test]
@@ -440,7 +523,7 @@ mod tests {
             .unwrap();
         rig.service
             .transcript
-            .owner_message(&group.id, "do the thing")
+            .owner_message(&group.id, "do the thing", None)
             .unwrap();
         let mut task = swarmbot_contracts::task::Task::own(
             rig.lead.id.clone(),

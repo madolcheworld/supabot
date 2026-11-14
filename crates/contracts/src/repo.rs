@@ -79,6 +79,21 @@ pub trait EntryRepo: Send + Sync {
         conversation: &ConversationId,
         limit: u32,
     ) -> Result<Vec<Entry>, DomainError>;
+    /// The newest `limit` entries **older than** `before_seq`, ascending.
+    ///
+    /// This is the other half of [`entries_after`](Self::entries_after): a
+    /// transcript that opens on the tail can only scroll backwards if the store
+    /// can page backwards, and a client that instead asked for "everything"
+    /// would make a long-lived conversation a memory problem on both sides. The
+    /// bound is exclusive (`seq < before_seq`) so a page never repeats the row
+    /// the caller already has, and the result is ascending so a client can
+    /// prepend it as-is.
+    fn entries_before(
+        &self,
+        conversation: &ConversationId,
+        before_seq: Seq,
+        limit: u32,
+    ) -> Result<Vec<Entry>, DomainError>;
     /// Every entry of one conversation, ascending (used by the JSONL mirror and
     /// by tests). Returns the count deleted.
     fn delete_entries(&self, conversation: &ConversationId) -> Result<u64, DomainError>;
@@ -514,6 +529,14 @@ mod tests {
             Ok(vec![])
         }
         fn entry_tail(&self, _: &ConversationId, _: u32) -> Result<Vec<Entry>, DomainError> {
+            Ok(vec![])
+        }
+        fn entries_before(
+            &self,
+            _: &ConversationId,
+            _: Seq,
+            _: u32,
+        ) -> Result<Vec<Entry>, DomainError> {
             Ok(vec![])
         }
         fn delete_entries(&self, _: &ConversationId) -> Result<u64, DomainError> {

@@ -80,12 +80,20 @@ OPENCODE_CONFIG_CONTENT = '{"model":"{model}","permission":{"edit":"ask","bash":
 # 2. [CC] (via ACP adapter) — handshake OK, turns refused: not logged in on
 #    this machine. See the header. Exact enable snippet + proof command there.
 #
+#    `login_command` is display-only: the Settings screen shows it next to the
+#    Connect button with a Copy action, and the brain never runs it. Use it when
+#    the agent advertises a login but no `_meta["terminal-auth"]` command (a
+#    stock `claude-code-acp` advertises `claude-login` with only a sentence).
+#    Set it only if it is true for *this* machine — the UI presents it as the
+#    instruction to follow.
+#
 # [[backends]]
 # id = "claude"
 # kind = "acp"
 # [backends.options]
 # command = "claude-code-acp"
 # permission_mode = "reject"
+# login_command = ["claude", "/login"]
 
 # 3. Codex (via ACP adapter) — handshake OK, turns rejected by the ChatGPT
 #    account's model entitlement. See the header.
@@ -96,6 +104,7 @@ OPENCODE_CONFIG_CONTENT = '{"model":"{model}","permission":{"edit":"ask","bash":
 # [backends.options]
 # command = "codex-acp"
 # permission_mode = "reject"
+# login_command = ["codex", "login"]
 
 
 [settings]

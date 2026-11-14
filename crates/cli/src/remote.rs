@@ -29,21 +29,27 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use swarmbot_client::{BackendView, BrainClient, ClientError, Health, PairingCode, SessionAction};
+use swarmbot_client::{
+    BackendView, BrainClient, ClientError, Health, PairingCode, SecretName, SecretWrite,
+    SessionAction,
+};
 use swarmbot_contracts::bot::{Bot, BotStatus};
 use swarmbot_contracts::config::{BackendKind, Settings};
 use swarmbot_contracts::conversation::Conversation;
 use swarmbot_contracts::entry::Entry;
-use swarmbot_contracts::id::{BotId, ConversationId, EntryId, RequestId};
+use swarmbot_contracts::id::{
+    BotId, ConversationId, EntryId, NodeId, RequestId, RoutineId, RuleId,
+};
 use swarmbot_contracts::live::{LiveCursor, LiveEvent};
 use swarmbot_contracts::node::NodeInfo;
-use swarmbot_contracts::request::{Decision, RuntimeRequest};
+use swarmbot_contracts::request::{ApprovalRule, Decision, RuntimeRequest};
+use swarmbot_contracts::routine::{Routine, RoutineRun};
 use swarmbot_contracts::task::{Task, TaskStatus};
 use swarmbot_contracts::turn::UsageReport;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::embedded::{Embedded, short_conversation};
-use crate::session::{SendReport, Session, request_relevant_to};
+use crate::session::{BotEdit, SendReport, Session, request_relevant_to};
 
 /// The environment variable that carries a token when `--token` is absent.
 pub const TOKEN_ENV: &str = "SWARMBOT_TOKEN";
@@ -230,16 +236,22 @@ pub fn resolve_token(
     ))
 }
 
-/// Ask for the token on the terminal, without echoing it.
+/// Ask for the brain token on the terminal, without echoing it.
+fn prompt_token() -> Result<String> {
+    prompt_secret("brain token (input is not echoed): ")
+}
+
+/// Ask for a secret on the terminal, without echoing it.
 ///
 /// Raw mode is restored whatever happens: a shell left in raw mode is a broken
-/// shell, and "the token prompt failed" must not cost the user their terminal.
-/// Nothing here prints the characters typed — not even as dots — because a
-/// repaint of the line is one more place a token could land.
-fn prompt_token() -> Result<String> {
+/// shell, and "the prompt failed" must not cost the user their terminal.
+/// Nothing printed shows the characters typed — not even as dots — because a
+/// repaint of the line is one more place a secret could land. `prompt` names
+/// what is being asked for and never contains a value.
+pub fn prompt_secret(prompt: &str) -> Result<String> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
-    eprint!("brain token (input is not echoed): ");
+    eprint!("{prompt}");
     std::io::stderr().flush()?;
     crossterm::terminal::enable_raw_mode()?;
     let mut token = String::new();
@@ -252,11 +264,11 @@ fn prompt_token() -> Result<String> {
                     token.pop();
                 }
                 KeyCode::Esc => {
-                    read = Err(anyhow!("the token prompt was cancelled"));
+                    read = Err(anyhow!("the prompt was cancelled"));
                     break;
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    read = Err(anyhow!("the token prompt was interrupted"));
+                    read = Err(anyhow!("the prompt was interrupted"));
                     break;
                 }
                 KeyCode::Char(character) => token.push(character),
@@ -264,7 +276,7 @@ fn prompt_token() -> Result<String> {
             },
             Ok(_) => {}
             Err(err) => {
-                read = Err(anyhow!("cannot read the token from the terminal: {err}"));
+                read = Err(anyhow!("cannot read from the terminal: {err}"));
                 break;
             }
         }
@@ -902,6 +914,162 @@ impl Session for Remote {
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone()
+    }
+
+    /// The daemon's own metrics, mapped into the four counters an owner reads.
+    /// `Some` here (unlike the default) because the brain really can answer
+    /// them: this is not the embedded half's advantage, it is a route.
+    fn live_counts(&self) -> Option<crate::session::LiveCounts> {
+        self.client
+            .metrics()
+            .ok()
+            .map(|metrics| crate::session::LiveCounts {
+                turns_running: metrics.turns_running,
+                deliveries_queued: metrics.deliveries_queued,
+                deliveries_parked: metrics.deliveries_parked,
+                runners: metrics.runners,
+                // The daemon answered, so its swarm is booted: these are real
+                // live runners, not a zero from a process that started nothing.
+                booted: true,
+            })
+    }
+
+    // --- the owner's write surface -------------------------------------------
+
+    fn rules(&self) -> Result<Vec<ApprovalRule>> {
+        self.client.rules().map_err(|err| self.honest(&err))
+    }
+
+    fn delete_rule(&self, id: &RuleId) -> Result<()> {
+        self.client.delete_rule(id).map_err(|err| self.honest(&err))
+    }
+
+    fn pending(&self) -> Result<Vec<RuntimeRequest>> {
+        self.client
+            .pending_requests()
+            .map(|requests| {
+                requests
+                    .into_iter()
+                    .filter(|request| request.is_pending())
+                    .collect()
+            })
+            .map_err(|err| self.honest(&err))
+    }
+
+    fn settings(&self) -> Result<Settings> {
+        self.client.settings().map_err(|err| self.honest(&err))
+    }
+
+    fn update_settings(&self, patch: &Value) -> Result<Settings> {
+        self.client
+            .update_settings(patch)
+            // Verbatim, status and all: the brain's 400 carries the validation
+            // sentence ("a budget of zero is not a budget"), and paraphrasing it
+            // here would be the one place that reason could be lost.
+            .map_err(|err| self.honest(&err))
+    }
+
+    fn routines(&self) -> Result<Vec<Routine>> {
+        self.client.routines(None).map_err(|err| self.honest(&err))
+    }
+
+    fn pause_routine(&self, id: &RoutineId) -> Result<Routine> {
+        self.client
+            .pause_routine(id)
+            .map_err(|err| self.honest(&err))
+    }
+
+    fn resume_routine(&self, id: &RoutineId) -> Result<Routine> {
+        self.client
+            .resume_routine(id)
+            .map_err(|err| self.honest(&err))
+    }
+
+    fn delete_routine(&self, id: &RoutineId) -> Result<()> {
+        self.client
+            .delete_routine(id)
+            .map_err(|err| self.honest(&err))
+    }
+
+    fn routine_runs(&self, id: &RoutineId, limit: u32) -> Result<Vec<RoutineRun>> {
+        self.client
+            .routine_runs(id, Some(limit.clamp(1, 200)))
+            .map_err(|err| self.honest(&err))
+    }
+
+    fn revoke_node(&self, id: &NodeId) -> Result<()> {
+        self.client.revoke_node(id).map_err(|err| self.honest(&err))
+    }
+
+    fn edit_bot(&self, name: &str, edit: &BotEdit) -> Result<Bot> {
+        // The same body the brain documents for `PATCH /api/bots/{id}`: only the
+        // keys present change, and an empty `model` means "the backend's
+        // default". `enabled` is the one field the brain applies through its own
+        // writer because it also starts or stops the runner.
+        let mut patch = serde_json::Map::new();
+        if let Some(backend) = &edit.backend {
+            patch.insert("backend".to_string(), Value::String(backend.clone()));
+        }
+        if let Some(model) = &edit.model {
+            patch.insert("model".to_string(), Value::String(model.clone()));
+        }
+        if let Some(enabled) = edit.enabled {
+            patch.insert("enabled".to_string(), Value::Bool(enabled));
+        }
+        if let Some(skills) = &edit.skills {
+            patch.insert(
+                "skills".to_string(),
+                Value::Array(
+                    skills
+                        .iter()
+                        .map(|skill| Value::String(skill.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        self.client
+            .update_bot(name, &Value::Object(patch))
+            .map_err(|err| self.honest(&err))
+    }
+
+    fn secrets(&self) -> Result<Vec<SecretName>> {
+        self.client.secrets().map_err(|err| self.honest(&err))
+    }
+
+    fn set_secret(&self, name: &str, value: &str) -> Result<SecretWrite> {
+        self.client
+            .set_secret(name, value)
+            .map_err(|err| self.honest(&err))
+    }
+
+    fn delete_secret(&self, name: &str) -> Result<SecretWrite> {
+        self.client
+            .delete_secret(name)
+            .map_err(|err| self.honest(&err))
+    }
+
+    fn entries_before(
+        &self,
+        conversation: &ConversationId,
+        before_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<Entry>> {
+        self.client
+            .entries_before(conversation, before_seq, limit)
+            .map_err(|err| self.honest(&err))
+    }
+
+    /// The brain's own export route, byte for byte.
+    ///
+    /// The body is NDJSON served by the daemon, so this half does not rebuild it
+    /// from entries: a proxy or a brain with a newer row shape would still be
+    /// exported exactly as it was stored. The embedded half builds the same bytes
+    /// from its own store ([`crate::admin::export_ndjson`]); that is the only
+    /// difference, and both produce one `Entry` JSON object per line, ascending.
+    fn export_transcript(&self, conversation: &ConversationId) -> Result<String> {
+        self.client
+            .export_transcript(conversation)
+            .map_err(|err| self.honest(&err))
     }
 }
 

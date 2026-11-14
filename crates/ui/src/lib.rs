@@ -20,9 +20,12 @@
 //! * [`worker`] — the live + rpc threads, reconnect backoff, and the main-thread
 //!   pump that applies [`proto::WorkerMsg`]s through the reducer.
 //! * [`spawn`] — `--spawn-brain` / `--offline` child supervision.
+//! * [`gpu`] — whether a window can get a Vulkan driver at all, decided before
+//!   GPUI panics trying to find one.
+//! * [`time`] — the transcript's day-aware timestamp labels.
 //! * [`widgets`] — the text input, the markdown renderer, small shared bits.
 //! * [`view`] — the screens: root layout, sidebar, conversation, composer, graph,
-//!   cards, nodes, settings, palette.
+//!   cards, nodes, routines, rules, settings, usage, palette.
 //! * [`selftest`] — the fabricated-event driver behind `--selftest`.
 
 use std::path::{Path, PathBuf};
@@ -40,12 +43,14 @@ use swarmbot_client::{BackendModels, BackendView, BrainClient, ClientError, Mode
 pub mod actions;
 pub mod args;
 pub mod brain;
+pub mod gpu;
 pub mod proto;
 pub mod reducer;
 pub mod selftest;
 pub mod spawn;
 pub mod state;
 pub mod theme;
+pub mod time;
 pub mod view;
 pub mod widgets;
 pub mod worker;
@@ -94,6 +99,26 @@ pub fn run() -> i32 {
         args.offline,
         args.should_spawn()
     ));
+
+    // A window needs a Vulkan driver, and GPUI panics (with a message about a
+    // GPU context, which reads like a bug here) when there is none. Ask first:
+    // an absent driver is an environment fact with a one-command fix, so it gets
+    // a sentence and a distinct exit code instead of a panic in a library thread.
+    let driver = gpu::diagnose_here();
+    report.note(format!("vulkan/driver: {}", driver.label()));
+    if !driver.can_render() {
+        // One line, in the report and on the same stream `--report` captures —
+        // printed once, not echoed to stderr as well. It is the whole answer a
+        // caller needs, so duplicating it only adds noise.
+        report.note(format!("GPU FAILED: {}", gpu::absent_message()));
+        report.note(format!(
+            "exit: renders=0 selftest={} ok=false",
+            args.selftest
+        ));
+        report.flush(args.report.as_deref());
+        // 2, not 1: "this machine cannot open a window" is not "the app failed".
+        return 2;
+    }
 
     // Supervise a child brain if asked. The guard lives until `run` returns, so
     // the child is killed on the way out.
@@ -334,8 +359,35 @@ fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) {
                     chrono::Utc::now(),
                 )
             {
-                s.routines = vec![r];
+                s.set_routines(vec![r]);
                 s.routine_creator_open = true;
+            }
+            if cfg.screen == state::Screen::Rules {
+                // Fabricate what `GET /api/rules` would have delivered: a
+                // matcher-less deny (the loud case), a "cargo …" allow, and an
+                // ask scoped to one bot.
+                let mut deny = swarmbot_contracts::ApprovalRule::new(
+                    swarmbot_contracts::RuleScope::Global,
+                    swarmbot_contracts::RuleEffect::Deny,
+                );
+                deny.id = swarmbot_contracts::RuleId::from_suffix("rule-deny-all");
+                let mut allow = swarmbot_contracts::ApprovalRule::new(
+                    swarmbot_contracts::RuleScope::Global,
+                    swarmbot_contracts::RuleEffect::Allow,
+                );
+                allow.id = swarmbot_contracts::RuleId::from_suffix("rule-allow-cargo");
+                allow.surface = Some(swarmbot_contracts::Surface::Shell);
+                allow.tool = Some("shell".into());
+                allow.command_prefix = Some("cargo".into());
+                let mut ask = swarmbot_contracts::ApprovalRule::new(
+                    swarmbot_contracts::RuleScope::Bot(swarmbot_contracts::BotId::from_suffix(
+                        "dev",
+                    )),
+                    swarmbot_contracts::RuleEffect::Ask,
+                );
+                ask.id = swarmbot_contracts::RuleId::from_suffix("rule-ask-write");
+                ask.surface = Some(swarmbot_contracts::Surface::WriteFile);
+                s.set_rules(vec![deny, allow, ask]);
             }
             if cfg.screen == state::Screen::Usage {
                 // Fabricate what `GET /api/usage` would have delivered, so the

@@ -10,7 +10,8 @@ use common::*;
 
 use serde_json::{Value, json};
 
-use swarmbot_contracts::id::{BotId, ConversationId, EntryId};
+use swarmbot_contracts::id::{BotId, ConversationId, EntryId, NodeId};
+use swarmbot_contracts::node::{NodeInfo, NodeKind, PolicyMap};
 use swarmbot_contracts::turn::Usage;
 use swarmbot_llm::ScriptedTurn;
 
@@ -62,8 +63,50 @@ async fn every_route_refuses_an_anonymous_request_with_the_envelope() {
         "/api/usage",
         "/api/backends",
         "/api/backends/probe",
+        // The operational surface is behind the owner gate like everything
+        // else. A metrics poll or a credential write without a token is the
+        // kind of endpoint that gets "temporarily" exempted, so it is pinned
+        // here next to the routes that have been here since the beginning.
+        "/api/metrics",
+        "/api/secrets",
     ] {
         let response = get(&anonymous, &brain.url(path)).await;
+        expect_error(response, 401, "unauthorized").await;
+    }
+
+    // Connect is a POST on a different path, and it is behind the same gate: an
+    // unauthenticated caller must not be able to make the brain spawn an agent.
+    let response = post_empty(&anonymous, &brain.url("/api/backends/fake/connect")).await;
+    expect_error(response, 401, "unauthorized").await;
+
+    // The new write routes are gated too, and separately from their GETs: a
+    // route is either under `require_auth` or it is not, and "it is only a
+    // patch" is not a permission.
+    for (method, path, body) in [
+        (
+            reqwest::Method::PATCH,
+            "/api/nodes/nod_local",
+            Some(json!({"label": "x"})),
+        ),
+        (reqwest::Method::PATCH, "/api/nodes/nod_local", None),
+        (
+            reqwest::Method::PUT,
+            "/api/secrets",
+            Some(json!({"name": "K", "value": "v"})),
+        ),
+        (reqwest::Method::DELETE, "/api/secrets/SOME_KEY", None),
+        (reqwest::Method::POST, "/api/auth/revoke-sessions", None),
+        (
+            reqwest::Method::GET,
+            "/api/conversations/cnv_00000000000000000000000000000000/export",
+            None,
+        ),
+    ] {
+        let mut request = anonymous.request(method.clone(), brain.url(path));
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.expect("the request goes out");
         expect_error(response, 401, "unauthorized").await;
     }
 
@@ -329,11 +372,20 @@ async fn bots_create_list_get_patch_and_delete() {
             "instructions": "read the diff",
             "backend": "fake",
             "color": "#123456",
+            // `skills` is field three of the client's `NewBotRequest`; before it
+            // existed no front end could name one, so the brain's support for it
+            // was unreachable from this crate's own client.
+            "skills": ["release-notes", "tone-of-voice"],
         }),
     )
     .await;
     assert_eq!(response.status().as_u16(), 201);
     let created = body(response).await;
+    assert_eq!(
+        created["skills"],
+        json!(["release-notes", "tone-of-voice"]),
+        "a create body's skills are stored: {created}"
+    );
     assert_eq!(
         created["name"],
         json!("reviewer-two"),
@@ -379,6 +431,11 @@ async fn bots_create_list_get_patch_and_delete() {
     let patched = body(response).await;
     assert_eq!(patched["label"], json!("Senior Reviewer"));
     assert_eq!(patched["model"], json!("fake-2"));
+    assert_eq!(
+        patched["skills"],
+        json!(["release-notes", "tone-of-voice"]),
+        "an absent `skills` key leaves the list alone"
+    );
     assert_eq!(
         patched["instructions"], created["instructions"],
         "untouched"
@@ -1448,6 +1505,507 @@ async fn the_blocking_client_reads_the_usage_report() {
     assert_eq!(report.turns, 1);
     assert_eq!(report.by_bot.len(), 1);
     assert_eq!(report.by_bot[0].bot_name.as_deref(), Some("lead"));
+
+    brain.stop().await;
+}
+
+// --- paging backwards --------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transcript_pages_backwards_with_before_seq() {
+    // The other half of paging: a transcript opens on its tail, so scrolling into
+    // its own past needs a cursor that walks the other way. `before_seq` is
+    // exclusive and the page is ascending, which together are what let a client
+    // prepend a page without dropping or repeating the row it already shows.
+    let brain = TestBrain::start().await;
+    let client = brain.client();
+    let dm = brain.bot("lead").direct_conversation_id;
+    let url = format!("/api/conversations/{dm}");
+
+    for index in 0..5 {
+        post(
+            &client,
+            &brain.url(&format!("{url}/messages")),
+            &json!({"text": format!("backwards {index}"), "addressed": []}),
+        )
+        .await;
+    }
+    brain.settle().await;
+
+    let tail = array(get(&client, &brain.url(&format!("{url}/tail?limit=1000"))).await).await;
+    assert!(tail.len() >= 5, "{} entries", tail.len());
+    let oldest = tail.first().expect("a first entry")["seq"]
+        .as_u64()
+        .expect("a seq");
+
+    // Page backwards two at a time and prepend: the union has to be the tail.
+    let mut walked: Vec<Value> = Vec::new();
+    let mut before_seq = oldest + 1;
+    for _ in 0..(tail.len() + 2) {
+        let page = array(
+            get(
+                &client,
+                &brain.url(&format!("{url}/entries?before_seq={before_seq}&limit=2")),
+            )
+            .await,
+        )
+        .await;
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2, "{page:?}");
+        let seqs: Vec<u64> = page
+            .iter()
+            .map(|entry| entry["seq"].as_u64().expect("a seq"))
+            .collect();
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        assert_eq!(seqs, sorted, "a backward page is still ascending");
+        assert!(
+            seqs.iter().all(|seq| *seq < before_seq),
+            "`before_seq` is exclusive: {seqs:?} against {before_seq}"
+        );
+        // Prepending each page is what the client does with it; the result is the
+        // same order as paging forward.
+        let mut combined = page;
+        combined.extend(walked);
+        walked = combined;
+        before_seq = seqs.first().copied().expect("a first seq");
+    }
+    // `oldest + 1` included the oldest entry itself, so the walk covers exactly
+    // the tail that starts there.
+    let expected: Vec<Value> = tail
+        .iter()
+        .filter(|entry| entry["seq"].as_u64().is_some_and(|seq| seq <= oldest))
+        .cloned()
+        .collect();
+    assert_eq!(
+        walked, expected,
+        "backward paging loses or duplicates entries"
+    );
+
+    // Walking from before the first entry is an empty page, not an error.
+    let empty = array(
+        get(
+            &client,
+            &brain.url(&format!("{url}/entries?before_seq=1&limit=10")),
+        )
+        .await,
+    )
+    .await;
+    assert!(empty.is_empty(), "{empty:?}");
+
+    // Sending both cursors is refused rather than silently preferring one: a page
+    // in the wrong direction looks like missing messages, not like a bad request.
+    let message = expect_error(
+        get(
+            &client,
+            &brain.url(&format!("{url}/entries?after_seq=1&before_seq=9&limit=10")),
+        )
+        .await,
+        400,
+        "invalid_input",
+    )
+    .await;
+    assert!(message.contains("before_seq"), "{message}");
+
+    brain.stop().await;
+}
+
+// --- export ------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_export_is_one_entry_per_line_and_an_unknown_conversation_is_a_404() {
+    let brain = TestBrain::start().await;
+    let client = brain.client();
+    let dm = brain.bot("lead").direct_conversation_id;
+    let url = format!("/api/conversations/{dm}");
+
+    post(
+        &client,
+        &brain.url(&format!("{url}/messages")),
+        &json!({"text": "export me", "addressed": []}),
+    )
+    .await;
+    brain.settle().await;
+
+    let response = get(&client, &brain.url(&format!("{url}/export"))).await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-ndjson"),
+        "the export declares what it is"
+    );
+    let text = response.text().await.expect("a body");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(!lines.is_empty(), "the transcript has entries");
+
+    // Every line is one `Entry`, and the file as a whole is the transcript in the
+    // same order `/tail` answers: an archive tool needs no second schema.
+    let mut exported: Vec<Value> = Vec::new();
+    for line in &lines {
+        let value: Value = serde_json::from_str(line)
+            .unwrap_or_else(|err| panic!("line {line:?} is not one JSON value: {err}"));
+        assert_eq!(value["conversation_id"], json!(dm.to_string()), "{value}");
+        exported.push(value);
+    }
+    let tail = array(get(&client, &brain.url(&format!("{url}/tail?limit=1000"))).await).await;
+    assert_eq!(exported, tail, "the export is the transcript");
+    assert!(
+        exported
+            .iter()
+            .any(|entry| entry["kind"]["text"] == json!("export me")),
+        "{exported:?}"
+    );
+
+    // More than one export page, so the streaming loop is exercised across a
+    // page boundary: a text finder that forgot to advance its cursor would either
+    // loop forever or silently stop at page one, and the assertions below would
+    // see a short file — the one outcome an archive must never produce.
+    let mut expected = exported.len();
+    for index in 0..(1_005 - exported.len().min(1_005)) {
+        brain
+            .swarm
+            .transcript
+            .owner_message(&dm, format!("bulk {index}"), None)
+            .expect("an entry");
+        expected += 1;
+    }
+    let full = get(&client, &brain.url(&format!("{url}/export"))).await;
+    let full_text = full.text().await.expect("a body");
+    let full_lines: Vec<&str> = full_text.lines().collect();
+    assert_eq!(
+        full_lines.len(),
+        expected,
+        "every entry is exported exactly once across page boundaries"
+    );
+    let mut previous = 0u64;
+    for line in &full_lines {
+        let value: Value = serde_json::from_str(line).expect("one Entry per line");
+        let seq = value["seq"].as_u64().expect("a seq");
+        assert!(
+            seq > previous,
+            "ascending and without repeats: {seq} after {previous}"
+        );
+        previous = seq;
+    }
+
+    // A conversation that does not exist is a 404 *before* the body starts: a
+    // 200 with an empty body would look like a successful empty export.
+    let missing = ConversationId::new();
+    expect_error(
+        get(
+            &client,
+            &brain.url(&format!("/api/conversations/{missing}/export")),
+        )
+        .await,
+        404,
+        "not_found",
+    )
+    .await;
+
+    brain.stop().await;
+}
+
+// --- metrics -----------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_report_what_the_brain_can_actually_count() {
+    let brain = TestBrain::start().await;
+    let client = brain.client();
+
+    let value = body(get(&client, &brain.url("/api/metrics")).await).await;
+    let object = value.as_object().expect("an object");
+    // Every documented field, and nothing invented: a client that prints this
+    // would otherwise be reading a number the brain made up.
+    for key in [
+        "version",
+        "uptime_secs",
+        "epoch",
+        "bots_total",
+        "bots_idle",
+        "bots_working",
+        "bots_queued",
+        "bots_error",
+        "bots_disabled",
+        "runners",
+        "turns_running",
+        "deliveries_queued",
+        "deliveries_parked",
+        "tasks_queued",
+        "tasks_running",
+        "requests_pending",
+        "nodes_total",
+        "nodes_online",
+    ] {
+        assert!(object.get(key).is_some(), "missing `{key}` in {value}");
+    }
+    assert_eq!(object.len(), 18, "{value}");
+
+    assert_eq!(value["version"], json!(env!("CARGO_PKG_VERSION")));
+    assert_eq!(value["epoch"], json!(brain.state.epoch()));
+    assert!(value["uptime_secs"].as_u64().is_some(), "{value}");
+    // The demo team is four bots, all with runners, all idle.
+    assert_eq!(value["bots_total"], json!(4), "{value}");
+    assert_eq!(value["runners"], json!(4), "{value}");
+    assert_eq!(value["bots_idle"], json!(4), "{value}");
+    assert_eq!(value["bots_working"], json!(0), "{value}");
+    assert_eq!(value["turns_running"], json!(0), "{value}");
+    // The local node is registered and online; it is the only one.
+    assert_eq!(value["nodes_total"], json!(1), "{value}");
+    assert_eq!(value["nodes_online"], json!(1), "{value}");
+    assert_eq!(value["requests_pending"], json!(0), "{value}");
+
+    // A pending card is counted, so the number is not a constant zero.
+    let lead = brain.bot("lead");
+    let dm = lead.direct_conversation_id.clone();
+    let mut request = swarmbot_contracts::request::RuntimeRequest::approval(
+        lead.id.clone(),
+        dm.clone(),
+        swarmbot_contracts::node::Surface::Shell,
+        "shell",
+        "cargo test",
+        None,
+    );
+    brain
+        .swarm
+        .approval
+        .raise_async(&mut request)
+        .expect("the card is raised");
+    let after = body(get(&client, &brain.url("/api/metrics")).await).await;
+    assert_eq!(after["requests_pending"], json!(1), "{after}");
+
+    // A disabled bot is counted apart and loses its runner: the two statuses are
+    // different facts, and a client showing "4 idle" for a muted bot lies.
+    let dev = brain.bot("dev");
+    brain
+        .swarm
+        .bots
+        .set_enabled(&dev.id, false)
+        .expect("the bot is disabled");
+    brain.swarm.ensure_runners().expect("runners reconcile");
+    let after = body(get(&client, &brain.url("/api/metrics")).await).await;
+    assert_eq!(after["bots_disabled"], json!(1), "{after}");
+    assert_eq!(after["bots_idle"], json!(3), "{after}");
+    assert_eq!(after["bots_total"], json!(4), "{after}");
+    assert_eq!(
+        after["runners"],
+        json!(3),
+        "a disabled bot gets no runner: {after}"
+    );
+    assert_eq!(after["requests_pending"], json!(1), "still the one card");
+
+    brain.stop().await;
+}
+
+// --- jobs, nodes and the rest of the operational surface ---------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn patching_a_node_narrows_what_it_may_do_and_publishes_the_row() {
+    let brain = TestBrain::start().await;
+    let client = brain.client();
+
+    // A live subscriber is how the UI learns about a roster edit; without the
+    // publish, a screen would keep showing trust the owner has withdrawn.
+    let mut events = brain.swarm.hub.subscribe(None, None);
+
+    // The local node declares `fs@1` and `shell@1`; approve only `fs`.
+    let response = patch(
+        &client,
+        &brain.url("/api/nodes/nod_local"),
+        &json!({"label": "this machine", "approved": ["fs"]}),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 200);
+    let node = body(response).await;
+    assert_eq!(node["label"], json!("this machine"));
+    assert_eq!(node["approved"], json!(["fs@1"]), "{node}");
+    assert_eq!(
+        node["declared"],
+        json!(["fs@1", "shell@1"]),
+        "declared is the node's word, not the owner's: {node}"
+    );
+
+    // The edit is stored, not merely echoed.
+    let listed = array(get(&client, &brain.url("/api/nodes")).await).await;
+    let local = listed
+        .iter()
+        .find(|node| node["id"] == json!("nod_local"))
+        .expect("the local node is still listed");
+    assert_eq!(local["label"], json!("this machine"));
+    assert_eq!(local["approved"], json!(["fs@1"]));
+    let stored = brain
+        .swarm
+        .store
+        .get_node(&NodeId::local())
+        .expect("the roster reads")
+        .expect("the local node");
+    assert_eq!(stored.label, "this machine");
+    assert!(!stored.can("shell"), "shell is no longer approved");
+    assert!(stored.can("fs"), "fs still is");
+
+    // And the row went out on the live socket.
+    let mut published = false;
+    for _ in 0..64 {
+        match tokio::time::timeout(QUICK, events.recv()).await {
+            Ok(Some(swarmbot_contracts::live::LiveEvent::NodeUpsert { node, .. })) => {
+                if node.id.is_local() && node.label == "this machine" {
+                    published = true;
+                    break;
+                }
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(published, "a roster edit must be published as Change::Node");
+
+    // Approving nothing is meaningful, and it is how an owner says "run nothing".
+    let node = body(
+        patch(
+            &client,
+            &brain.url("/api/nodes/nod_local"),
+            &json!({"approved": []}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(node["approved"], json!([]), "{node}");
+    assert_eq!(
+        node["label"],
+        json!("this machine"),
+        "the label is untouched"
+    );
+
+    // An empty patch changes nothing and answers the current row.
+    let node = body(patch(&client, &brain.url("/api/nodes/nod_local"), &json!({})).await).await;
+    assert_eq!(node["approved"], json!([]));
+
+    // A label cannot be blanked: the roster shows it as the machine's name.
+    expect_error(
+        patch(
+            &client,
+            &brain.url("/api/nodes/nod_local"),
+            &json!({"label": "   "}),
+        )
+        .await,
+        400,
+        "invalid_input",
+    )
+    .await;
+
+    // A field this API does not document is a 400, not a silent no-op.
+    expect_error(
+        patch(
+            &client,
+            &brain.url("/api/nodes/nod_local"),
+            &json!({"policy": {}}),
+        )
+        .await,
+        400,
+        "invalid_input",
+    )
+    .await;
+
+    // An unknown node is a 404.
+    expect_error(
+        patch(
+            &client,
+            &brain.url("/api/nodes/nod_00000000000000000000000000000000"),
+            &json!({"label": "ghost"}),
+        )
+        .await,
+        404,
+        "not_found",
+    )
+    .await;
+
+    brain.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approving_a_capability_the_node_never_declared_is_refused_by_name() {
+    let brain = TestBrain::start().await;
+    let client = brain.client();
+
+    let message = expect_error(
+        patch(
+            &client,
+            &brain.url("/api/nodes/nod_local"),
+            &json!({"approved": ["fs", "pty"]}),
+        )
+        .await,
+        400,
+        "invalid_input",
+    )
+    .await;
+    // The refusal names what was asked for and what the node offers: "invalid
+    // input" on its own would leave an owner guessing which name was wrong.
+    assert!(message.contains("pty@1"), "{message}");
+    assert!(message.contains("fs@1, shell@1"), "{message}");
+    assert!(
+        message.contains("cannot be raised"),
+        "the reason a brain refuses this at all: {message}"
+    );
+
+    // Nothing was written: a refused patch must not half-apply its other fields.
+    let stored = brain
+        .swarm
+        .store
+        .get_node(&NodeId::local())
+        .expect("the roster reads")
+        .expect("the local node");
+    assert!(stored.can("shell"), "{:?}", stored.approved);
+    assert!(stored.can("fs"), "{:?}", stored.approved);
+
+    brain.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn patching_a_revoked_node_is_a_conflict_and_reapproval_is_not_a_back_door() {
+    let brain = TestBrain::start().await;
+    let client = brain.client();
+
+    // A remote row that the owner already cut off.
+    let id = NodeId::new();
+    let mut node = NodeInfo::local("gone", Vec::new(), PolicyMap::default());
+    node.id = id.clone();
+    node.kind = NodeKind::Remote;
+    node.revoked = true;
+    node.online = false;
+    brain.swarm.store.insert_node(&node).expect("a revoked row");
+
+    let message = expect_error(
+        patch(
+            &client,
+            &brain.url(&format!("/api/nodes/{id}")),
+            &json!({"approved": ["shell"]}),
+        )
+        .await,
+        409,
+        "conflict",
+    )
+    .await;
+    assert!(message.contains("revoked"), "{message}");
+
+    // Re-approving would silently re-grant trust to the one machine the owner
+    // explicitly cut off, so nothing may be written.
+    let stored = brain
+        .swarm
+        .store
+        .get_node(&id)
+        .expect("the roster reads")
+        .expect("the row survives");
+    assert!(stored.revoked);
+    assert!(!stored.can("shell"), "{:?}", stored.approved);
+    assert_eq!(
+        stored.approved.as_slice(),
+        ["fs@1", "shell@1"],
+        "from hello? no: untouched"
+    );
 
     brain.stop().await;
 }

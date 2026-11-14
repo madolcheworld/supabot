@@ -231,6 +231,11 @@ impl BackendRegistry {
                     detail: error.to_string(),
                     model: entry.info.model.clone(),
                     version: None,
+                    // A transport error is not a login refusal: nothing was
+                    // asked, so this build claims nothing about auth.
+                    auth_methods: Vec::new(),
+                    auth_required: false,
+                    login_command: None,
                 },
             }
         });

@@ -18,8 +18,9 @@ use swarmbot_client::{
     NewRoutineRequest, PairingCode, SentMessage, SessionAction, TaskDetail,
 };
 use swarmbot_contracts::{
-    Bot, BotId, Conversation, ConversationId, Decision, EntryId, NodeId, NodeInfo, RequestId,
-    Routine, RoutineId, RoutineRun, RuntimeRequest, Settings, Task, TaskId, UsageReport,
+    ApprovalRule, Bot, BotId, Conversation, ConversationId, Decision, Entry, EntryId, NodeId,
+    NodeInfo, RequestId, Routine, RoutineId, RoutineRun, RuleId, RuntimeRequest, Settings, Task,
+    TaskId, UsageReport,
 };
 
 /// The REST surface the UI uses. Object-safe and `Send + Sync` so the worker
@@ -66,6 +67,13 @@ pub trait Brain: Send + Sync {
     fn update_settings(&self, patch: &Value) -> Result<Settings, ClientError>;
     fn backends(&self) -> Result<Vec<BackendView>, ClientError>;
     fn probe_backends(&self) -> Result<Vec<BackendProbe>, ClientError>;
+    /// The Connect action for one backend: the handshake, plus `method` when the
+    /// owner picked one of the logins the backend advertised. No model call.
+    fn connect_backend(
+        &self,
+        backend: &str,
+        method: Option<&str>,
+    ) -> Result<BackendProbe, ClientError>;
     /// PATCH one bot (the provider menu switches `backend` / `model`).
     fn update_bot(&self, id_or_name: &str, patch: &Value) -> Result<Bot, ClientError>;
     /// The models one backend advertises (empty = it offers no menu).
@@ -84,6 +92,19 @@ pub trait Brain: Send + Sync {
     /// `GET /api/usage` — what the backends reported the team spent in a
     /// window. `since` is RFC 3339 text; `None` asks for the brain's default.
     fn usage(&self, since: Option<&str>) -> Result<UsageReport, ClientError>;
+    /// `GET /api/rules` — the saved approval rules.
+    fn rules(&self) -> Result<Vec<ApprovalRule>, ClientError>;
+    /// `DELETE /api/rules/{id}` — unsave one rule.
+    fn delete_rule(&self, id: &RuleId) -> Result<(), ClientError>;
+    /// One page of older entries: `seq < before_seq`, ascending. The bound is
+    /// exclusive and `limit` is passed through unchanged, so the caller can read
+    /// a short page as "the beginning" (see the trait's own doc on the client).
+    fn entries_before(
+        &self,
+        id: &ConversationId,
+        before_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<Entry>, ClientError>;
     fn shutdown(&self) -> Result<(), ClientError>;
 }
 
@@ -192,6 +213,13 @@ impl Brain for ClientBrain {
     fn probe_backends(&self) -> Result<Vec<BackendProbe>, ClientError> {
         self.client.probe_backends()
     }
+    fn connect_backend(
+        &self,
+        backend: &str,
+        method: Option<&str>,
+    ) -> Result<BackendProbe, ClientError> {
+        self.client.connect_backend(backend, method)
+    }
     fn nodes(&self) -> Result<Vec<NodeInfo>, ClientError> {
         self.client.nodes()
     }
@@ -219,6 +247,20 @@ impl Brain for ClientBrain {
     }
     fn usage(&self, since: Option<&str>) -> Result<UsageReport, ClientError> {
         self.client.usage(since)
+    }
+    fn rules(&self) -> Result<Vec<ApprovalRule>, ClientError> {
+        self.client.rules()
+    }
+    fn delete_rule(&self, id: &RuleId) -> Result<(), ClientError> {
+        self.client.delete_rule(id)
+    }
+    fn entries_before(
+        &self,
+        id: &ConversationId,
+        before_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<Entry>, ClientError> {
+        self.client.entries_before(id, before_seq, limit)
     }
     fn shutdown(&self) -> Result<(), ClientError> {
         self.client.shutdown()
@@ -479,7 +521,39 @@ pub mod scripted {
                 detail: Some("scripted".into()),
                 model: Some("fake".into()),
                 version: None,
+                auth_methods: Vec::new(),
+                auth_required: false,
+                login_command: None,
             }])
+        }
+
+        fn connect_backend(
+            &self,
+            backend: &str,
+            method: Option<&str>,
+        ) -> Result<BackendProbe, ClientError> {
+            // The method id is part of the record so a reducer/worker test can
+            // assert which login the click asked for (and that a plain Connect
+            // sends none).
+            self.record(
+                "connect_backend",
+                format!("{backend} {}", method.unwrap_or("-")),
+            );
+            self.maybe_fail(BackendProbe {
+                backend: backend.to_string(),
+                ok: false,
+                detail: Some("Authentication required".into()),
+                model: None,
+                version: None,
+                auth_methods: vec![swarmbot_client::BackendAuthMethod {
+                    id: "claude-login".into(),
+                    name: "Log in with [CC]".into(),
+                    description: Some("Run `claude /login` in the terminal".into()),
+                    command: None,
+                }],
+                auth_required: true,
+                login_command: Some("claude /login".into()),
+            })
         }
         fn nodes(&self) -> Result<Vec<NodeInfo>, ClientError> {
             self.record("nodes", "");
@@ -558,6 +632,32 @@ pub mod scripted {
             _limit: Option<u32>,
         ) -> Result<Vec<RoutineRun>, ClientError> {
             self.record("routine_runs", id.to_string());
+            self.maybe_fail(Vec::new())
+        }
+        fn rules(&self) -> Result<Vec<ApprovalRule>, ClientError> {
+            self.record("rules", "");
+            self.maybe_fail(vec![ApprovalRule::new(
+                swarmbot_contracts::RuleScope::Global,
+                swarmbot_contracts::RuleEffect::Allow,
+            )])
+        }
+        fn delete_rule(&self, id: &RuleId) -> Result<(), ClientError> {
+            self.record("delete_rule", id.to_string());
+            self.maybe_fail(())
+        }
+        fn entries_before(
+            &self,
+            id: &ConversationId,
+            before_seq: u64,
+            limit: u32,
+        ) -> Result<Vec<Entry>, ClientError> {
+            // The bound and the limit are recorded: they are what the "Load
+            // earlier" button's correctness hangs on, so a test must be able to
+            // assert the exact request it produced.
+            self.record(
+                "entries_before",
+                format!("{id} <{before_seq} limit {limit}"),
+            );
             self.maybe_fail(Vec::new())
         }
         fn usage(&self, since: Option<&str>) -> Result<UsageReport, ClientError> {

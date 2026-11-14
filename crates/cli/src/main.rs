@@ -24,6 +24,27 @@
 //! indistinguishable; [`main`] maps the parse failure instead of letting clap
 //! exit. `--json` runs also end with one machine-readable object naming the
 //! reason, so a script does not have to parse prose.
+//!
+//! # Reading and writing
+//!
+//! The commands split into two halves, and the reason is worth stating because it
+//! is the shape of the whole surface:
+//!
+//! * **reading** — `run`, `chat`, `bots ls`, `groups ls`, `transcript`, `tasks
+//!   ls`, `nodes ls`, `usage`, `config show`, `status`. These never change a
+//!   brain, so the in-process half is composed **without booting** ([`Embedded`]):
+//!   listing a roster must not provision a team into an empty data dir.
+//! * **writing** — `rules`, `requests`, `routines`, `config set`, `config key`,
+//!   `bots edit`, `nodes revoke`. Each one is in [`crate::admin`], and each works
+//!   in both modes through [`Session`]; the two places where a mode genuinely
+//!   cannot answer (`nodes revoke` in-process, and anything that belongs to the
+//!   daemon's own filesystem) say so in a typed refusal that names the reason,
+//!   never by returning a plausible-looking nothing.
+//!
+//! Two cross-cutting rules hold for every command in the second half: `--json`
+//! follows the existing shapes (one object per line for a list, one whole object
+//! for a single answer), and a value the brain refused is repeated with the
+//! brain's own status and sentence rather than paraphrased.
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -39,6 +60,7 @@ use swarmbot_contracts::id::ConversationId;
 use swarmbot_contracts::node::{NodeInfo, NodeKind, RootMode};
 use swarmbot_core::swarm::Swarm;
 
+mod admin;
 mod config;
 mod demo;
 mod embedded;
@@ -55,12 +77,17 @@ use embedded::{BrainParams, Embedded, drain_quiescent, emit_event};
 use remote::{Backend, Remote};
 use render::{Printer, Roster, RunStop, Theme};
 use resolve::Directory;
-use session::{Session, wait_for_idle};
+use session::{BotEdit, Session, wait_for_idle};
 
 /// How long `shutdown` keeps probing the brain after it acknowledged, before
 /// reporting that it was still answering. The daemon lets the turns in flight
 /// finish first, so "it said ok" and "it is gone" are different facts.
 const SHUTDOWN_WATCH: Duration = Duration::from_secs(10);
+
+/// How many entries `transcript` prints when `--limit` is not given. The same
+/// window `chat` opens with, so "what I saw in the chat" and "what the
+/// transcript printed" are the same slice of history.
+const DEFAULT_TRANSCRIPT_LIMIT: u32 = 50;
 
 /// The exit-code table, in `--help` as well as in the module docs: the codes are
 /// a contract, and a contract nobody can look up from the terminal is folklore.
@@ -191,12 +218,40 @@ enum Command {
         #[command(subcommand)]
         command: GroupsCommand,
     },
+    /// Saved approval rules — what an "always allow" answer wrote.
+    Rules {
+        #[command(subcommand)]
+        command: RulesCommand,
+    },
+    /// Cards waiting for an answer, in every conversation — not only the one a
+    /// chat is looking at.
+    Requests {
+        #[command(subcommand)]
+        command: RequestsCommand,
+    },
+    /// Scheduled prompts a bot runs on an interval or a cron.
+    Routines {
+        #[command(subcommand)]
+        command: RoutinesCommand,
+    },
     /// Print a conversation's transcript.
     Transcript {
         /// Bot handle, group title or conversation id.
         target: String,
-        #[arg(long, default_value = "50")]
-        limit: u32,
+        /// How many of the newest entries to print (default 50).
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+        /// Page **backwards**: print the `--limit` entries older than this
+        /// sequence number (exclusive), ascending. `swarmbot transcript` with no
+        /// `--before` prints the newest window.
+        #[arg(long, value_name = "SEQ", conflicts_with = "out")]
+        before: Option<u64>,
+        /// Write the whole conversation as NDJSON (one `Entry` per line) to
+        /// FILE instead of printing a window. Refuses `--limit`/`--before`:
+        /// an export that silently honoured one of them would be a partial
+        /// history wearing the name of a complete one.
+        #[arg(long, value_name = "FILE", conflicts_with = "json")]
+        out: Option<PathBuf>,
         /// One JSON object per line (Entry) instead of prose.
         #[arg(long)]
         json: bool,
@@ -231,6 +286,12 @@ enum Command {
         #[command(subcommand)]
         command: BackupCommand,
     },
+    /// What the roster and the queues are doing right now.
+    Status {
+        /// One JSON object (the whole snapshot) instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
     /// Ask a remote brain (--brain) to stop, and say whether it did.
     Shutdown,
 }
@@ -239,6 +300,117 @@ enum Command {
 enum BotsCommand {
     /// List every bot with its backend, status and DM.
     Ls,
+    /// Change what a bot runs on, whether it is woken, and its skills.
+    Edit {
+        /// Bot handle (or id).
+        name: String,
+        /// Backend id; the brain refuses one it has not configured.
+        #[arg(long, value_name = "ID")]
+        backend: Option<String>,
+        /// Model override; an empty string goes back to the backend's default.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Wake this bot again.
+        #[arg(long, conflicts_with = "disabled")]
+        enabled: bool,
+        /// Mute this bot: nothing wakes it, and its runner is stopped.
+        #[arg(long, conflicts_with = "enabled")]
+        disabled: bool,
+        /// Comma-separated skill names; an empty string clears them.
+        #[arg(long, value_name = "A,B")]
+        skills: Option<String>,
+        /// One JSON object (the bot as saved) instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RulesCommand {
+    /// List the saved approval rules.
+    Ls {
+        /// One JSON object (ApprovalRule) per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Unsave one rule; the next identical ask reaches a human again.
+    Rm {
+        /// Rule id, or the tail of one as `rules ls` prints it.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RequestsCommand {
+    /// List the cards waiting for an answer, in every conversation.
+    Ls {
+        /// One JSON object (RuntimeRequest) per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Answer one waiting card — an approval, or a question's free text.
+    Answer {
+        /// Request id, or the tail of one as `requests ls` prints it.
+        id: String,
+        /// Allow this one action.
+        #[arg(long, conflicts_with_all = ["always", "deny", "answer"])]
+        allow_once: bool,
+        /// Allow it and save a rule for the identical ask.
+        #[arg(long, conflicts_with_all = ["allow_once", "deny", "answer"])]
+        always: bool,
+        /// Refuse this one action.
+        #[arg(long, conflicts_with_all = ["allow_once", "always", "answer"])]
+        deny: bool,
+        /// Free text for a question, a form or a hand-off.
+        #[arg(long, value_name = "TEXT", conflicts_with_all = ["allow_once", "always", "deny"])]
+        answer: Option<String>,
+        /// One JSON object (the settled RuntimeRequest) instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RoutinesCommand {
+    /// List every routine with its schedule and next run.
+    Ls {
+        /// One JSON object (Routine) per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a routine from firing; nothing is deleted.
+    Pause {
+        /// Routine id, or the tail of one as `routines ls` prints it.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Let a paused routine fire again.
+    Resume {
+        /// Routine id, or the tail of one as `routines ls` prints it.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a routine.
+    Rm {
+        /// Routine id, or the tail of one as `routines ls` prints it.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// A routine's past runs, newest first.
+    Runs {
+        /// Routine id, or the tail of one as `routines ls` prints it.
+        id: String,
+        #[arg(long, default_value = "50")]
+        limit: u32,
+        /// One JSON object (RoutineRun) per line.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -263,6 +435,15 @@ enum NodesCommand {
     /// Mint a one-time pairing code and print the `swarmbot-node pair` line.
     /// Needs --brain.
     Pair,
+    /// Revoke a node's pairing: it drops offline and may not redial. Needs
+    /// --brain — a node pairs with the daemon's gateway, and an in-process brain
+    /// has no gateway to pair with.
+    Revoke {
+        /// Node id, or the tail of one as `nodes ls` prints it.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -270,6 +451,46 @@ enum ConfigCommand {
     /// Show the effective config — never a key value. With --brain, the brain's
     /// own settings and backends instead of a local file.
     Show,
+    /// Change one setting on the live brain (both modes: the in-process one and
+    /// a daemon). The value is validated by the brain's own rules.
+    Set {
+        /// Setting name; `config set` refuses an unknown one and lists the rest.
+        key: String,
+        /// The new value. `off`/`none`/`null` clears an optional cap.
+        value: String,
+        /// One JSON object (the saved Settings) instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
+    /// API keys the backends read — by name. A value is never printed, and
+    /// `set` reads it from stdin (or a no-echo prompt), never from argv, where
+    /// `ps` would publish it.
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// List the key names this brain would load, and which backends name them.
+    Ls {
+        /// One JSON object per line: `{"name": …, "used_by": […], "set": …}`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add or replace one key. The value is read from stdin, never from argv.
+    Set {
+        /// The variable name (or secrets.json key) the backend reads.
+        name: String,
+    },
+    /// Remove one key.
+    Rm {
+        name: String,
+        /// One JSON object describing what was removed, by name only.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -502,25 +723,97 @@ async fn dispatch(cli: &Cli) -> Result<i32> {
         }
         Command::Bots { command } => match command {
             BotsCommand::Ls => cmd_bots_ls(cli).await,
+            BotsCommand::Edit {
+                name,
+                backend,
+                model,
+                enabled,
+                disabled,
+                skills,
+                json,
+            } => {
+                cmd_bots_edit(
+                    cli,
+                    name,
+                    backend.as_deref(),
+                    model.as_deref(),
+                    *enabled,
+                    *disabled,
+                    skills.as_deref(),
+                    *json,
+                )
+                .await
+            }
         },
         Command::Groups { command } => match command {
             GroupsCommand::Ls => cmd_groups_ls(cli).await,
         },
+        Command::Rules { command } => match command {
+            RulesCommand::Ls { json } => cmd_rules_ls(cli, *json).await,
+            RulesCommand::Rm { id, json } => cmd_rules_rm(cli, id, *json).await,
+        },
+        Command::Requests { command } => match command {
+            RequestsCommand::Ls { json } => cmd_requests_ls(cli, *json).await,
+            RequestsCommand::Answer {
+                id,
+                allow_once,
+                always,
+                deny,
+                answer,
+                json,
+            } => {
+                cmd_requests_answer(
+                    cli,
+                    id,
+                    *allow_once,
+                    *always,
+                    *deny,
+                    answer.as_deref(),
+                    *json,
+                )
+                .await
+            }
+        },
+        Command::Routines { command } => match command {
+            RoutinesCommand::Ls { json } => cmd_routines_ls(cli, *json).await,
+            RoutinesCommand::Pause { id, json } => {
+                cmd_routines_change(cli, admin::RoutineAction::Pause, id, *json).await
+            }
+            RoutinesCommand::Resume { id, json } => {
+                cmd_routines_change(cli, admin::RoutineAction::Resume, id, *json).await
+            }
+            RoutinesCommand::Rm { id, json } => {
+                cmd_routines_change(cli, admin::RoutineAction::Delete, id, *json).await
+            }
+            RoutinesCommand::Runs { id, limit, json } => {
+                cmd_routines_runs(cli, id, *limit, *json).await
+            }
+        },
         Command::Transcript {
             target,
             limit,
+            before,
+            out,
             json,
-        } => cmd_transcript(cli, target, *limit, *json).await,
+        } => cmd_transcript(cli, target, *limit, *before, out.clone(), *json).await,
         Command::Tasks { command } => match command {
             TasksCommand::Ls { bot } => cmd_tasks_ls(cli, bot.as_deref()).await,
         },
         Command::Nodes { command } => match command {
             NodesCommand::Ls => cmd_nodes_ls(cli).await,
             NodesCommand::Pair => cmd_nodes_pair(cli).await,
+            NodesCommand::Revoke { id, json } => cmd_nodes_revoke(cli, id, *json).await,
         },
         Command::Config { command } => match command {
             ConfigCommand::Show => cmd_config_show(cli).await,
+            ConfigCommand::Set { key, value, json } => cmd_config_set(cli, key, value, *json).await,
+            ConfigCommand::Key { command } => match command {
+                KeyCommand::Ls { json } => cmd_key_ls(cli, *json).await,
+                KeyCommand::Set { name } => cmd_key_set(cli, name).await,
+                KeyCommand::Rm { name, json } => cmd_key_rm(cli, name, *json).await,
+            },
         },
+        Command::Status { json } => cmd_status(cli, *json).await,
         Command::Usage { since, json } => cmd_usage(cli, since.as_deref(), *json).await,
         Command::Backup { command } => match command {
             BackupCommand::Create { out } => cmd_backup_create(cli, out.clone()).await,
@@ -1201,6 +1494,164 @@ fn list_bots<S: Session>(session: &S, printer: &mut Printer<std::io::Stdout>) ->
     Ok(0)
 }
 
+/// `swarmbot bots edit <name> …`
+///
+/// Both modes, through the port: the embedded half changes the roster in this
+/// process's store, the remote half sends the same fields as a
+/// `PATCH /api/bots/{id}`. A flag-less edit is refused before either is asked —
+/// a "saved" line for a request that changed nothing is the kind of lie this CLI
+/// exists not to tell.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_bots_edit(
+    cli: &Cli,
+    name: &str,
+    backend: Option<&str>,
+    model: Option<&str>,
+    enabled: bool,
+    disabled: bool,
+    skills: Option<&str>,
+    json: bool,
+) -> Result<i32> {
+    let edit = BotEdit {
+        backend: backend.map(str::to_string),
+        model: model.map(str::to_string),
+        enabled: match (enabled, disabled) {
+            // clap already refuses both flags together; this keeps the mapping
+            // total without a panic.
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
+        skills: skills.map(parse_skills),
+    };
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => admin::bots_edit(&embedded, name, &edit, json, &mut printer),
+        Backend::Remote(remote) => admin::bots_edit(&remote, name, &edit, json, &mut printer),
+    }
+}
+
+/// `--skills a,b` — trimmed, empty entries dropped. An empty string is an empty
+/// list, which is how an owner clears a bot's skills (the brain stores what it
+/// is sent, so `[]` and "nobody said" are different things).
+fn parse_skills(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|skill| !skill.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `swarmbot rules ls` / `rules rm <id>`
+async fn cmd_rules_ls(cli: &Cli, json: bool) -> Result<i32> {
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => admin::rules_list(&embedded, json, &mut printer),
+        Backend::Remote(remote) => admin::rules_list(&remote, json, &mut printer),
+    }
+}
+
+async fn cmd_rules_rm(cli: &Cli, id: &str, json: bool) -> Result<i32> {
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => admin::rules_remove(&embedded, id, json, &mut printer),
+        Backend::Remote(remote) => admin::rules_remove(&remote, id, json, &mut printer),
+    }
+}
+
+/// `swarmbot requests ls`
+async fn cmd_requests_ls(cli: &Cli, json: bool) -> Result<i32> {
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => admin::requests_list(&embedded, json, &mut printer),
+        Backend::Remote(remote) => admin::requests_list(&remote, json, &mut printer),
+    }
+}
+
+/// `swarmbot requests answer <id> …`
+///
+/// The one flag that applies is required, in so many words: a card answered by
+/// silence would settle with no decision, which a tool gate reads as a denial
+/// while the human who typed nothing believes they left it alone.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_requests_answer(
+    cli: &Cli,
+    id: &str,
+    allow_once: bool,
+    always: bool,
+    deny: bool,
+    answer: Option<&str>,
+    json: bool,
+) -> Result<i32> {
+    let answer = admin::answer_from_flags(allow_once, always, deny, answer)?;
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => {
+            admin::requests_answer(&embedded, id, &answer, json, &mut printer)
+        }
+        Backend::Remote(remote) => admin::requests_answer(&remote, id, &answer, json, &mut printer),
+    }
+}
+
+/// `swarmbot routines ls`
+async fn cmd_routines_ls(cli: &Cli, json: bool) -> Result<i32> {
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => admin::routines_list(&embedded, json, &mut printer),
+        Backend::Remote(remote) => admin::routines_list(&remote, json, &mut printer),
+    }
+}
+
+/// `swarmbot routines pause|resume|rm <id>`
+async fn cmd_routines_change(
+    cli: &Cli,
+    action: admin::RoutineAction,
+    id: &str,
+    json: bool,
+) -> Result<i32> {
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => {
+            admin::routines_change(&embedded, action, id, json, &mut printer)
+        }
+        Backend::Remote(remote) => admin::routines_change(&remote, action, id, json, &mut printer),
+    }
+}
+
+/// `swarmbot routines runs <id>`
+async fn cmd_routines_runs(cli: &Cli, id: &str, limit: u32, json: bool) -> Result<i32> {
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => {
+            admin::routines_runs(&embedded, id, limit, json, &mut printer)
+        }
+        Backend::Remote(remote) => admin::routines_runs(&remote, id, limit, json, &mut printer),
+    }
+}
+
+/// `swarmbot config set <key> <value>`
+///
+/// Both modes write to the *brain's* live settings — the daemon's over `PATCH
+/// /api/settings`, the in-process one through its own `SettingsHandle`. Neither
+/// writes the TOML file: a `config set` that quietly edited a file the running
+/// brain never re-read would report a change that is not in effect.
+async fn cmd_config_set(cli: &Cli, key: &str, value: &str, json: bool) -> Result<i32> {
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => admin::config_set(&embedded, key, value, json, &mut printer),
+        Backend::Remote(remote) => admin::config_set(&remote, key, value, json, &mut printer),
+    }
+}
+
+/// `swarmbot status`
+async fn cmd_status(cli: &Cli, json: bool) -> Result<i32> {
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => admin::status(&embedded, json, &mut printer),
+        Backend::Remote(remote) => admin::status(&remote, json, &mut printer),
+    }
+}
+
 async fn cmd_groups_ls(cli: &Cli) -> Result<i32> {
     let mut printer = stdout_printer(cli, false);
     match backend_for(cli).await? {
@@ -1220,30 +1671,74 @@ fn list_groups<S: Session>(session: &S, printer: &mut Printer<std::io::Stdout>) 
     Ok(0)
 }
 
-async fn cmd_transcript(cli: &Cli, target: &str, limit: u32, json: bool) -> Result<i32> {
+async fn cmd_transcript(
+    cli: &Cli,
+    target: &str,
+    limit: Option<u32>,
+    before: Option<u64>,
+    out: Option<PathBuf>,
+    json: bool,
+) -> Result<i32> {
+    admin::check_export_flags(out.is_some(), limit)?;
+    let limit = limit.unwrap_or(DEFAULT_TRANSCRIPT_LIMIT);
     let mut printer = stdout_printer(cli, json);
     match backend_for(cli).await? {
-        Backend::Embedded(embedded) => transcript(&embedded, target, limit, json, &mut printer),
-        Backend::Remote(remote) => transcript(&remote, target, limit, json, &mut printer),
+        Backend::Embedded(embedded) => transcript(
+            &embedded,
+            target,
+            limit,
+            before,
+            out.as_deref(),
+            json,
+            &mut printer,
+        ),
+        Backend::Remote(remote) => transcript(
+            &remote,
+            target,
+            limit,
+            before,
+            out.as_deref(),
+            json,
+            &mut printer,
+        ),
     }
 }
 
+/// Print a transcript window, or write the whole thing out.
+///
+/// `before` pages backwards — the `--limit` entries older than a sequence
+/// number — and without it the newest window is shown. `out` is a different job
+/// on purpose: the **whole** conversation as NDJSON. It refuses to share a
+/// command line with `--before` (clap does that) rather than quietly ignoring it,
+/// because a complete export is the one thing a `--before` must not narrow.
 fn transcript<S: Session, W: Write>(
     session: &S,
     target: &str,
     limit: u32,
+    before: Option<u64>,
+    out: Option<&std::path::Path>,
     json: bool,
     printer: &mut Printer<W>,
 ) -> Result<i32> {
     let directory = Directory::new(session.bots()?, session.conversations()?);
     let resolved = directory.resolve(target)?;
+    if let Some(path) = out {
+        // A file of rows, not a rendering: whatever the brain sends is what
+        // lands on disk, byte for byte.
+        let body = session.export_transcript(resolved.conversation_id())?;
+        admin::write_export(&body, Some(path), printer)?;
+        return Ok(0);
+    }
     if !json {
         printer.note(&format!("transcript: {}", resolved.describe()))?;
         if let Some(hint) = directory.ambiguity_hint(target, &resolved) {
             printer.note(&hint)?;
         }
     }
-    let entries = session.tail(resolved.conversation_id(), limit)?;
+    let entries = match before {
+        Some(seq) => session.entries_before(resolved.conversation_id(), seq, limit)?,
+        None => session.tail(resolved.conversation_id(), limit)?,
+    };
     if json {
         for entry in &entries {
             // One object per line, like `run --json`: greppable, diffable.
@@ -1261,6 +1756,16 @@ fn transcript<S: Session, W: Write>(
         }
         if let Ok(requests) = session.pending_in(resolved.conversation_id()) {
             roster.adopt_requests(requests);
+        }
+        if entries.is_empty()
+            && let Some(seq) = before
+        {
+            // The difference matters: "there is nothing older than seq N" is not
+            // "this conversation is empty".
+            printer.note(&format!(
+                "no entries older than seq {seq} in {}",
+                resolved.describe()
+            ))?;
         }
         for entry in &entries {
             printer.entry(entry, &roster)?;
@@ -1310,6 +1815,21 @@ fn list_nodes<S: Session>(session: &S, printer: &mut Printer<std::io::Stdout>) -
         printer.line(&line)?;
     }
     Ok(0)
+}
+
+/// `swarmbot nodes revoke <id>`
+///
+/// The id is resolved against the roster first, so a typo is a not-found rather
+/// than a `DELETE` of a row nobody meant. An in-process brain then refuses for
+/// its own honest reason (see `Embedded::revoke_node`): it has no gateway for a
+/// remote machine to pair with, and revoking the local node would leave every
+/// tool call failing.
+async fn cmd_nodes_revoke(cli: &Cli, id: &str, json: bool) -> Result<i32> {
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => admin::nodes_revoke(&embedded, id, json, &mut printer),
+        Backend::Remote(remote) => admin::nodes_revoke(&remote, id, json, &mut printer),
+    }
 }
 
 /// Mint a pairing code on the daemon and print the line the node operator runs.
@@ -1599,6 +2119,102 @@ async fn cmd_usage(cli: &Cli, since: Option<&str>, json: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// `swarmbot config key ls`
+///
+/// The credential names the brain would load — the file's, plus the environment
+/// variables its backends name. **Never a value**: the whole point of this
+/// command is that an owner can see which keys exist without opening a 0600
+/// file, and a listing that printed one would undo that file's mode.
+async fn cmd_key_ls(cli: &Cli, json: bool) -> Result<i32> {
+    let mut printer = stdout_printer(cli, json);
+    match backend_for(cli).await? {
+        Backend::Embedded(embedded) => list_keys(&embedded, json, &mut printer),
+        Backend::Remote(remote) => list_keys(&remote, json, &mut printer),
+    }
+}
+
+fn list_keys<S: Session>(
+    session: &S,
+    json: bool,
+    printer: &mut Printer<std::io::Stdout>,
+) -> Result<i32> {
+    let secrets = session.secrets()?;
+    if json {
+        for secret in &secrets {
+            printer.line(&serde_json::to_string(secret)?)?;
+        }
+        return Ok(0);
+    }
+    if secrets.is_empty() {
+        printer.note(
+            "no credential names — `swarmbot config key set <NAME>` writes one, and the value \
+             comes from stdin rather than this command line",
+        )?;
+        return Ok(0);
+    }
+    printer.heading("credentials (names only — a value is never printed)")?;
+    for line in admin::keys_lines(&secrets) {
+        printer.line(&line)?;
+    }
+    Ok(0)
+}
+
+/// `swarmbot config key set <name>`
+///
+/// The value comes from stdin — a pipe or a no-echo terminal prompt — and never
+/// from this command's arguments, because argv is readable by every other
+/// process on the box (`ps aux` is the cheapest credential leak there is).
+async fn cmd_key_set(cli: &Cli, name: &str) -> Result<i32> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(anyhow!("a key needs a name"));
+    }
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    let value = if stdin_is_tty {
+        let prompt = format!("value for {name} (input is not echoed): ");
+        tokio::task::spawn_blocking(move || remote::prompt_secret(&prompt))
+            .await
+            .map_err(|err| anyhow!("the value prompt stopped: {err}"))??
+    } else {
+        // A pipe: one line, newline stripped. Reading to EOF would swallow a
+        // second key fed on the same stdin.
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        let line = line.trim_end_matches(['\n', '\r']).to_string();
+        if line.trim().is_empty() {
+            return Err(anyhow!(
+                "no value on stdin — pipe one in (`printf %s \"$KEY\" | swarmbot config key set \
+                 {name}`) or run this on a terminal"
+            ));
+        }
+        line
+    };
+    let mut printer = stdout_printer(cli, false);
+    let report = match backend_for(cli).await? {
+        Backend::Embedded(embedded) => embedded.set_secret(&name, &value)?,
+        Backend::Remote(remote) => remote.set_secret(&name, &value)?,
+    };
+    printer.line(&format!("{} written ({})", report.name, report.applies))?;
+    printer.note(&admin::applies_hint())?;
+    Ok(0)
+}
+
+/// `swarmbot config key rm <name>`
+async fn cmd_key_rm(cli: &Cli, name: &str, json: bool) -> Result<i32> {
+    let report = match backend_for(cli).await? {
+        Backend::Embedded(embedded) => embedded.delete_secret(name)?,
+        Backend::Remote(remote) => remote.delete_secret(name)?,
+    };
+    let mut printer = stdout_printer(cli, json);
+    if json {
+        printer.line(&serde_json::to_string(&report)?)?;
+        return Ok(0);
+    }
+    printer.line(&format!("{} removed ({})", report.name, report.applies))?;
+    printer.note(&admin::applies_hint())?;
+    Ok(0)
+}
+
 async fn cmd_shutdown(cli: &Cli) -> Result<i32> {
     let Some(url) = &cli.brain else {
         return Err(remote::needs_brain(
@@ -1617,6 +2233,15 @@ async fn cmd_shutdown(cli: &Cli) -> Result<i32> {
     Ok(0)
 }
 
+/// One row per node.
+///
+/// The three capability sets are printed separately on purpose: `declare` is
+/// what the machine says it can do, `approve` is what the owner turned on, and
+/// the effective set is their intersection — the only one the brain routes on.
+/// Printing just the intersection hides a node that declared `pty@1` and was
+/// only approved for `shell@1`, which is exactly the fact an owner needs before
+/// widening anything (a pairing code grants no capability the node did not
+/// already declare).
 fn nodes_lines(nodes: &[NodeInfo]) -> Vec<String> {
     nodes
         .iter()
@@ -1625,7 +2250,15 @@ fn nodes_lines(nodes: &[NodeInfo]) -> Vec<String> {
                 NodeKind::Local => "local",
                 NodeKind::Remote => "remote",
             };
-            let presence = if node.online { "online" } else { "offline" };
+            // `revoked` replaces the presence word: a revoked node that still
+            // says "offline" reads as "it will come back".
+            let presence = if node.revoked {
+                "revoked"
+            } else if node.online {
+                "online"
+            } else {
+                "offline"
+            };
             let caps = node.capabilities();
             let roots: Vec<String> = node
                 .roots
@@ -1638,13 +2271,27 @@ fn nodes_lines(nodes: &[NodeInfo]) -> Vec<String> {
                     format!("{}:{}({mode})", root.id, root.path)
                 })
                 .collect();
-            format!(
-                "{} \"{}\" {kind} {presence} caps [{}] roots [{}]",
+            let declared = node.declared.as_slice().join(", ");
+            let approved = node.approved.as_slice().join(", ");
+            let mut line = format!(
+                "{} \"{}\" {kind} {presence} caps [{}] declared [{declared}] approved [{approved}]",
                 node.id,
                 node.label,
-                caps.as_slice().join(", "),
-                roots.join(", ")
-            )
+                caps.as_slice().join(", ")
+            );
+            // The gap is the interesting part, so name it when there is one.
+            let withheld: Vec<&str> = node
+                .declared
+                .as_slice()
+                .iter()
+                .filter(|cap| !node.approved.as_slice().contains(cap))
+                .map(String::as_str)
+                .collect();
+            if !withheld.is_empty() && !node.revoked {
+                line.push_str(&format!(" (not approved: {})", withheld.join(", ")));
+            }
+            line.push_str(&format!(" roots [{}]", roots.join(", ")));
+            line
         })
         .collect()
 }
@@ -2120,6 +2767,157 @@ mod tests {
         let err = pick_run_conversation(&swarm, Some("Nope"), None).expect_err("missing");
         assert!(err.to_string().contains("no group called"), "{err}");
         embedded.shutdown().await;
+    }
+
+    /// The flag surface of the new commands: what parses, what must not, and the
+    /// conflicts that keep a command from meaning two things at once.
+    #[test]
+    fn the_write_commands_parse_and_refuse_a_contradiction() {
+        // Happy paths: every documented form parses.
+        for argv in [
+            vec!["swarmbot", "rules", "ls"],
+            vec!["swarmbot", "rules", "rm", "rul_abc"],
+            vec!["swarmbot", "requests", "ls"],
+            vec!["swarmbot", "requests", "answer", "req_1", "--allow-once"],
+            vec!["swarmbot", "requests", "answer", "req_1", "--always"],
+            vec!["swarmbot", "requests", "answer", "req_1", "--deny"],
+            vec![
+                "swarmbot", "requests", "answer", "req_1", "--answer", "staging",
+            ],
+            vec!["swarmbot", "routines", "ls"],
+            vec!["swarmbot", "routines", "pause", "rtn_1"],
+            vec!["swarmbot", "routines", "resume", "rtn_1"],
+            vec!["swarmbot", "routines", "rm", "rtn_1"],
+            vec!["swarmbot", "routines", "runs", "rtn_1"],
+            vec!["swarmbot", "nodes", "revoke", "nod_1"],
+            vec!["swarmbot", "config", "set", "max_hops", "3"],
+            vec!["swarmbot", "config", "key", "ls"],
+            vec!["swarmbot", "config", "key", "set", "X_API_KEY"],
+            vec!["swarmbot", "config", "key", "rm", "X_API_KEY"],
+            vec!["swarmbot", "status"],
+            vec!["swarmbot", "bots", "edit", "lead", "--model", "m2"],
+            vec!["swarmbot", "bots", "edit", "lead", "--disabled"],
+            vec!["swarmbot", "transcript", "lead", "--before", "42"],
+            vec!["swarmbot", "transcript", "lead", "--out", "t.ndjson"],
+            // `--limit` parses alongside `--out`: the flag has no default any
+            // more, but clap's job ends at "both were typed", and the *command*
+            // is where the contradiction is explained in words.
+            vec![
+                "swarmbot",
+                "transcript",
+                "lead",
+                "--out",
+                "t.ndjson",
+                "--limit",
+                "5",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(&argv).is_ok(), "{argv:?} should parse");
+        }
+
+        // A question and an approval answer are different things: two answers on
+        // one card would settle it twice.
+        for argv in [
+            vec![
+                "swarmbot",
+                "requests",
+                "answer",
+                "req_1",
+                "--allow-once",
+                "--deny",
+            ],
+            vec![
+                "swarmbot", "requests", "answer", "req_1", "--always", "--answer", "ok",
+            ],
+            // A bot cannot be both enabled and disabled.
+            vec![
+                "swarmbot",
+                "bots",
+                "edit",
+                "lead",
+                "--enabled",
+                "--disabled",
+            ],
+            // An export is the whole transcript; a backwards page narrows it.
+            vec![
+                "swarmbot",
+                "transcript",
+                "lead",
+                "--out",
+                "t.ndjson",
+                "--before",
+                "5",
+            ],
+            vec![
+                "swarmbot",
+                "transcript",
+                "lead",
+                "--out",
+                "t.ndjson",
+                "--json",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{argv:?} must not parse"
+            );
+        }
+
+        // The `--out`/`--limit` pair reaches the command and is refused there, in
+        // one line that says which flag to drop.
+        let refused = admin::check_export_flags(true, Some(5)).expect_err("narrowed export");
+        assert!(refused.to_string().contains("--limit"), "{refused}");
+        assert!(
+            refused.to_string().contains("whole transcript"),
+            "{refused}"
+        );
+        // Neither flag on its own is refused.
+        assert!(admin::check_export_flags(true, None).is_ok());
+        assert!(admin::check_export_flags(false, Some(5)).is_ok());
+
+        // `requests answer` with no answer flag parses (clap cannot require "one
+        // of four"), and the command refuses it with a sentence rather than
+        // settling the card with nothing.
+        let cli = Cli::parse_from(["swarmbot", "requests", "answer", "req_1"]);
+        assert!(matches!(
+            cli.command,
+            Command::Requests {
+                command: RequestsCommand::Answer { .. }
+            }
+        ));
+    }
+
+    /// `--skills a,b` trims and drops empties; an empty string means "none",
+    /// which is how an owner clears a bot's skills.
+    #[test]
+    fn skills_parse_into_a_list_a_brain_can_store() {
+        assert_eq!(parse_skills("rust, git"), vec!["rust", "git"]);
+        assert_eq!(parse_skills(" rust ,, git , "), vec!["rust", "git"]);
+        assert!(parse_skills("").is_empty());
+        assert!(parse_skills(" , , ").is_empty());
+    }
+
+    /// A session that only implements the run/chat surface must refuse the write
+    /// commands with a typed error — never answer "there are no rules".
+    #[test]
+    fn a_session_without_the_write_surface_refuses_instead_of_answering_empty() {
+        let session = NeverIdle::new("nothing");
+        for (what, result) in [
+            ("rules", session.rules().map(|_| ())),
+            ("requests", session.pending().map(|_| ())),
+            ("routines", session.routines().map(|_| ())),
+            ("settings", session.settings().map(|_| ())),
+            ("secrets", session.secrets().map(|_| ())),
+        ] {
+            let err = result.expect_err(what);
+            let text = err.to_string();
+            assert!(text.contains("cannot"), "{what}: {text}");
+            assert!(
+                text.contains("run/chat surface only"),
+                "{what} says which surface it has: {text}"
+            );
+        }
+        assert_eq!(session.live_counts(), None, "and it cannot count either");
     }
 
     #[test]

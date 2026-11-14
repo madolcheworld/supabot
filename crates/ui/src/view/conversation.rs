@@ -25,7 +25,134 @@ use crate::widgets::bits;
 use crate::widgets::markdown;
 use crate::widgets::text_input::TextInput;
 
-/// The conversation header: title, the live activity line, provider button,
+/// How many entries one "Load earlier" page asks for.
+///
+/// Small enough that the answer arrives quickly on a long transcript, large
+/// enough that paging to the beginning is a handful of clicks. The brain's own
+/// default is 100 and its cap is 1000, so this never trips a server-side clamp —
+/// which matters, because a silently clamped page would make a full page look
+/// short and the button would stop honestly-but-wrongly early.
+pub const HISTORY_PAGE: u32 = 50;
+
+/// The "Load earlier" control above the transcript, or `None` when there is
+/// nothing to say.
+///
+/// Five cases, each a different truth about the transcript's top:
+///
+/// * no conversation, or an empty one — no control at all;
+/// * a page in flight — the word, not a button (a second click is a no-op, and
+///   pretending otherwise is how a button ends up doing nothing);
+/// * the last page failed — the reason and a Retry;
+/// * a short page already proved the beginning was reached — say it once, then
+///   stop offering the action;
+/// * otherwise — the button, which asks for the entries before the oldest row
+///   held (an exclusive bound, so the row on screen cannot come back).
+pub fn history_bar(
+    s: &AppState,
+    state: &Entity<AppState>,
+    commands: &Sender<Command>,
+) -> Option<gpui::Div> {
+    let conversation = s.open_conversation()?;
+    let conv = conversation.id.clone();
+    if s.entries(&conv).is_empty() {
+        return None;
+    }
+    let history = s.history(&conv);
+
+    let body = if let Some(reason) = history.failed.clone() {
+        let commands_retry = commands.clone();
+        let conv_retry = conv.clone();
+        let state_retry = state.clone();
+        div()
+            .px_4()
+            .py_1()
+            .bg(rgb(theme::NOTICE_ERROR_BG))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::NOTICE_ERROR_FG))
+                    .child(format!("older messages could not be loaded: {reason}")),
+            )
+            .child(
+                bits::button("Retry", bits::Tone::Ghost)
+                    .id("retry-history")
+                    .on_click(move |_, _, cx: &mut gpui::App| {
+                        request_older_page(&state_retry, &commands_retry, &conv_retry, cx);
+                    }),
+            )
+    } else if history.loading {
+        div()
+            .px_4()
+            .py_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(bits::spinner(s.spinner_phase))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_DIM))
+                    .child("loading earlier messages…"),
+            )
+    } else if !history.can_load(s.entries(&conv)) || s.oldest_seq(&conv).is_some_and(|seq| seq <= 1)
+    {
+        // Nothing older left: either a page already proved it, or the oldest row
+        // held is seq 1. The second case is checked here as well as in
+        // `begin_older_page` so the button is not offered for a click whose only
+        // possible outcome is "there was nothing" — a control that has to be
+        // clicked to learn it does nothing is the failure mode this whole bar
+        // exists to avoid.
+        div().px_4().py_1().flex().justify_center().child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_DIM))
+                .child("beginning of the conversation"),
+        )
+    } else {
+        let commands_load = commands.clone();
+        let conv_load = conv.clone();
+        let state_load = state.clone();
+        div().px_4().py_1().flex().justify_center().child(
+            bits::button("Load earlier", bits::Tone::Ghost)
+                .id("load-earlier")
+                .on_click(move |_, _, cx: &mut gpui::App| {
+                    request_older_page(&state_load, &commands_load, &conv_load, cx);
+                }),
+        )
+    };
+    Some(body)
+}
+
+/// Ask for the page before the oldest row held, once.
+///
+/// The claim ([`AppState::begin_older_page`]) comes first: it is what stops a
+/// double click from becoming two requests, and what turns the button into the
+/// spinner. Reading the bound first keeps the request tied to what is on screen
+/// (an exclusive `seq`, so the oldest visible row cannot come back).
+fn request_older_page(
+    state: &Entity<AppState>,
+    commands: &Sender<Command>,
+    conversation: &swarmbot_contracts::ConversationId,
+    cx: &mut gpui::App,
+) {
+    let oldest = state.read(cx).oldest_seq(conversation);
+    let Some(before_seq) = oldest else {
+        return;
+    };
+    let claimed = state.update(cx, |st, _| st.begin_older_page(conversation));
+    if claimed {
+        let _ = commands.send(Command::EntriesBefore {
+            conversation: conversation.clone(),
+            before_seq,
+            limit: HISTORY_PAGE,
+        });
+    }
+}
+
+/// The conversation header: title, the live activity line, provider button,/// The conversation header: title, the live activity line, provider button,
 /// and the sidebar toggle button when the right panel is collapsed.
 pub fn header(
     s: &AppState,
@@ -638,6 +765,14 @@ pub fn same_group(prev: Option<&Entry>, entry: &Entry) -> bool {
     if prev.author != entry.author {
         return false;
     }
+    // A new calendar day is a new group even when the messages are minutes
+    // apart: the separator above a group carries the day ("Today", "Yesterday",
+    // a date), and a 00:01 message grouped under a "Yesterday 11:58 PM" label
+    // would be filed under the wrong day.
+    let same_day = prev.created_at.date_naive() == entry.created_at.date_naive();
+    if !same_day {
+        return false;
+    }
     let gap = entry.created_at.signed_duration_since(prev.created_at);
     (0..300).contains(&gap.num_seconds())
 }
@@ -835,7 +970,7 @@ fn message_row(
                 .py_2()
                 .text_xs()
                 .text_color(rgb(theme::TEXT_DIM))
-                .child(entry.created_at.format("Today %-I:%M %p").to_string()),
+                .child(crate::time::moment_label_here(entry.created_at)),
         );
     }
 
@@ -1139,57 +1274,6 @@ impl StatusLabel for ToolCallStatus {
     }
 }
 
-/// A simulated conversation history matching the screenshot when a conversation has no entries.
-pub fn mock_conversation_view() -> gpui::Stateful<gpui::Div> {
-    div()
-        .id("mock-transcript-scroll")
-        .flex_1()
-        .overflow_y_scroll()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .px_4()
-        .py_2()
-        // Yesterday 1:55 PM
-        .child(centered_time_str("Yesterday 1:55 PM"))
-        .child(user_pill_str("Hello"))
-        // Today 5:34 AM
-        .child(centered_time_str("Today 5:34 AM"))
-        .child(user_pill_str("Hello"))
-        .child(user_pill_str("Hello"))
-        .child(user_pill_str("Hello"))
-        // Today 7:38 AM
-        .child(centered_time_str("Today 7:38 AM"))
-        .child(user_pill_str("Hi 👋"))
-        // Today 11:40 AM
-        .child(centered_time_str("Today 11:40 AM"))
-        .child(user_pill_str("hello"))
-}
-
-fn centered_time_str(text: &str) -> gpui::Div {
-    div()
-        .w_full()
-        .flex()
-        .justify_center()
-        .py_3()
-        .text_xs()
-        .text_color(rgb(theme::TEXT_DIM))
-        .child(text.to_string())
-}
-
-fn user_pill_str(text: &str) -> gpui::Div {
-    div().w_full().flex().justify_end().py_1().child(
-        div()
-            .px_4()
-            .py_2()
-            .rounded_full()
-            .bg(rgb(0x000000))
-            .text_color(rgb(0xffffff))
-            .text_sm()
-            .child(text.to_string()),
-    )
-}
-
 /// Callback invoked when a collapsible or dismissible banner close button is clicked.
 pub type CloseCallback = Box<dyn Fn(&mut gpui::App) + 'static>;
 
@@ -1294,6 +1378,26 @@ mod tests {
         assert!(!same_group(None, &first));
     }
 
+    /// A group never spans midnight: the separator above it carries the day, so
+    /// two messages two minutes apart on either side of midnight must not share
+    /// one "Yesterday 11:59 PM" heading.
+    #[test]
+    fn a_new_calendar_day_breaks_the_group_even_inside_the_time_window() {
+        let author = bot_author();
+        // 2026-11-13 23:59:00 UTC and 2026-11-14 00:01:00 UTC.
+        let late = entry_at(author.clone(), message("late"), 1_765_756_740);
+        let early = entry_at(author, message("early"), 1_765_756_860);
+        let gap = early.created_at.signed_duration_since(late.created_at);
+        assert!(
+            gap.num_seconds() < 300,
+            "the time window alone would group these ({gap})"
+        );
+        assert!(
+            !same_group(Some(&late), &early),
+            "a new calendar day is a new group, because the separator says which day it is"
+        );
+    }
+
     #[test]
     fn a_new_author_or_a_gap_breaks_the_group() {
         let a = bot_author();
@@ -1316,7 +1420,7 @@ mod tests {
         let bot =
             swarmbot_contracts::Bot::new("codie", "Codie", "", "codex", ConversationId::new());
         let bot_id = bot.id.clone();
-        state.bots.push(bot);
+        state.upsert_bot(bot);
         let dm = Conversation::direct(bot_id.clone());
         assert_eq!(
             dm_bot(&state, &dm).map(|b| b.id),

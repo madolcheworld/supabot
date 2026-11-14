@@ -153,7 +153,44 @@ impl ApprovalService {
     }
 
     /// Ask, and wait for the answer or the expiry.
-    pub async fn ask(&self, mut request: RuntimeRequest) -> Result<Outcome, DomainError> {
+    pub async fn ask(&self, request: RuntimeRequest) -> Result<Outcome, DomainError> {
+        self.ask_inner(request, |_| Ok(())).await
+    }
+
+    /// [`ask`](Self::ask), with a hook that runs after the waiter is registered
+    /// and **before** the card is published.
+    ///
+    /// The hook exists so a test can answer the card at the exact instant the
+    /// race used to live in, without sleeping and hoping: with the waiter
+    /// registered first, `respond` finds it and the ask settles at once; with
+    /// the old order (card first, waiter second) the same hook would have to
+    /// simulate a `respond` that finds no waiter, which delivers the answer as
+    /// a message and leaves the ask blocked until the expiry. There is no
+    /// timing in the assertion, so it cannot be flaky.
+    ///
+    /// Test-only because a production caller has no reason to interleave, and
+    /// because the path it exercises is the real one: [`ask`](Self::ask) is
+    /// this function with an empty hook.
+    #[cfg(test)]
+    pub(crate) async fn ask_with_after_register<F>(
+        &self,
+        request: RuntimeRequest,
+        after_register: F,
+    ) -> Result<Outcome, DomainError>
+    where
+        F: FnOnce(&RequestId) -> Result<(), DomainError>,
+    {
+        self.ask_inner(request, after_register).await
+    }
+
+    async fn ask_inner<F>(
+        &self,
+        mut request: RuntimeRequest,
+        after_register: F,
+    ) -> Result<Outcome, DomainError>
+    where
+        F: FnOnce(&RequestId) -> Result<(), DomainError>,
+    {
         let settings = self.settings.get();
 
         match self.evaluate(&request) {
@@ -194,13 +231,32 @@ impl ApprovalService {
         request.expires_at = Some(
             request.created_at + chrono::Duration::seconds(settings.approval_expiry_secs as i64),
         );
-        self.raise(&mut request)?;
-
+        // The row first, because `respond` reads the request before it can
+        // answer it; the waiter second; the card last. Publishing the card is
+        // what tells anybody the request exists, so a `respond` can only land
+        // after the waiter is in the map — which is the whole point. The old
+        // order (card, then waiter) left a window in which the answer found no
+        // waiter: the tool call then hung for `approval_expiry_secs` (ten
+        // minutes by default) even though the owner had already said yes, and
+        // the bot got an extra message it did not need.
+        self.store.insert_request(&request)?;
         let (tx, rx) = oneshot::channel();
         self.waiters
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(request.id.clone(), tx);
+
+        // A hook that fails, or a card that cannot be published, must not leave
+        // a waiter registered for a request nobody can see: that entry would
+        // never be taken and the map would grow one dead id per failure.
+        if let Err(err) = after_register(&request.id) {
+            self.abandon_ask(&request.id);
+            return Err(err);
+        }
+        if let Err(err) = self.publish_card(&mut request) {
+            self.abandon_ask(&request.id);
+            return Err(err);
+        }
 
         let deadline = request.expires_at.unwrap_or_else(Utc::now);
         let wait = deadline
@@ -227,20 +283,49 @@ impl ApprovalService {
         }
     }
 
+    /// Undo the half of an ask that was already written: forget the waiter and
+    /// close the row, so a request whose card never existed is not left pending
+    /// for the expiry ticker to find.
+    fn abandon_ask(&self, id: &RequestId) {
+        self.waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        if let Ok(Some(mut request)) = self.store.get_request(id)
+            && request.cancel(Utc::now(), "the approval card could not be published")
+        {
+            let _ = self.store.update_request(&request);
+            self.hub.publish(Change::Request(request));
+        }
+    }
+
     /// Raise a card and return at once: `ask_user` and `request_approval` must
     /// never block a tool call.
     pub fn raise_async(&self, request: &mut RuntimeRequest) -> Result<RequestId, DomainError> {
-        self.raise(request)?;
+        self.store.insert_request(request)?;
+        self.publish_card(request)?;
         Ok(request.id.clone())
     }
 
-    /// Insert, card, publish. Shared by both shapes so a card always exists.
-    fn raise(&self, request: &mut RuntimeRequest) -> Result<(), DomainError> {
-        self.store.insert_request(request)?;
+    /// Card, update, publish — the half of raising a request that announces it.
+    ///
+    /// Split from the insert because the two orders differ: a blocking ask
+    /// registers its waiter in between, and an async one has no waiter at all.
+    fn publish_card(&self, request: &mut RuntimeRequest) -> Result<(), DomainError> {
         let body = card_body(request);
         let card = self.transcript.card(request, request.title(), body)?;
-        request.card_entry_id = Some(card.id.clone());
-        self.store.update_request(request)?;
+        // The row was written before this call, so it can already have been
+        // answered — the pending-requests listing is enough to respond from. Only
+        // the card id belongs to this half, so re-read and set that one field:
+        // writing this copy's whole row back would turn a stored `Answered` into
+        // the stale `Pending` this call arrived with, which is a lost answer.
+        let mut stored = self
+            .store
+            .get_request(&request.id)?
+            .ok_or_else(|| swarmbot_contracts::not_found::request(&request.id))?;
+        stored.card_entry_id = Some(card.id.clone());
+        self.store.update_request(&stored)?;
+        *request = stored;
         self.hub.publish(Change::Request(request.clone()));
         debug!(request = %request.id, kind = ?request.kind, "a request is waiting");
         Ok(())
@@ -1059,6 +1144,108 @@ mod tests {
         let bare = question(&rig);
         assert_eq!(card_body(&bare), "which environment?");
         assert_eq!(bare.kind, RequestKind::Question);
+    }
+
+    /// An answer that arrives the instant the card exists must reach the ask
+    /// that raised it, not wait out the expiry.
+    ///
+    /// The bug: `ask` published the card *first* and registered its waiter
+    /// *second*. The brain answers cards from another task, so a `respond`
+    /// landing in that window found no waiter, delivered the answer as a
+    /// message to the bot, and left the tool call blocked for
+    /// `approval_expiry_secs` (ten minutes by default) even though the owner had
+    /// already said yes. The hook below runs at exactly that boundary, so this
+    /// test fails on the old order without sleeping on a race: with the waiter
+    /// registered second, `respond` has nobody to send to and an extra
+    /// async-answer delivery is queued for the bot.
+    #[tokio::test]
+    async fn a_waiter_is_registered_before_the_card_is_published() {
+        let rig = rig();
+        // A one-second expiry, so the *failure* mode is a fast, deterministic
+        // `Denied` rather than the ten-minute hang the old order produced. It
+        // cannot help a passing run: `respond` happens in the hook, before `ask`
+        // ever awaits, so a correct order settles with or without a deadline.
+        rig.service
+            .settings_handle_for_test()
+            .update(|settings| settings.approval_expiry_secs = 1)
+            .unwrap();
+        let request = approval(&rig, "cargo test");
+        let id = request.id.clone();
+        let service = Arc::clone(&rig.service);
+        let answered_from = id.clone();
+        let outcome = rig
+            .service
+            .ask_with_after_register(request, move |registered| {
+                assert_eq!(registered, &answered_from, "the hook sees the request id");
+                // What `POST /api/requests/{id}/respond` does.
+                service.respond(
+                    registered,
+                    Some(Decision::AllowOnce),
+                    None,
+                    Responder::Owner,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, Outcome::Allowed { rule_id: None });
+        assert_eq!(
+            rig.service.runners_for_test().parked_count(),
+            0,
+            "the answer reached the waiting ask; it was not queued as a message \
+             for the bot, which is what the losing race did"
+        );
+        let stored = rig.store.get_request(&id).unwrap().unwrap();
+        assert_eq!(stored.status, RequestStatus::Answered);
+        assert_eq!(stored.responded_by, Some(Responder::Owner));
+    }
+
+    /// A failed card leaves no waiter behind: the map must not grow one dead id
+    /// per failure, and the row must not stay pending with no card to answer.
+    #[tokio::test]
+    async fn a_card_that_cannot_be_published_leaves_no_waiter() {
+        let rig = rig();
+        let request = approval(&rig, "cargo test");
+        let id = request.id.clone();
+        // The card goes into a conversation that does not exist, which is how a
+        // publish fails without inventing a broken store.
+        let mut broken = request;
+        broken.conversation_id = swarmbot_contracts::id::ConversationId::new();
+        let err = rig
+            .service
+            .ask_with_after_register(broken, |_| Ok(()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "not_found", "{err}");
+        // A second ask that *can* be answered works, which it would not if the
+        // failed one had left a stale sender or a stuck lock in the map.
+        let ok = approval(&rig, "cargo build");
+        let ok_id = ok.id.clone();
+        let service = Arc::clone(&rig.service);
+        let outcome = rig
+            .service
+            .ask_with_after_register(ok, move |registered| {
+                service.respond(
+                    registered,
+                    Some(Decision::AllowOnce),
+                    None,
+                    Responder::Owner,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(outcome.allowed());
+        assert_eq!(
+            rig.store.get_request(&ok_id).unwrap().unwrap().status,
+            RequestStatus::Answered
+        );
+        assert!(
+            rig.store.get_request(&id).unwrap().is_none()
+                || rig.store.get_request(&id).unwrap().unwrap().status == RequestStatus::Cancelled,
+            "the request whose card never existed is not left pending"
+        );
     }
 
     // -- the destructive floor -------------------------------------------------

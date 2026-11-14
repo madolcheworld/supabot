@@ -237,7 +237,9 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     /// Optional per-turn MCP servers exposed to backends that run their own
-    /// tool loop (such as ACP agents).
+    /// tool loop. Both such adapters consume it: ACP passes them in
+    /// `session/new`'s `mcpServers`, and `ClaudeCli` materializes them into the
+    /// `--mcp-config` file it hands the harness for this turn only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServerSpec>,
 }
@@ -566,6 +568,14 @@ impl ModelList {
 }
 
 /// Health of one backend, as the UI's Settings screen shows it.
+///
+/// A status is a *report*, never a claim that a turn works: `ok == true` means
+/// the checks named in `detail` passed (for ACP: spawn + `initialize` +
+/// `session/new`, no model call). The three auth fields exist because the
+/// Settings screen must offer a **Connect** action and say honestly what it can
+/// and cannot do — D9.28's lesson is that a green handshake and a working turn
+/// are different facts, so the fields are deliberately flat and the UI prints
+/// the limit instead of inventing a "ready" state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendStatus {
     pub backend: String,
@@ -575,6 +585,59 @@ pub struct BackendStatus {
     pub model: Option<String>,
     /// Backend or harness version, when it reports one.
     pub version: Option<String>,
+    /// Logins the backend itself advertises (ACP `initialize` → `authMethods`),
+    /// verbatim. Empty when it named none — or when the handshake never got
+    /// that far, which `auth_required`/`detail` disambiguates. This is what a
+    /// Connect button offers, and never a guess from the adapter.
+    #[serde(default)]
+    pub auth_methods: Vec<BackendAuthMethod>,
+    /// The check was refused **because a login is needed**: ACP's
+    /// `-32000 authRequired`, a missing `api_key_env` key, or an HTTP 401/403.
+    ///
+    /// `false` is not "logged in" — it is "not refused for that reason".
+    #[serde(default)]
+    pub auth_required: bool,
+    /// The exact command the *config* names for logging this backend in
+    /// (`options.login_command`), when it names one. Shown and copyable; never
+    /// executed — an agent login is interactive and belongs to the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_command: Option<String>,
+}
+
+impl BackendStatus {
+    /// The short form every adapter uses for "checked, and here is what came
+    /// back": no model, no version, no auth surface. Callers that know more
+    /// fill the fields in afterwards, so adding a field here stays a one-line
+    /// change at the call site instead of a 6-field literal everywhere.
+    pub fn report(backend: impl Into<String>, ok: bool, detail: impl Into<String>) -> Self {
+        Self {
+            backend: backend.into(),
+            ok,
+            detail: detail.into(),
+            model: None,
+            version: None,
+            auth_methods: Vec::new(),
+            auth_required: false,
+            login_command: None,
+        }
+    }
+}
+
+/// One login a backend advertises, as the UI renders it.
+///
+/// `command` is the exact shell command an operator can run, when anybody
+/// authoritative named one: the agent's own `_meta["terminal-auth"]` block, or
+/// the backend's `options.login_command`. When nobody did, it is `None` and the
+/// UI shows the description instead — inventing `claude /login` for an agent
+/// that never said so would be a guess presented as an instruction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendAuthMethod {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// What a backend can do, so the runner can adapt (drive a tool loop or not,

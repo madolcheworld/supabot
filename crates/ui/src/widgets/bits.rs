@@ -116,22 +116,6 @@ pub fn avatar(color: Rgba, initial: char, size: Pixels) -> Div {
     }
 }
 
-/// A circular user avatar with initials (e.g. "GT").
-pub fn user_avatar(initials: &str, size: Pixels) -> Div {
-    div()
-        .size(size)
-        .flex_none()
-        .rounded_full()
-        .bg(rgb(0xe5e7eb))
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(size * 0.44)
-        .font_weight(FontWeight::BOLD)
-        .text_color(rgb(0x374151))
-        .child(initials.to_string())
-}
-
 /// A computer monitor icon for the bot screen card.
 pub fn monitor_icon() -> Div {
     div()

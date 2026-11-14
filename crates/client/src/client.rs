@@ -30,6 +30,15 @@ use swarmbot_contracts::{
 use crate::error::ClientError;
 use crate::http::{Http, PROBE_TIMEOUT, SharedToken};
 
+/// The most one `export_transcript` call will read into memory (64 MiB).
+///
+/// The endpoint itself streams, so the brain's side has no limit; this is the
+/// **blocking client's** cost, because it hands back a `String`. A transcript
+/// larger than this fails with a transport error instead of coming back
+/// truncated — a short file that looks complete is the one outcome an archive
+/// tool must never be given.
+pub const EXPORT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 /// `GET /api/health` — also the cheapest "is anything listening?" check.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Health {
@@ -39,6 +48,87 @@ pub struct Health {
     /// to take a fresh snapshot instead of resuming a cursor.
     pub epoch: u64,
     pub uptime_secs: u64,
+}
+
+/// `GET /api/metrics` — what the brain is doing right now, counted.
+///
+/// Mirrors `swarmbot_brain::routes::metrics::Metrics` field for field without
+/// depending on that crate (this crate speaks the wire, not the brain). Every
+/// number is a count of something the brain's store or runner map already knows:
+/// nothing here is an estimate, a rate or a projection, and a field the brain
+/// cannot fill is absent rather than invented.
+///
+/// One relation worth knowing when displaying these: `turns_running` comes from
+/// the **store**, while `bots_working` comes from the roster row. They can
+/// disagree for the moment between a turn ending and its row being written, and
+/// `turns_running` is the one to trust.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Metrics {
+    /// The brain's version, so a client can say which binary it is talking to.
+    pub version: String,
+    /// Seconds since the brain's process started (monotonic, not wall clock).
+    pub uptime_secs: u64,
+    /// The live log's epoch: a different value means the brain restarted, and a
+    /// stored cursor must resync instead of resuming.
+    pub epoch: u64,
+
+    /// Bots in the roster, disabled ones included.
+    pub bots_total: u64,
+    pub bots_idle: u64,
+    /// Bots mid-turn as the roster row records it.
+    pub bots_working: u64,
+    /// Bots waiting for their runner.
+    pub bots_queued: u64,
+    /// Bots that failed `FAILURE_LIMIT` turns in a row.
+    pub bots_error: u64,
+    /// Bots turned off by the owner; they get no runner.
+    pub bots_disabled: u64,
+    /// Live runner tasks — smaller than `bots_total` when bots are disabled.
+    pub runners: u64,
+
+    /// Turns the store still calls running: the signal that decides idleness.
+    pub turns_running: u64,
+    /// Deliveries waiting for a bot that is already running, summed over the
+    /// roster.
+    pub deliveries_queued: u64,
+    /// Deliveries waiting for a runner that does not exist yet — the number that
+    /// can keep the swarm from ever going idle.
+    pub deliveries_parked: u64,
+    /// Tasks in the queue, across every bot.
+    pub tasks_queued: u64,
+    /// Tasks currently running, across every bot.
+    pub tasks_running: u64,
+    /// Cards (approvals, questions, forms) still waiting for the owner.
+    pub requests_pending: u64,
+
+    /// Every roster row, revoked ones included.
+    pub nodes_total: u64,
+    /// Nodes that are online and not revoked — able to run a tool call now.
+    pub nodes_online: u64,
+}
+
+/// One credential **name** from `GET /api/secrets`.
+///
+/// A name, never a value: no endpoint in this client can read a secret back, by
+/// design. `used_by` lists the backend ids whose `api_key_env` is this name —
+/// what breaks if it is deleted. Empty means "no configured backend asks for it",
+/// which is a real answer for a key left behind by a removed backend.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretName {
+    pub name: String,
+    #[serde(default)]
+    pub used_by: Vec<String>,
+}
+
+/// What a secret write did (`PUT`/`DELETE /api/secrets`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretWrite {
+    pub name: String,
+    /// `"restart"` or `"hot"`. The brain answers `"restart"` today: the backend
+    /// registry resolves each key once, while the swarm is composed, so a changed
+    /// value reaches the next process and not the running one. A client should
+    /// print `applies`, not assume it.
+    pub applies: String,
 }
 
 /// What `POST /api/conversations/{id}/messages` answers: the owner's entry as
@@ -98,7 +188,13 @@ pub struct BackendModels {
     pub authoritative: bool,
 }
 
-/// One row of `GET /api/backends/probe`: did the brain reach this backend?
+/// One row of `GET /api/backends/probe` (or `POST /api/backends/{id}/connect`):
+/// did the brain reach this backend, and what would it take to log in?
+///
+/// The three auth fields are mirrored from `swarmbot_llm::BackendStatus`
+/// without depending on that crate (this crate speaks the wire, not the
+/// adapter). Every one of them is `#[serde(default)]`: an older brain that does
+/// not send them means "not asked", which is what the defaults say.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BackendProbe {
     pub backend: String,
@@ -106,6 +202,32 @@ pub struct BackendProbe {
     pub detail: Option<String>,
     pub model: Option<String>,
     pub version: Option<String>,
+    /// Logins the backend itself advertises. Empty = it named none (or the
+    /// handshake never got that far).
+    #[serde(default)]
+    pub auth_methods: Vec<BackendAuthMethod>,
+    /// The backend refused because a login is needed. `false` is not "logged
+    /// in" — it is "not refused for that reason".
+    #[serde(default)]
+    pub auth_required: bool,
+    /// The command the backend's config names for logging in, when it names
+    /// one. Shown and copied, never executed by anything in this crate.
+    #[serde(default)]
+    pub login_command: Option<String>,
+}
+
+/// One login a backend advertises (`authMethods` over ACP, verbatim).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendAuthMethod {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The exact command an operator can run, when the agent or the config
+    /// named one. `None` means "nobody named a command" — the UI shows the
+    /// description then, and never guesses a command of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// `POST /api/nodes/pairing-codes`.
@@ -138,6 +260,15 @@ pub struct NewBotRequest {
     pub node: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toolsets: Option<Vec<Toolset>>,
+    /// Skill names the bot has. Each names a file under `<data>/skills/`
+    /// (`<name>/SKILL.md` or `<name>.md`); the brain renders it into the bot's
+    /// instructions every turn. `#[serde(default)]` so a client built against an
+    /// older brain, or a brain asked by an older client, still round-trips.
+    ///
+    /// Empty is skipped on the wire, because "no skills" is the brain's own
+    /// default and sending an explicit empty list would say nothing new.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
 }
 
 impl NewBotRequest {
@@ -156,6 +287,7 @@ impl NewBotRequest {
             color: None,
             node: None,
             toolsets: None,
+            skills: Vec::new(),
         }
     }
 
@@ -177,6 +309,93 @@ impl NewBotRequest {
     pub fn toolsets(mut self, toolsets: Vec<Toolset>) -> Self {
         self.toolsets = Some(toolsets);
         self
+    }
+
+    pub fn skills(mut self, skills: Vec<String>) -> Self {
+        self.skills = skills;
+        self
+    }
+}
+
+/// A `PATCH /api/bots/{id}` body, typed.
+///
+/// [`BrainClient::update_bot`] takes a raw [`Value`], which is the right shape for
+/// a caller that already has a JSON object. This struct is for the ones that do
+/// not: the two fields a front end most often forgets (`skills`, `enabled`) are
+/// here with their wire names, so "mute this bot" and "give it this skill" are
+/// expressible without hand-building JSON and without a typo becoming a silently
+/// ignored field (`PATCH /api/bots/{id}` refuses unknown fields with a 400).
+///
+/// Every field is skipped when `None`, because the brain merges a patch: sending
+/// an explicit `null` would not mean "leave it alone" to this API — it would be
+/// read as a value.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BotPatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Empty string clears the model (back to the backend's default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Empty string clears the colour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// A node id; empty string returns the bot to the local node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub toolsets: Option<Vec<Toolset>>,
+    /// Replaces the bot's skill list (an empty list removes every skill).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    /// `false` disables the bot: nothing wakes it and its runner is shut down.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl BotPatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
+        self
+    }
+
+    pub fn backend(mut self, backend: impl Into<String>) -> Self {
+        self.backend = Some(backend.into());
+        self
+    }
+
+    pub fn skills(mut self, skills: Vec<String>) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+
+    pub fn toolsets(mut self, toolsets: Vec<Toolset>) -> Self {
+        self.toolsets = Some(toolsets);
+        self
+    }
+
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = Some(enabled);
+        self
+    }
+
+    /// The wire body, for a caller that wants to log it or store it.
+    pub fn to_value(&self) -> Result<Value, ClientError> {
+        serde_json::to_value(self).map_err(|err| ClientError::Decode {
+            reason: format!("a bot patch cannot be serialized: {err}"),
+        })
     }
 }
 
@@ -285,6 +504,11 @@ struct FoldedBody {
 #[derive(Deserialize)]
 struct StoppedBody {
     stopped: bool,
+}
+
+#[derive(Deserialize)]
+struct RevokedBody {
+    revoked: usize,
 }
 
 impl BrainClient {
@@ -421,6 +645,12 @@ impl BrainClient {
         self.http.patch(&url, patch)
     }
 
+    /// [`Self::update_bot`], with a typed body — see [`BotPatch`].
+    pub fn patch_bot(&self, id_or_name: &str, patch: &BotPatch) -> Result<Bot, ClientError> {
+        let url = self.endpoint(&["api", "bots", id_or_name], &[])?;
+        self.http.patch(&url, patch)
+    }
+
     pub fn delete_bot(&self, id_or_name: &str) -> Result<(), ClientError> {
         let url = self.endpoint(&["api", "bots", id_or_name], &[])?;
         self.http.delete(&url)
@@ -522,6 +752,30 @@ impl BrainClient {
         self.http.get(&url)
     }
 
+    /// Entries with `seq < before_seq`, ascending, at most `limit` — paging
+    /// **backwards** from a cursor the caller already holds.
+    ///
+    /// Exclusive on purpose: sending the smallest `seq` you already display is
+    /// safe, and the page is ascending so it can be prepended without re-sorting.
+    /// `limit` of `0` asks the brain for its default page (100); the brain clamps
+    /// anything above 1000. A page shorter than `limit` means the transcript has
+    /// no older entries, and an empty page means the same thing said twice.
+    pub fn entries_before(
+        &self,
+        id: &ConversationId,
+        before_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<Entry>, ClientError> {
+        let url = self.endpoint(
+            &["api", "conversations", id.as_str(), "entries"],
+            &[
+                ("before_seq", before_seq.to_string()),
+                ("limit", limit.to_string()),
+            ],
+        )?;
+        self.http.get(&url)
+    }
+
     /// The newest `limit` entries, ascending — what a transcript shows first.
     pub fn tail(&self, id: &ConversationId, limit: u32) -> Result<Vec<Entry>, ClientError> {
         let url = self.endpoint(
@@ -529,6 +783,22 @@ impl BrainClient {
             &[("limit", limit.to_string())],
         )?;
         self.http.get(&url)
+    }
+
+    /// The whole transcript as NDJSON: `GET /api/conversations/{id}/export`.
+    ///
+    /// One [`Entry`] per line, each exactly as `/entries` serializes it, so a
+    /// caller can write the bytes through unchanged (`swarmbot transcript --out
+    /// FILE`) and a reader can parse a line at a time. The value is the raw body;
+    /// this method does not reformat, re-order or re-encode it.
+    ///
+    /// The brain streams the export, but a `String` has to be held whole, so the
+    /// blocking client caps one call at [`EXPORT_MAX_BYTES`]. Past that the call
+    /// **fails** — it never returns a short file, because an archive tool cannot
+    /// tell a truncated export from a complete one.
+    pub fn export_transcript(&self, id: &ConversationId) -> Result<String, ClientError> {
+        let url = self.endpoint(&["api", "conversations", id.as_str(), "export"], &[])?;
+        self.http.get_text(&url, EXPORT_MAX_BYTES)
     }
 
     /// Post the owner's message. `addressed` are the bots mentioned with
@@ -671,6 +941,23 @@ impl BrainClient {
         self.http.delete(&url)
     }
 
+    /// Edit one node's roster row: `PATCH /api/nodes/{id}`.
+    ///
+    /// `patch` is a JSON object with either or both of:
+    ///
+    /// * `label` — the display name the roster shows (an empty one is refused);
+    /// * `approved` — the capability names the owner allows. It **replaces** the
+    ///   stored list, must be a subset of what the node declared, and an empty
+    ///   list approves nothing. An undeclared name is a 400 naming it.
+    ///
+    /// The write goes through the brain's guarded writer, so an owner's edit and a
+    /// node's heartbeat cannot lose each other, and the answer is the row as
+    /// stored (with its new revision).
+    pub fn update_node(&self, id: &NodeId, patch: &Value) -> Result<NodeInfo, ClientError> {
+        let url = self.endpoint(&["api", "nodes", id.as_str()], &[])?;
+        self.http.patch(&url, patch)
+    }
+
     // --- approval rules ----------------------------------------------------------
 
     pub fn rules(&self) -> Result<Vec<ApprovalRule>, ClientError> {
@@ -717,6 +1004,21 @@ impl BrainClient {
         self.http.get_with_timeout(&url, timeout)
     }
 
+    /// Run the Settings screen's **Connect** for one backend: the handshake,
+    /// plus `method` when the owner picked one of the backend's advertised
+    /// logins. Probe-style budget (it spawns an agent on the brain's side), and
+    /// it never spends a model call.
+    pub fn connect_backend(
+        &self,
+        backend_id: &str,
+        method: Option<&str>,
+    ) -> Result<BackendProbe, ClientError> {
+        let url = self.endpoint(&["api", "backends", backend_id, "connect"], &[])?;
+        let timeout = self.http.timeout().max(PROBE_TIMEOUT);
+        self.http
+            .post_with_timeout(&url, &serde_json::json!({"method": method}), timeout)
+    }
+
     /// The models one backend advertises. Probe-style budget: an ACP backend
     /// answers this from a live agent session.
     pub fn backend_models(&self, backend_id: &str) -> Result<BackendModels, ClientError> {
@@ -746,6 +1048,57 @@ impl BrainClient {
         };
         let url = self.endpoint(&["api", "usage"], &query)?;
         self.http.get(&url)
+    }
+
+    // --- operational -------------------------------------------------------------
+
+    /// `GET /api/metrics` — what the brain is doing right now, as counts.
+    ///
+    /// Everything is a count of something the store or the runner map already
+    /// knows, so a zero is a fact ("nothing is running") rather than a missing
+    /// measurement. See [`Metrics`] for what each field means.
+    pub fn metrics(&self) -> Result<Metrics, ClientError> {
+        let url = self.endpoint(&["api", "metrics"], &[])?;
+        self.http.get(&url)
+    }
+
+    /// `GET /api/secrets` — the credential **names** the brain holds, with the
+    /// backends that ask for each one. There is no way to read a value back, by
+    /// design.
+    pub fn secrets(&self) -> Result<Vec<SecretName>, ClientError> {
+        let url = self.endpoint(&["api", "secrets"], &[])?;
+        self.http.get(&url)
+    }
+
+    /// `PUT /api/secrets` — write or replace one credential.
+    ///
+    /// The brain writes `<data>/secrets.json` atomically with mode 0600 and
+    /// registers the value with its log scrubber immediately. Read [`SecretWrite`]
+    /// for what `applies` will say: today it is `"restart"`, because the backend
+    /// registry resolves its keys once, when the swarm is composed.
+    pub fn set_secret(&self, name: &str, value: &str) -> Result<SecretWrite, ClientError> {
+        let url = self.endpoint(&["api", "secrets"], &[])?;
+        self.http
+            .put(&url, &serde_json::json!({"name": name, "value": value}))
+    }
+
+    /// `DELETE /api/secrets/{name}` — remove one credential from the file.
+    ///
+    /// A name the brain also receives from its own environment is refused with a
+    /// 409: a process cannot unset its environment, so answering "deleted" would
+    /// be a lie about a key that is still in use.
+    pub fn delete_secret(&self, name: &str) -> Result<SecretWrite, ClientError> {
+        let url = self.endpoint(&["api", "secrets", name], &[])?;
+        self.http.delete_json(&url)
+    }
+
+    /// `POST /api/auth/revoke-sessions` — log every browser session out, keeping
+    /// the owner token. Returns how many sessions died (idempotent: zero the
+    /// second time). A caller authenticating with a cookie is revoking itself too.
+    pub fn revoke_sessions(&self) -> Result<usize, ClientError> {
+        let url = self.endpoint(&["api", "auth", "revoke-sessions"], &[])?;
+        let body: RevokedBody = self.http.post_empty(&url)?;
+        Ok(body.revoked)
     }
 
     /// Build one endpoint URL: `segments` are appended as percent-encoded
@@ -780,6 +1133,7 @@ mod tests {
     use crate::testing::StubBrain;
     use serde_json::json;
     use swarmbot_contracts::EntryKind;
+    use swarmbot_contracts::routine::RoutineStatus;
 
     fn stub_client(stub: &StubBrain) -> BrainClient {
         BrainClient::new(&stub.url()).expect("a loopback stub URL is valid")
@@ -970,6 +1324,133 @@ mod tests {
             .last_request("DELETE", "/api/bots/stub")
             .expect("recorded");
         assert_eq!(recorded.body, "");
+    }
+
+    #[test]
+    fn a_typed_bot_patch_sends_only_what_was_set() {
+        // The two fields a front end forgets most: `skills` and `enabled`.
+        let stub = StubBrain::start();
+        let client = stub_client(&stub);
+
+        let patch = BotPatch::new()
+            .skills(vec!["release-notes".to_string()])
+            .enabled(false);
+        client.patch_bot("stub", &patch).expect("patched");
+        let recorded = stub
+            .last_request("PATCH", "/api/bots/stub")
+            .expect("recorded");
+        let body = body_json(&recorded);
+        assert_eq!(body["skills"], json!(["release-notes"]));
+        assert_eq!(body["enabled"], json!(false));
+        // Everything unset is skipped, not sent as a null the brain would read as
+        // a value: a merge patch only touches what is present.
+        assert!(body.get("label").is_none(), "{body}");
+        assert!(body.get("instructions").is_none(), "{body}");
+
+        // An empty list is a value, and it means "remove every skill".
+        let clear = BotPatch::new().skills(Vec::new());
+        client.patch_bot("stub", &clear).expect("patched");
+        let recorded = stub
+            .last_request("PATCH", "/api/bots/stub")
+            .expect("recorded");
+        assert_eq!(body_json(&recorded)["skills"], json!([]));
+
+        // An empty patch serializes to `{}`, which the brain answers with the
+        // current row rather than a 400.
+        assert_eq!(BotPatch::new().to_value().expect("serializes"), json!({}));
+    }
+
+    #[test]
+    fn the_new_read_routes_name_their_own_urls() {
+        let stub = StubBrain::start();
+        let client = stub_client(&stub);
+
+        // Backward paging: both parameters, in the documented spelling.
+        let id = ConversationId::from_suffix("000000000000000000000000000000c1");
+        let entries = client.entries_before(&id, 42, 50).expect("a backward page");
+        assert_eq!(entries.len(), 1, "the stub answers a canned entry");
+        let recorded = stub
+            .last_request("GET", &format!("/api/conversations/{id}/entries"))
+            .expect("recorded");
+        assert!(recorded.query.contains("before_seq=42"), "{recorded:?}");
+        assert!(recorded.query.contains("limit=50"), "{recorded:?}");
+
+        // The export is handed back verbatim: one JSON object per line, not a
+        // decoded array.
+        let text = client.export_transcript(&id).expect("the export");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text:?}");
+        for line in &lines {
+            let value: Value = serde_json::from_str(line).expect("one Entry per line");
+            assert_eq!(value["conversation_id"], json!(id.to_string()));
+        }
+        let recorded = stub
+            .last_request("GET", &format!("/api/conversations/{id}/export"))
+            .expect("recorded");
+        assert_eq!(recorded.query, "", "the export takes no query");
+
+        // Metrics decode into the typed struct field for field.
+        let metrics = client.metrics().expect("metrics");
+        assert_eq!(metrics.version, "0.1.0");
+        assert_eq!(metrics.epoch, 7);
+        assert_eq!(metrics.bots_total, 1);
+        assert_eq!(metrics.runners, 1);
+        stub.last_request("GET", "/api/metrics").expect("recorded");
+
+        // Secrets: names in, the write's `applies` out, and no value anywhere.
+        let secrets = client.secrets().expect("secrets");
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].name, "INFERHUB_API_KEY");
+        assert_eq!(secrets[0].used_by, vec!["inferhub".to_string()]);
+        let written = client
+            .set_secret("INFERHUB_API_KEY", "sk-stub-value")
+            .expect("written");
+        assert_eq!(written.name, "INFERHUB_API_KEY");
+        assert_eq!(written.applies, "restart");
+        let recorded = stub.last_request("PUT", "/api/secrets").expect("recorded");
+        let body = body_json(&recorded);
+        assert_eq!(body["name"], "INFERHUB_API_KEY");
+        assert_eq!(
+            body["value"], "sk-stub-value",
+            "the value goes *to* the brain"
+        );
+        let removed = client.delete_secret("INFERHUB_API_KEY").expect("removed");
+        assert_eq!(removed.applies, "restart");
+        stub.last_request("DELETE", "/api/secrets/INFERHUB_API_KEY")
+            .expect("recorded");
+    }
+
+    #[test]
+    fn routines_round_trip_against_the_stub() {
+        // This route set exists for the CLI's remote mode: without it, every
+        // routine command in `--brain` mode could only be tested against a 404.
+        let stub = StubBrain::start();
+        let client = stub_client(&stub);
+
+        let listed = client.routines(None).expect("routines");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "Nightly build");
+        assert_eq!(listed[0].status, RoutineStatus::Active);
+        assert!(
+            listed[0].next_run_at.is_some(),
+            "an active routine has a next run"
+        );
+
+        let paused = client.pause_routine(&listed[0].id).expect("paused");
+        assert_eq!(paused.status, RoutineStatus::Paused);
+        stub.last_request("POST", &format!("/api/routines/{}/pause", listed[0].id))
+            .expect("recorded");
+
+        let resumed = client.resume_routine(&listed[0].id).expect("resumed");
+        assert_eq!(resumed.status, RoutineStatus::Active);
+
+        let runs = client.routine_runs(&listed[0].id, Some(10)).expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].status,
+            swarmbot_contracts::routine::RunStatus::Success
+        );
+        assert!(runs[0].ended_at.is_some(), "a finished run has an end");
     }
 
     #[test]
@@ -1296,6 +1777,57 @@ mod tests {
         assert_eq!(probes.len(), 1);
         assert!(probes[0].ok);
         assert_eq!(probes[0].backend, "fake");
+        // A reachable backend advertises no login: the fields exist and are
+        // empty, so a UI can render them without a special case.
+        assert!(probes[0].auth_methods.is_empty());
+        assert!(!probes[0].auth_required);
+    }
+
+    #[test]
+    fn connect_posts_the_chosen_method_and_decodes_the_login_it_needs() {
+        let stub = StubBrain::start();
+        let client = stub_client(&stub);
+
+        // The plain handshake: a `null` method, and the brain's answer decoded
+        // in full — including the login the agent advertises and the command
+        // the config names. The client never invents either.
+        let status = client.connect_backend("claude", None).expect("connect");
+        assert!(!status.ok);
+        assert!(status.auth_required);
+        assert_eq!(status.auth_methods.len(), 1);
+        assert_eq!(status.auth_methods[0].id, "claude-login");
+        assert_eq!(
+            status.auth_methods[0].description.as_deref(),
+            Some("Run `claude /login` in the terminal")
+        );
+        // The agent named no command, so the method carries none: the command
+        // that is shown came from the config (`login_command`), not from a
+        // guess.
+        assert_eq!(status.auth_methods[0].command, None);
+        assert_eq!(status.login_command.as_deref(), Some("claude /login"));
+
+        // A chosen login is sent as `{"method": …}`, and the refusal it earns
+        // is surfaced verbatim rather than turned into a client-side success.
+        let refused = client
+            .connect_backend("claude", Some("claude-login"))
+            .expect("connect reports");
+        assert!(!refused.ok, "{refused:?}");
+        assert!(
+            refused
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Method not implemented")),
+            "{refused:?}"
+        );
+
+        let posted = stub
+            .last_request("POST", "/api/backends/claude/connect")
+            .expect("the connect call reached the stub");
+        assert!(
+            posted.body.contains("\"claude-login\""),
+            "the chosen method id goes on the wire: {}",
+            posted.body
+        );
     }
 
     #[test]

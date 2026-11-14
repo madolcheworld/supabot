@@ -82,6 +82,25 @@ enum Behavior {
     /// the connection accumulates unanswered setup calls and is eventually
     /// replaced as wedged.
     NeverAnswerSessionNew,
+    /// A login is required: `initialize` advertises one `authMethods` entry,
+    /// `session/new` answers ACP's `-32000 Authentication required` until
+    /// `authenticate` is called with that id — then it answers normally.
+    /// Measured shape: `claude-code-acp` advertises `claude-login`, and its
+    /// sessions are refused until the `claude` CLI is logged in.
+    LoginRequired,
+    /// Same advertisement, but `authenticate` answers `-32601`: the agent names
+    /// a login it does not implement (`claude-code-acp`'s `authenticate` throws
+    /// `Method not implemented`). Connect must report that, never "connected".
+    AuthNotImplemented,
+    /// The advertised method carries `_meta["terminal-auth"]`: the exact
+    /// command the owner should run. `session/new` is fine, so this is the
+    /// "green handshake on an agent that still wants a login" case.
+    TerminalAuthMeta,
+    /// A normal turn that also sends ACP v1's `usage_update` notification
+    /// (`used`/`size`/`cost`) before answering `end_turn`. The numbers are
+    /// context occupancy, not this turn's input/output tokens, so the adapter
+    /// must report no tokens rather than inventing them.
+    UsageUpdate,
 }
 
 type Log = Arc<Mutex<Vec<Value>>>;
@@ -208,6 +227,8 @@ async fn play_agent(
     let mut lines = BufReader::new(read_half).lines();
     let mut prompt_id: Option<u64> = None;
     let mut sessions_created = 0u32;
+    // Whether a login has been accepted; only `Behavior::LoginRequired` reads it.
+    let mut authenticated = false;
 
     while let Some(line) = next_line(&mut lines, &stdin_closed).await {
         if line.trim().is_empty() {
@@ -237,6 +258,26 @@ async fn play_agent(
                 if advertise_session_close {
                     agent_capabilities["sessionCapabilities"] = json!({"close": {}});
                 }
+                // The auth block is the agent's own claim; the client may only
+                // repeat it, never invent one.
+                let auth_methods = match behavior {
+                    Behavior::LoginRequired | Behavior::AuthNotImplemented => json!([{
+                        "id": "claude-login",
+                        "name": "Log in with [CC]",
+                        "description": "Run `claude /login` in the terminal",
+                    }]),
+                    Behavior::TerminalAuthMeta => json!([{
+                        "id": "terminal-login",
+                        "name": "[CC] Login",
+                        "description": "Run the login command in a terminal",
+                        "_meta": {"terminal-auth": {
+                            "command": "node",
+                            "args": ["/opt/claude/cli.js"],
+                            "label": "[CC] Login",
+                        }},
+                    }]),
+                    _ => json!([]),
+                };
                 match behavior {
                     Behavior::McpHttpSupported => {
                         agent_capabilities["mcpCapabilities"] = json!({"http": true, "sse": false});
@@ -252,14 +293,42 @@ async fn play_agent(
                     id,
                     json!({
                         "protocolVersion": 1,
-                        "authMethods": [],
+                        "authMethods": auth_methods,
                         "agentCapabilities": agent_capabilities,
                     }),
                 )
                 .await;
             }
+            "authenticate" => {
+                let method = value["params"]["methodId"].as_str().unwrap_or("");
+                match behavior {
+                    Behavior::LoginRequired | Behavior::TerminalAuthMeta
+                        if method == "claude-login" || method == "terminal-login" =>
+                    {
+                        authenticated = true;
+                        respond(&writer, id, json!({})).await;
+                    }
+                    Behavior::AuthNotImplemented => {
+                        // What the real adapter does: names a login, cannot
+                        // perform it.
+                        respond_error(&writer, id, -32601, "Method not implemented.").await;
+                    }
+                    _ => {
+                        respond_error(&writer, id, -32602, "unknown auth method").await;
+                    }
+                }
+            }
             "session/new" => {
                 sessions_created += 1;
+                // A login is what `-32000` means; ACP's `authRequired`.
+                if matches!(
+                    behavior,
+                    Behavior::LoginRequired | Behavior::AuthNotImplemented
+                ) && !authenticated
+                {
+                    respond_error(&writer, id, -32000, "Authentication required").await;
+                    continue;
+                }
                 if behavior == Behavior::SlowFirstSetup && sessions_created == 1 {
                     // The first session setup is the slow one: it is never
                     // answered, so that turn's setup budget is what ends it.
@@ -350,6 +419,36 @@ async fn play_agent(
                         )
                         .await;
                         respond(&agent_writer, Some(id), json!({"stopReason": "cancelled"})).await;
+                    });
+                }
+                // ACP v1's only numeric update: context occupancy plus a
+                // cumulative cost. The turn still ends normally; what the
+                // adapter may NOT do is report `used` as input tokens.
+                Behavior::UsageUpdate => {
+                    let Some(id) = id else { continue };
+                    let sid = value["params"]["sessionId"]
+                        .as_str()
+                        .unwrap_or("s-test")
+                        .to_string();
+                    let agent_writer = Arc::clone(&writer);
+                    tokio::spawn(async move {
+                        update(
+                            &agent_writer,
+                            &sid,
+                            json!({"sessionUpdate": "agent_message_chunk",
+                                   "content": {"type": "text", "text": "done"}}),
+                        )
+                        .await;
+                        update(
+                            &agent_writer,
+                            &sid,
+                            json!({"sessionUpdate": "usage_update",
+                                   "used": 12_345u64,
+                                   "size": 200_000u64,
+                                   "cost": {"amount": 0.05, "currency": "USD"}}),
+                        )
+                        .await;
+                        respond(&agent_writer, Some(id), json!({"stopReason": "end_turn"})).await;
                     });
                 }
                 // Streams keepalives, then answers: the concurrent turn whose
@@ -732,6 +831,47 @@ async fn a_full_turn_streams_reasoning_and_text_and_finishes_once() {
         .join("\n");
     assert!(text.contains("You are @test"), "{text}");
     assert!(text.contains("user: hi there"), "{text}");
+}
+
+/// ACP v1 carries no input/output token counts, and its one numeric update is
+/// **context occupancy**, not this turn's spend. A turn that receives a real
+/// `usage_update` must report `llm_calls: 1` with zero tokens instead of
+/// turning `used` into `input_tokens`; the zeros mean "not reported", which is
+/// the same honesty `UsageReport` demands. `proto.rs`'s
+/// `a_usage_update_is_ignored_and_never_becomes_token_counts` pins the
+/// classifier; this pins the turn.
+#[tokio::test]
+async fn a_usage_update_is_not_decoded_into_token_counts() {
+    let (backend, _log) = agent(Behavior::UsageUpdate);
+    let (tx, rx) = mpsc::channel(64);
+    let events = collect_events(rx);
+
+    let response = backend
+        .chat(request_with_history(), tx, CancellationToken::new())
+        .await
+        .expect("the turn completes");
+    assert_eq!(response.text, "done");
+    assert_eq!(response.usage.llm_calls, 1, "one `session/prompt` ran");
+    assert_eq!(
+        response.usage.input_tokens, 0,
+        "`used` is tokens in context, not this turn's input; reading it as one would be a lie"
+    );
+    assert_eq!(response.usage.output_tokens, 0);
+    assert_eq!(response.usage.total_tokens(), 0);
+
+    // Nothing else on the stream carries numbers either: the update was
+    // classified `Ignored`, so the only usage a consumer sees is `Finished`'s.
+    let events = events.await.expect("joined");
+    assert_eq!(
+        events.last(),
+        Some(&LlmEvent::Finished {
+            finish_reason: FinishReason::Stop,
+            usage: response.usage,
+            text: "done".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+        })
+    );
 }
 
 /// An agent's own tool call must arrive as `AgentToolCall`, and **never** as
@@ -1383,6 +1523,118 @@ async fn probe_reports_a_ready_agent_without_spending_a_turn() {
     assert!(status.detail.contains("ACP v1"), "{status:#?}");
     assert!(status.detail.contains("permissions: reject"), "{status:#?}");
     assert_eq!(status.version.as_deref(), Some("acp v1"));
+}
+
+#[tokio::test]
+async fn probe_reports_the_login_an_agent_advertises() {
+    let (backend, _log) = agent(Behavior::LoginRequired);
+    let status = backend.probe().await.expect("probe reports, never throws");
+    assert!(!status.ok, "{status:#?}");
+    // The refusal is the agent's own words, and it says *why*: -32000.
+    assert!(
+        status.detail.contains("Authentication required"),
+        "{status:#?}"
+    );
+    assert!(status.auth_required, "{status:#?}");
+    assert_eq!(status.auth_methods.len(), 1, "{status:#?}");
+    let method = &status.auth_methods[0];
+    assert_eq!(method.id, "claude-login");
+    assert_eq!(method.name, "Log in with [CC]");
+    assert_eq!(
+        method.description.as_deref(),
+        Some("Run `claude /login` in the terminal")
+    );
+    // The agent named no command, so none is invented for the copy button.
+    assert_eq!(method.command, None, "{status:#?}");
+    // Nothing in the report claims a turn would work.
+    assert!(!status.ok);
+}
+
+#[tokio::test]
+async fn probe_never_reports_a_login_required_when_the_session_was_opened() {
+    // The measured `claude-code-acp` shape: a green handshake on an agent that
+    // still advertises a login. The status must be honest about both halves —
+    // `ok` (the handshake passed) and the advertised method (a turn may still
+    // be refused), which is what the Settings card renders as a warning.
+    let (backend, _log) = agent(Behavior::TerminalAuthMeta);
+    let status = backend.probe().await.expect("probe reports");
+    assert!(status.ok, "{status:#?}");
+    assert!(!status.auth_required, "{status:#?}");
+    assert_eq!(status.auth_methods.len(), 1, "{status:#?}");
+    // `_meta["terminal-auth"]` is the one source of an exact command.
+    assert_eq!(
+        status.auth_methods[0].command.as_deref(),
+        Some("node /opt/claude/cli.js")
+    );
+}
+
+#[tokio::test]
+async fn connect_performs_a_login_only_when_the_agent_advertised_it() {
+    let (backend, log) = agent(Behavior::LoginRequired);
+
+    // A plain Connect is a handshake: no `authenticate` is sent, and the report
+    // is the same one `probe` gives.
+    let plain = backend.connect(None).await.expect("connect reports");
+    assert!(!plain.ok, "{plain:#?}");
+    assert!(plain.auth_required, "{plain:#?}");
+    let entries = logged(&log);
+    assert!(
+        find_request(&entries, "authenticate").is_none(),
+        "a plain connect must not send authenticate: {entries:#?}"
+    );
+
+    // A chosen login is sent with the agent's own method id, and then the
+    // handshake has to pass — that is the only thing that reads as connected.
+    let connected = backend
+        .connect(Some("claude-login"))
+        .await
+        .expect("connect reports");
+    assert!(connected.ok, "{connected:#?}");
+    assert!(!connected.auth_required, "{connected:#?}");
+    let entries = logged(&log);
+    let auth = find_request(&entries, "authenticate").expect("authenticate was sent");
+    assert_eq!(auth["params"]["methodId"], json!("claude-login"));
+}
+
+#[tokio::test]
+async fn a_login_the_agent_cannot_perform_is_reported_not_faked() {
+    // `claude-code-acp` names `claude-login` and answers `Method not
+    // implemented`. Connect must show that, and must not call the session
+    // connected.
+    let (backend, _log) = agent(Behavior::AuthNotImplemented);
+    let status = backend
+        .connect(Some("claude-login"))
+        .await
+        .expect("connect reports");
+    assert!(!status.ok, "{status:#?}");
+    assert!(status.auth_required, "{status:#?}");
+    assert!(
+        status.detail.contains("Method not implemented"),
+        "{status:#?}"
+    );
+    // The login is still offered, because it is still what the agent says it
+    // needs — the button stays, its refusal is what changed.
+    assert_eq!(status.auth_methods.len(), 1, "{status:#?}");
+}
+
+#[tokio::test]
+async fn a_login_method_nobody_advertised_is_not_sent_to_the_agent() {
+    let (backend, log) = agent(Behavior::Normal);
+    let status = backend
+        .connect(Some("some-other-login"))
+        .await
+        .expect("connect reports");
+    assert!(!status.ok, "{status:#?}");
+    assert!(status.auth_methods.is_empty(), "{status:#?}");
+    assert!(
+        status.detail.contains("advertises no auth method"),
+        "{status:#?}"
+    );
+    let entries = logged(&log);
+    assert!(
+        find_request(&entries, "authenticate").is_none(),
+        "an unadvertised method must never be sent: {entries:#?}"
+    );
 }
 
 #[tokio::test]

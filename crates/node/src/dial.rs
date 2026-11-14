@@ -466,6 +466,10 @@ pub async fn session(
             // check is the other half — both, on purpose.
             require_hello: true,
             handler: Some(Arc::clone(&handler) as Handler),
+            // The owner's own cap on concurrent work, from `node.toml` or
+            // `--max-in-flight`. `Peer::new` clamps 0 to 1, and the config
+            // refuses 0 outright, so this is never "serve nothing".
+            max_in_flight: runtime.config.max_in_flight,
             ..PeerConfig::default()
         },
     );

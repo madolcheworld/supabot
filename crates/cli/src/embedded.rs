@@ -21,14 +21,17 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use swarmbot_contracts::bot::Bot;
-use swarmbot_contracts::config::BrainConfig;
+use swarmbot_contracts::config::{BrainConfig, Settings};
 use swarmbot_contracts::conversation::Conversation;
 use swarmbot_contracts::entry::Entry;
 use swarmbot_contracts::error::DomainError;
-use swarmbot_contracts::id::{BotId, ConversationId, EntryId, RequestId};
+use swarmbot_contracts::id::{
+    BotId, ConversationId, EntryId, NodeId, RequestId, RoutineId, RuleId,
+};
 use swarmbot_contracts::live::LiveEvent;
 use swarmbot_contracts::node::{NodeInfo, NodeRoot};
-use swarmbot_contracts::request::{Decision, RuntimeRequest};
+use swarmbot_contracts::request::{ApprovalRule, Decision, RuntimeRequest};
+use swarmbot_contracts::routine::{Routine, RoutineRun};
 use swarmbot_contracts::task::Task;
 use swarmbot_contracts::turn::{DEFAULT_WINDOW_HOURS, UsageReport};
 use swarmbot_core::compose;
@@ -37,7 +40,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::remote::Backend;
 use crate::render::{Printer, Roster, print_event};
-use crate::session::{SendReport, Session, request_relevant_to};
+use crate::session::{BotEdit, SendReport, Session, request_relevant_to};
+use swarmbot_client::{SecretName, SecretWrite};
 
 /// Everything [`Embedded::build`] needs: a resolved config and where to run.
 pub struct BrainParams {
@@ -56,6 +60,13 @@ pub struct BrainParams {
 #[derive(Clone)]
 pub struct Embedded {
     pub swarm: std::sync::Arc<Swarm>,
+    /// Whether this handle booted the swarm (runners started, team provisioned)
+    /// or only composed it. A read-only command (`bots ls`, `status`) must not
+    /// provision a team into an empty data dir, so it composes without booting —
+    /// and then `0 live runners` is a fact about *this process*, not about a
+    /// team. [`Session::live_counts`] reports that distinction instead of letting
+    /// the zero read as "the team has no runners".
+    booted: bool,
 }
 
 impl Embedded {
@@ -96,7 +107,10 @@ impl Embedded {
             composed.start_routine_ticker();
             composed.start_housekeeping_ticker();
         }
-        Ok(Self { swarm: composed })
+        Ok(Self {
+            swarm: composed,
+            booted: boot,
+        })
     }
 
     /// Which half of the seam this is — the value a command matches on to decide
@@ -399,6 +413,187 @@ impl Session for Embedded {
 
     fn delegation_lines(&self, conversation: &ConversationId) -> Result<Vec<String>> {
         Ok(crate::demo::delegation_lines(&self.swarm, conversation))
+    }
+
+    // --- the owner's write surface -------------------------------------------
+
+    fn rules(&self) -> Result<Vec<ApprovalRule>> {
+        self.swarm.approval.rules().map_err(|err| anyhow!("{err}"))
+    }
+
+    fn delete_rule(&self, id: &RuleId) -> Result<()> {
+        // The brain's route refuses a rule that is not there instead of a silent
+        // no-op; the embedded half keeps the same promise, or the two modes
+        // would disagree about what "deleted" means.
+        if !self.rules()?.iter().any(|rule| &rule.id == id) {
+            return Err(anyhow!(
+                "there is no approval rule {id} — `swarmbot rules ls` lists the saved ones"
+            ));
+        }
+        self.swarm
+            .approval
+            .delete_rule(id)
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    fn pending(&self) -> Result<Vec<RuntimeRequest>> {
+        self.swarm
+            .approval
+            .pending()
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    fn settings(&self) -> Result<Settings> {
+        Ok(self.swarm.settings.get())
+    }
+
+    fn update_settings(&self, patch: &Value) -> Result<Settings> {
+        let merged = crate::config::merge_settings(&self.swarm.settings.get(), patch)
+            .map_err(|err| anyhow!("{err}"))?;
+        self.swarm
+            .settings
+            .update(|slot| *slot = merged)
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    fn routines(&self) -> Result<Vec<Routine>> {
+        self.swarm
+            .routines
+            .list_routines()
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    fn pause_routine(&self, id: &RoutineId) -> Result<Routine> {
+        self.swarm
+            .routines
+            .pause_routine(id)
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    fn resume_routine(&self, id: &RoutineId) -> Result<Routine> {
+        self.swarm
+            .routines
+            .resume_routine(id, chrono::Utc::now())
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    fn delete_routine(&self, id: &RoutineId) -> Result<()> {
+        self.swarm
+            .routines
+            .delete_routine(id)
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    fn routine_runs(&self, id: &RoutineId, limit: u32) -> Result<Vec<RoutineRun>> {
+        self.swarm
+            .routines
+            .list_runs(id, limit.clamp(1, 200))
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    fn revoke_node(&self, id: &NodeId) -> Result<()> {
+        // The brain's route refuses the local node *and* closes a connected
+        // socket for a remote one. In this process the only node is the local
+        // one, and that refusal is the honest answer: revoking it would leave
+        // every tool call failing with `node_unavailable` and no way back.
+        if id.is_local() {
+            return Err(anyhow!(
+                "the local node cannot be revoked: it runs inside this process — with --brain, \
+                 `nodes revoke` cuts a remote machine off"
+            ));
+        }
+        // No gateway lives in this process, so a foreign node cannot be paired
+        // here at all; a row for one would be a leftover from a daemon's data
+        // dir. Say that instead of writing a revocation nothing can enforce.
+        Err(anyhow!(
+            "this in-process brain has no node gateway, so the only node it can hold is its own \
+             local one — run `swarmbot nodes revoke` with --brain to cut a paired machine off"
+        ))
+    }
+
+    fn edit_bot(&self, name: &str, edit: &BotEdit) -> Result<Bot> {
+        let mut bot = self
+            .swarm
+            .bots
+            .by_name(name)
+            .map_err(|err| anyhow!("{err}"))?;
+        // The same fields the brain's `PATCH /api/bots/{id}` touches, and the
+        // same empty-string rule for the model, so the two modes cannot drift.
+        if let Some(backend) = &edit.backend {
+            bot.backend = backend.clone();
+        }
+        if let Some(model) = &edit.model {
+            let trimmed = model.trim();
+            bot.model = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        }
+        if let Some(skills) = &edit.skills {
+            bot.skills = skills.clone();
+        }
+        let saved = self
+            .swarm
+            .bots
+            .update(&bot)
+            .map_err(|err| anyhow!("{err}"))?;
+        // `update` does not touch `status`; enabling/disabling is its own writer
+        // (`set_enabled`) because it also starts or stops the bot's runner.
+        match edit.enabled {
+            Some(enabled) => self
+                .swarm
+                .bots
+                .set_enabled(&saved.id, enabled)
+                .map_err(|err| anyhow!("{err}")),
+            None => Ok(saved),
+        }
+    }
+
+    fn entries_before(
+        &self,
+        conversation: &ConversationId,
+        before_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<Entry>> {
+        self.swarm
+            .store
+            .entries_before(conversation, before_seq, limit)
+            .map_err(|err| anyhow!("{err}"))
+    }
+
+    fn export_transcript(&self, conversation: &ConversationId) -> Result<String> {
+        crate::admin::export_ndjson(self.swarm.store.as_ref(), conversation)
+    }
+
+    fn secrets(&self) -> Result<Vec<SecretName>> {
+        crate::admin::list_secrets(&self.swarm.data_dir, &self.swarm.config)
+    }
+
+    fn set_secret(&self, name: &str, value: &str) -> Result<SecretWrite> {
+        crate::admin::write_secret(&self.swarm.data_dir, name, Some(value))
+    }
+
+    fn delete_secret(&self, name: &str) -> Result<SecretWrite> {
+        crate::admin::write_secret(&self.swarm.data_dir, name, None)
+    }
+
+    fn live_counts(&self) -> Option<crate::session::LiveCounts> {
+        let store = self.swarm.store.as_ref();
+        // Each of these is a `Result` on purpose in the store; a status command
+        // must not fail because one counter could not be read, so a failed read
+        // counts as zero *and* the caller is told by the count being absent…
+        // which it cannot be here. So: a store error makes the whole block
+        // `None`, and `status` prints "not readable" for those lines rather than
+        // inventing zeros.
+        let turns_running = store.running_turns().ok()?.len() as u64;
+        let mut deliveries_queued = 0u64;
+        for bot in store.list_bots().ok()? {
+            deliveries_queued += store.queued_deliveries(&bot.id).ok()?.len() as u64;
+        }
+        Some(crate::session::LiveCounts {
+            turns_running,
+            deliveries_queued,
+            deliveries_parked: self.swarm.runners.parked_count() as u64,
+            runners: self.swarm.runners.len() as u64,
+            booted: self.booted,
+        })
     }
 }
 

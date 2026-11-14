@@ -15,6 +15,7 @@ pub mod nodes;
 pub mod palette;
 pub mod provider_menu;
 pub mod routines;
+pub mod rules;
 pub mod settings;
 pub mod side_panel;
 pub mod sidebar;
@@ -60,6 +61,8 @@ pub struct Root {
     bot_handle_input: Entity<TextInput>,
     bot_label_input: Entity<TextInput>,
     bot_instructions_input: Entity<TextInput>,
+    /// The Settings screen's skills field (one editor open at a time).
+    skills_input: Entity<TextInput>,
     cards: HashMap<EntryId, Entity<CardView>>,
     /// Pending approval/question cards surfaced into a group view from
     /// delegated DM `handoff_task` turns (whose entries live in a bot's DM).
@@ -93,6 +96,8 @@ impl Root {
         let bot_label_input = cx.new(|cx| TextInput::new("Display name (e.g. Researcher)", cx));
         let bot_instructions_input =
             cx.new(|cx| TextInput::new("Instructions / role for this bot…", cx).multiline());
+        let skills_input =
+            cx.new(|cx| TextInput::new("skill names, comma separated (e.g. research, review)", cx));
         let focus_handle = cx.focus_handle();
         let observations = vec![
             cx.observe(&state, |this, state, cx| {
@@ -128,6 +133,7 @@ impl Root {
             bot_handle_input,
             bot_label_input,
             bot_instructions_input,
+            skills_input,
             cards: HashMap::new(),
             surfaced_cards: HashMap::new(),
             transcript,
@@ -402,16 +408,25 @@ impl Root {
             let state_h = self.state.clone();
             let commands_h = self.commands.clone();
             let handle_input = self.bot_handle_input.clone();
-            let headline = if s.bots.is_empty() {
-                "No bots yet"
-            } else {
-                "No conversation selected"
+            // "No bots yet" is a claim about the roster, so it needs a roster
+            // that has actually been read. Before the first snapshot — or after
+            // a failed one — this pane says what it is waiting for instead.
+            let roster_known = matches!(s.bots, crate::state::Fetched::Ready(_));
+            let headline = match (&s.bots, roster_known) {
+                (crate::state::Fetched::Failed(_), _) => "Could not load the roster",
+                (_, false) => "Waiting for the brain",
+                (_, true) if s.bots.is_empty() => "No bots yet",
+                _ => "No conversation selected",
             };
-            let hint = if s.bots.is_empty() {
-                "Add a bot to start chatting, or add 2+ bots to form a group."
-            } else {
-                "Select a bot or group from the left sidebar, or add a new bot."
+            let hint = match (&s.bots, roster_known) {
+                (crate::state::Fetched::Failed(reason), _) => reason.clone(),
+                (_, false) => s.conn.label(),
+                (_, true) if s.bots.is_empty() => {
+                    "Add a bot to start chatting, or add 2+ bots to form a group.".to_string()
+                }
+                _ => "Select a bot or group from the left sidebar, or add a new bot.".to_string(),
             };
+            let can_add = roster_known && s.bots.is_empty();
             div()
                 .flex_1()
                 .flex()
@@ -427,28 +442,30 @@ impl Root {
                         .child(headline),
                 )
                 .child(div().text_sm().text_color(rgb(theme::TEXT_DIM)).child(hint))
-                .child(
-                    div()
-                        .id("empty-add-bot-btn")
-                        .px_4()
-                        .py_2()
-                        .rounded_lg()
-                        .bg(rgb(theme::ACCENT))
-                        .hover(|h| h.bg(rgb(theme::ACCENT_HOVER)))
-                        .cursor_pointer()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(rgb(theme::BACKGROUND))
-                        .child("+ Add Bot")
-                        .on_click(move |_, window, cx: &mut App| {
-                            state_h.update(cx, |st, cx| {
-                                st.open_create_bot();
-                                cx.notify();
-                            });
-                            handle_input.read(cx).focus(window);
-                            let _ = commands_h.send(Command::FetchBackends);
-                        }),
-                )
+                .when(can_add, |d| {
+                    d.child(
+                        div()
+                            .id("empty-add-bot-btn")
+                            .px_4()
+                            .py_2()
+                            .rounded_lg()
+                            .bg(rgb(theme::ACCENT))
+                            .hover(|h| h.bg(rgb(theme::ACCENT_HOVER)))
+                            .cursor_pointer()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(theme::BACKGROUND))
+                            .child("+ Add Bot")
+                            .on_click(move |_, window, cx: &mut App| {
+                                state_h.update(cx, |st, cx| {
+                                    st.open_create_bot();
+                                    cx.notify();
+                                });
+                                handle_input.read(cx).focus(window);
+                                let _ = commands_h.send(Command::FetchBackends);
+                            }),
+                    )
+                })
                 .into_any_element()
         } else if count == 0 {
             div()
@@ -508,6 +525,7 @@ impl Root {
                 &self.provider_model,
                 &self.commands,
             ))
+            .children(conversation::history_bar(s, &self.state, &self.commands))
             .child(
                 div()
                     .flex_1()
@@ -632,13 +650,21 @@ impl Root {
         let state_group = self.state.clone();
         let group_title_input = self.group_title_input.clone();
 
-        let group_subtitle = if s.bots.len() < swarmbot_contracts::MIN_GROUP_MEMBERS {
-            format!(
-                "Requires at least {} bots",
-                swarmbot_contracts::MIN_GROUP_MEMBERS
-            )
-        } else {
-            "Start a multi-bot chat".to_string()
+        // The subtitle states a requirement, so it waits for a roster that has
+        // been read: "requires at least 2 bots" over an unknown roster is a claim
+        // that the owner has one bot too few, which nobody has checked.
+        let group_subtitle = match &s.bots {
+            crate::state::Fetched::Ready(bots)
+                if bots.len() < swarmbot_contracts::MIN_GROUP_MEMBERS =>
+            {
+                format!(
+                    "Requires at least {} bots",
+                    swarmbot_contracts::MIN_GROUP_MEMBERS
+                )
+            }
+            crate::state::Fetched::Ready(_) => "Start a multi-bot chat".to_string(),
+            crate::state::Fetched::Unknown => "Waiting for the roster".to_string(),
+            crate::state::Fetched::Failed(_) => "Roster unavailable".to_string(),
         };
 
         div()
@@ -987,10 +1013,22 @@ impl Root {
         }
 
         if s.bots.len() < swarmbot_contracts::MIN_GROUP_MEMBERS {
-            let msg = if s.bots.is_empty() {
-                "No bots added yet. Add at least 2 bots first via '+' -> Add Bot."
-            } else {
-                "Add 1 more bot first via '+' -> Add Bot (minimum 2)."
+            // "No bots added yet" is a claim about the roster, so it is only made
+            // when the roster was actually read; the other two states say what
+            // they are instead of asking the owner to fix a list that may be fine.
+            let msg = match &s.bots {
+                crate::state::Fetched::Failed(reason) => format!(
+                    "The roster could not be loaded ({reason}), so a group cannot be built yet."
+                ),
+                crate::state::Fetched::Unknown => {
+                    "The roster is still loading; a group needs at least 2 bots.".to_string()
+                }
+                crate::state::Fetched::Ready(_) if s.bots.is_empty() => {
+                    "No bots added yet. Add at least 2 bots first via '+' -> Add Bot.".to_string()
+                }
+                crate::state::Fetched::Ready(_) => {
+                    "Add 1 more bot first via '+' -> Add Bot (minimum 2).".to_string()
+                }
             };
             bot_list = bot_list.child(
                 div()
@@ -1624,7 +1662,10 @@ impl Render for Root {
                 &self.routine_name,
                 &self.routine_prompt,
             ),
-            Screen::Settings => settings::render(s, &self.state, &self.commands),
+            Screen::Rules => rules::render(s, &self.state, &self.commands),
+            Screen::Settings => {
+                settings::render(s, &self.state, &self.commands, &self.skills_input)
+            }
             Screen::Usage => usage::render(s, &self.state, &self.commands),
         };
 

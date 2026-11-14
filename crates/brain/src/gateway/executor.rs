@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -310,6 +310,132 @@ impl<S: Socket> NodeDispatcher<S> {
     }
 }
 
+impl<S: Socket> NodeDispatcher<S> {
+    /// Copy one file from `node` onto this machine's `dest`.
+    ///
+    /// Three steps, in this order, and the order is the protocol's:
+    ///
+    /// 1. **Mint the grant first** (`StreamHub::open`). A node on a fast link can
+    ///    dial the stream before the brain has recorded what it is waiting for,
+    ///    and an unregistered dial is refused — so the ticket has to exist before
+    ///    the RPC that tells the node to dial. The old bug shape here is exactly
+    ///    this race, and the module docs of `streams` say so.
+    /// 2. **Send `fs.download`** with the stream id and its single-use bearer.
+    /// 3. **Check the claim against the payload.** The node's RPC answer says
+    ///    `{size, sha256}` of what it *thinks* it sent; the frames say what
+    ///    arrived. A mismatch, or a stream that ended without `Done`, is a
+    ///    detected failure — never a plausible-looking short file.
+    ///
+    /// The bytes are written to a `.part` file and renamed, so a failed transfer
+    /// leaves nothing wearing the destination's name.
+    async fn download_to(
+        &self,
+        peer: &Peer<S>,
+        node: &NodeId,
+        invocation: &Invocation,
+        path: &str,
+        dest: &std::path::Path,
+    ) -> Result<ToolResult, ToolError> {
+        let ticket = self
+            .gateway
+            .streams()
+            .open(swarmbot_node_protocol::streams::StreamKind::Transfer)
+            .map_err(|error| {
+                ToolError::failed(format!("cannot open a data stream for {path}: {error}"))
+            })?;
+        let stream_id = ticket.stream_id.clone();
+        let stream_token = ticket.token.clone();
+        let stamped = self.invocation_for(node, invocation);
+        let outgoing = Outgoing {
+            method: rpc::FS_DOWNLOAD,
+            params: json!(rpc::FsDownload {
+                inv: stamped,
+                path: path.to_string(),
+                stream_id: stream_id.clone(),
+                stream_token,
+            }),
+            streaming: false,
+        };
+        let id = peer.next_id();
+        let answer = peer
+            .call_with_id_deadline(
+                id,
+                outgoing.method,
+                outgoing.params,
+                headers(node),
+                deadline_for(&NodeCall::FsStat {
+                    path: path.to_string(),
+                }),
+            )
+            .await;
+        let claim = match answer {
+            Ok(value) => match serde_json::from_value::<rpc::FsDownloadResult>(value) {
+                Ok(claim) => claim,
+                Err(error) => {
+                    self.gateway.streams().abandon(
+                        &ticket,
+                        format!(
+                            "the node answered `fs.download` with something unreadable: {error}"
+                        ),
+                    );
+                    return Err(ToolError::failed(format!(
+                        "the node's `fs.download` answer could not be decoded: {error}"
+                    )));
+                }
+            },
+            Err(error) => {
+                // The RPC failed, so nobody will dial: forget the grant instead of
+                // leaving it in the map until it ages out.
+                self.gateway
+                    .streams()
+                    .abandon(&ticket, format!("the `fs.download` call failed: {error}"));
+                return Err(wire::translate(node, rpc::FS_DOWNLOAD, &error));
+            }
+        };
+
+        let received = self
+            .gateway
+            .streams()
+            .receive(ticket)
+            .await
+            .map_err(|reason| ToolError::failed(format!("{path} did not arrive: {reason}")))?;
+
+        // The claim and the payload are checked against each other.
+        let arrived = received.len() as u64;
+        if arrived != claim.size {
+            return Err(ToolError::failed(format!(
+                "the node claimed {path} is {} bytes but {arrived} arrived; refusing to keep a \
+                 file whose size nobody agrees on",
+                claim.size
+            )));
+        }
+        if received.sha256 != claim.sha256 {
+            return Err(ToolError::failed(format!(
+                "the bytes that arrived for {path} do not match the digest the node reported \
+                 (node said {}, the payload hashes to {}); refusing to keep them",
+                claim.sha256, received.sha256
+            )));
+        }
+
+        let temp = dest.with_extension("part");
+        std::fs::write(&temp, &received.bytes).map_err(|error| {
+            ToolError::failed(format!("cannot write {}: {error}", temp.display()))
+        })?;
+        std::fs::rename(&temp, dest).map_err(|error| {
+            let _ = std::fs::remove_file(&temp);
+            ToolError::failed(format!(
+                "cannot move the download into {}: {error}",
+                dest.display()
+            ))
+        })?;
+        Ok(swarmbot_tools::handlers::download_result(
+            &dest.display().to_string(),
+            arrived,
+            &received.sha256,
+        ))
+    }
+}
+
 #[async_trait]
 impl<S: Socket> NodeExecutor for NodeDispatcher<S> {
     /// Route one call. `invocation` is the caller's own and is forwarded as it
@@ -345,6 +471,39 @@ impl<S: Socket> NodeExecutor for NodeDispatcher<S> {
         } else {
             self.unary(&peer, node, &outgoing, &call).await
         }
+    }
+
+    /// [`NodeExecutor::download`], with the same roster checks `exec` makes.
+    ///
+    /// `unusable` is consulted for the `fs` capability here too: a download reads
+    /// a file, so a node whose owner never approved `fs` must not be asked to
+    /// send one, and the refusal should name that rather than surface as a wire
+    /// error after a round trip.
+    async fn download(
+        &self,
+        node: &NodeId,
+        invocation: &Invocation,
+        path: &str,
+        dest: &std::path::Path,
+    ) -> Result<ToolResult, ToolError> {
+        if node.is_local() {
+            return self.local.download(node, invocation, path, dest).await;
+        }
+        let probe = NodeCall::FsRead {
+            path: path.to_string(),
+            offset: None,
+            limit: None,
+            encoding: None,
+        };
+        if let Some(reason) = self.unusable(node, &probe)? {
+            return Err(ToolError::failed(reason));
+        }
+        let Some(peer) = self.gateway.peer(node) else {
+            return Err(ToolError::failed(format!(
+                "node {node} is not connected: its control socket is gone"
+            )));
+        };
+        self.download_to(&peer, node, invocation, path, dest).await
     }
 }
 

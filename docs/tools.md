@@ -2,7 +2,7 @@
 
 Every tool a bot can call, what it takes, what it returns, and which safety rule
 governs it. The authoritative definition of each tool is its `spec()` function —
-`crates/tools/src/handlers/<tool>.rs` for the seven node tools, the
+`crates/tools/src/handlers/<tool>.rs` for the eight node tools, the
 `BotToolKind::spec` match in `crates/core/src/bot_tools.rs` for the thirteen bot
 tools. `ToolRegistry::dispatch` validates arguments against that spec's JSON
 Schema (`jsonschema` crate) before any handler runs, so this page, the registry
@@ -11,14 +11,14 @@ and the model all see one contract.
 **What exists in this build:** both halves of the catalogue, implemented and
 tested —
 
-* the seven **node tools** (`crates/tools/src/handlers/`, 94 tests): files, shell,
-  search;
+* the eight **node tools** (`crates/tools/src/handlers/`): files, shell, search,
+  and `download_file` (a file from another machine, over the node's data stream);
 * the thirteen **bot tools** (`crates/core/src/bot_tools.rs`, registered by
   `register_bot_tools`, which `Swarm::new` calls while it builds the registry):
   talking, delegating, asking the human, seeing the roster.
 
 Nothing else is offered to a model. In particular there is no browser, desktop,
-file-transfer or routine tool: those are out of scope
+routine, or upload tool: those are out of scope
 ([`decisions.md`](decisions.md) D0.4) and are not silently absent — a node asked
 for one answers with a typed refusal ([`node-protocol.md`](node-protocol.md) §9).
 
@@ -45,7 +45,7 @@ Enforced once, in `ToolRegistry::dispatch` / `apply_result_rules`, not per handl
 
 `ToolRegistry::visible_specs(toolsets, node_caps, in_task)` applies three gates in order:
 
-1. **Toolset** — the bot's `toolsets` must contain the tool's (`Node` for all seven below).
+1. **Toolset** — the bot's `toolsets` must contain the tool's (`Node` for all eight below).
 2. **Node capabilities** — a `Node` tool is hidden when the target node's effective
    capabilities (`declared ∩ approved`) lack `shell@1` (for `shell`) or `fs@1`
    (for the filesystem tools). `node_caps = None` means "unknown" and does **not**
@@ -57,7 +57,7 @@ Enforced once, in `ToolRegistry::dispatch` / `apply_result_rules`, not per handl
    model away from a recursion bomb, and there is no owner watching a task
    conversation to answer an ask.
 
-Toolsets: the seven node tools are `Toolset::Node`; `message_bot`,
+Toolsets: the eight node tools are `Toolset::Node`; `message_bot`,
 `post_to_group`, `handoff_task`, `react`, `list_bots`, `list_nodes`, `ask_user`
 and `request_approval` are `Toolset::Bot`; the five `*_task` tools are
 `Toolset::Task`. `Toolset::Owner` is reserved and no tool uses it yet.
@@ -74,7 +74,7 @@ node, never loosen it (`PolicyEngine::decide`).
 | Surface | Tools | Brain default (`config/swarmbot.example.toml`) | Read-only auto-allow |
 | --- | --- | --- | --- |
 | `shell` | `shell` | `ask` | no |
-| `read_file` | `read_file`, `list_dir`, `glob`, `grep` | `always` | yes (`settings.auto_approve_read_only`) |
+| `read_file` | `read_file`, `list_dir`, `glob`, `grep`, **`download_file`** | `always` | yes (`settings.auto_approve_read_only`) |
 | `write_file` | `write_file` | `ask` | no |
 | `edit_file` | `edit_file` | `ask` | no |
 
@@ -83,6 +83,15 @@ names the surface; `ask` → the `ApprovalGate` (rules first, then a human card)
 `always` → run. A destructive `shell` command is raised to `ask` even under
 `always` — see [`decisions.md`](decisions.md) D5.5 for the pattern list and its
 stated limits (it is not a shell parser).
+
+`download_file` is deliberately on the `read_file` surface rather than on a
+surface of its own: on the far machine it **reads** a file, and that is the
+permission the owner is granting. Its destination is not a caller-chosen path —
+it lands in `<workspace>/.downloads/<name>`, and a `name` containing a separator
+or `..` is refused — so the tool never becomes a remote-write surface. The result
+carries the size and the sha256 of the bytes that actually arrived, which for a
+remote node are checked against the `{size, sha256}` the node claimed
+([`node-protocol.md`](node-protocol.md) §8).
 
 Path boundary, before any of that: `PathPolicy::resolve` expands `~/`, resolves
 relative paths against the bot's workspace, canonicalizes component by component

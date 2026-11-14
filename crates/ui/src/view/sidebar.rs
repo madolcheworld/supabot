@@ -1,5 +1,18 @@
-//! The left sidebar: Search bar, bot conversations list, unread indicators,
-//! plugins, and user profile footer matching the design.
+//! The left sidebar: the app's title row, the group and DM lists, and the screen
+//! navigation.
+//!
+//! **Every control here does something.** An earlier version carried a search
+//! pill, a "More unreads" pill, a "Plugins" row and a hard-coded user profile
+//! ("Greg Tritthart" with an "upgrade" arrow): all four looked clickable and none
+//! of them was connected to anything, so the app advertised four capabilities it
+//! did not have. They are gone rather than wired, because none of them had an
+//! implementation to wire — a dimmed row that does nothing is the interface
+//! equivalent of a stub that returns success.
+//!
+//! **The list's empty state is a claim**, so it is made only when a snapshot has
+//! actually delivered an answer: "No bots or groups yet" with the roster unknown
+//! or failed to load would send the owner looking for a problem that is theirs
+//! and is not.
 
 use std::sync::mpsc::Sender;
 
@@ -7,12 +20,11 @@ use gpui::{Entity, SharedString, div, prelude::*, px, rgb};
 use swarmbot_contracts::BotStatus;
 
 use crate::proto::Command;
-use crate::state::{AppState, Screen};
+use crate::state::{AppState, Fetched, Screen};
 use crate::theme;
 use crate::widgets::bits::{self, Tone};
 
 pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::Div {
-    let has_unreads = s.unread.values().any(|&u| u > 0);
     div()
         .w(theme::space::SIDEBAR_W)
         .flex_none()
@@ -23,7 +35,7 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
         .border_r_1()
         .border_color(rgb(theme::BORDER))
         // Top search bar and new button
-        .child(header_search(s, state))
+        .child(header(s, state))
         // Scrollable bot conversations list
         .child(
             div()
@@ -35,14 +47,13 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
                 .gap_1()
                 .px_2()
                 .py_2()
-                .child(bots_list(s, state, commands))
-                .when(has_unreads, |d| d.child(more_unreads_pill())),
+                .child(bots_list(s, state, commands)),
         )
-        // Footer: Plugins + User Profile + Quick navigation
+        // Footer: screen navigation (the only clickable rows left in the sidebar)
         .child(footer(s, state, commands))
 }
 
-fn header_search(s: &AppState, state: &Entity<AppState>) -> gpui::Div {
+fn header(s: &AppState, state: &Entity<AppState>) -> gpui::Div {
     let state_plus = state.clone();
     let menu_open = s.plus_menu_open;
     div()
@@ -53,21 +64,19 @@ fn header_search(s: &AppState, state: &Entity<AppState>) -> gpui::Div {
         .flex()
         .items_center()
         .gap_2()
+        // The app's name where the search pill used to be: the only thing in this
+        // row that used to be clickable-but-dead. Jumping anywhere is `ctrl-k`,
+        // which is a working feature and is named in the palette itself.
         .child(
-            // Search pill box
             div()
                 .flex_1()
                 .h(px(36.0))
-                .rounded_xl()
-                .bg(rgb(0xebebee))
-                .px_3()
                 .flex()
                 .items_center()
-                .gap_2()
-                .text_color(rgb(theme::TEXT_MUTED))
                 .text_sm()
-                .child("🔍")
-                .child(div().text_color(rgb(theme::TEXT_MUTED)).child("Search")),
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(theme::TEXT))
+                .child("SwarmBot"),
         )
         .child(
             // Plus button opening the Add Bot / Create Group choice menu
@@ -235,7 +244,13 @@ fn bots_list(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>)
         }
     }
 
-    if groups.is_empty() && s.bots.is_empty() {
+    // The empty state is a claim about the brain, so it needs the brain to have
+    // answered. Unknown (still connecting, or no snapshot yet) and failed (the
+    // socket reported a failure) both say what they are instead.
+    let ready = matches!(s.bots, Fetched::Ready(_)) && matches!(s.conversations, Fetched::Ready(_));
+    if groups.is_empty() && s.bots.is_empty() && !ready {
+        list = list.child(not_ready_notice(s));
+    } else if groups.is_empty() && s.bots.is_empty() {
         let state_add = state.clone();
         let commands_add = commands.clone();
         list = list.child(
@@ -431,35 +446,17 @@ fn bot_item(
         })
 }
 
-fn more_unreads_pill() -> gpui::Div {
-    div().flex().justify_center().py_2().child(
-        div()
-            .px_4()
-            .py_1p5()
-            .rounded_full()
-            .bg(rgb(0x1d4ed8))
-            .text_color(rgb(0xffffff))
-            .text_xs()
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .flex()
-            .items_center()
-            .gap_1p5()
-            .cursor_pointer()
-            .hover(|h| h.bg(rgb(0x1e40af)))
-            .child("↓")
-            .child("More unreads"),
-    )
-}
-
 fn footer(_s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::Div {
     let state_settings = state.clone();
     let state_nodes = state.clone();
     let state_routines = state.clone();
     let state_usage = state.clone();
+    let state_rules = state.clone();
     let commands_settings = commands.clone();
     let commands_nodes = commands.clone();
     let commands_routines = commands.clone();
     let commands_usage = commands.clone();
+    let commands_rules = commands.clone();
     // The window the usage screen last asked for, read here so the nav button
     // asks the same question the screen is showing.
     let usage_hours = _s.usage_hours;
@@ -472,73 +469,21 @@ fn footer(_s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -
         .flex()
         .flex_col()
         .gap_2()
-        // Plugins button row
-        .child(
-            div()
-                .id("sidebar-plugins")
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1p5()
-                .rounded_xl()
-                .cursor_pointer()
-                .hover(|h| h.bg(rgb(0xebebee)))
-                .child(div().text_sm().child("🔌"))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(rgb(theme::TEXT))
-                        .child("Plugins"),
-                ),
-        )
-        // User profile card: Greg Tritthart
         .child(
             div()
                 .flex()
-                .items_center()
-                .justify_between()
-                .px_1()
-                .py_1()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2p5()
-                        .child(bits::user_avatar("GT", px(32.0)))
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(theme::TEXT))
-                                .child("Greg Tritthart"),
-                        ),
-                )
-                .child(
-                    // Blue circular action button with up arrow
-                    div()
-                        .size(px(28.0))
-                        .rounded_full()
-                        .bg(rgb(0x2563eb))
-                        .cursor_pointer()
-                        .hover(|h| h.bg(rgb(0x1d4ed8)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(rgb(0xffffff))
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .child("⬆"),
-                ),
-        )
-        // Hidden/compact nav triggers for state/integration tests
-        .child(
-            div()
-                .flex()
+                .flex_wrap()
                 .items_center()
                 .gap_1()
-                .pt_1()
+                .child(bits::button("Rules", Tone::Ghost).id("nav-rules").on_click(
+                    move |_, _, cx: &mut gpui::App| {
+                        state_rules.update(cx, |st, cx| {
+                            st.screen = Screen::Rules;
+                            cx.notify();
+                        });
+                        let _ = commands_rules.send(Command::FetchRules);
+                    },
+                ))
                 .child(bits::button("Nodes", Tone::Ghost).id("nav-nodes").on_click(
                     move |_, _, cx: &mut gpui::App| {
                         state_nodes.update(cx, |st, cx| {
@@ -584,6 +529,46 @@ fn footer(_s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>) -
                             )),
                         });
                     },
+                )),
+        )
+}
+
+/// What the list says while the roster is not known.
+///
+/// The roster has exactly one source — the live snapshot — so it cannot fail on
+/// its own: a failure *is* the socket's failure, and [`AppState::conn`] already
+/// carries it. That is why this reads the connection label instead of inventing
+/// a second error state that nothing could ever set.
+///
+/// Deliberately no action button: the only thing that helps is waiting for the
+/// socket, and the `+` menu above already works.
+fn not_ready_notice(s: &AppState) -> gpui::Div {
+    div()
+        .p_4()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT_MUTED))
+                .text_center()
+                .child(match s.conn {
+                    crate::state::ConnectionState::Connected => "Waiting for the first snapshot",
+                    _ => "Not connected",
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_DIM))
+                .text_center()
+                .child(format!(
+                    "{}. The roster is shown once the live socket delivers its snapshot.",
+                    s.conn.label()
                 )),
         )
 }

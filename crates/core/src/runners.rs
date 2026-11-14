@@ -461,6 +461,24 @@ impl RunnerMap {
             .sum()
     }
 
+    /// Forget everything parked for a bot that can no longer take it, and hand
+    /// the deliveries back so the caller can drop them in the store.
+    ///
+    /// Parking is only safe while a runner may still appear. A bot that is
+    /// disabled or deleted never gets one, so a parked delivery of its own is
+    /// not "waiting", it is a zombie: `wait_for_idle` requires
+    /// `parked_count() == 0`, so one of these makes a whole team look busy
+    /// forever. The map has no store, hence the return value — the caller is
+    /// what closes the row (`DeliveryState::Dropped`) as well as the map entry.
+    pub fn drop_parked(&self, bot_id: &BotId) -> Vec<Delivery> {
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(bot_id)
+            .map(VecDeque::into)
+            .unwrap_or_default()
+    }
+
     pub async fn shutdown(&self) {
         let handles: Vec<Arc<RunnerHandle>> = self
             .handles
@@ -1267,6 +1285,7 @@ async fn execute_turn(
                 toolsets: effective_toolsets.clone(),
                 node_caps: Some(node.capabilities()),
                 in_task,
+                cancel: turn_cancel.child_token(),
             })?),
             None => None,
         }
@@ -2564,9 +2583,18 @@ mod tests {
         let chunk_1 = format!("MSG_ONE {}", "a".repeat(3500));
         let chunk_2 = format!("MSG_TWO {}", "b".repeat(3500));
         let chunk_3 = format!("MSG_THREE {}", "c".repeat(3500));
-        let e1 = swarm.transcript.owner_message(&group.id, &chunk_1).unwrap();
-        let e2 = swarm.transcript.owner_message(&group.id, &chunk_2).unwrap();
-        let e3 = swarm.transcript.owner_message(&group.id, &chunk_3).unwrap();
+        let e1 = swarm
+            .transcript
+            .owner_message(&group.id, &chunk_1, None)
+            .unwrap();
+        let e2 = swarm
+            .transcript
+            .owner_message(&group.id, &chunk_2, None)
+            .unwrap();
+        let e3 = swarm
+            .transcript
+            .owner_message(&group.id, &chunk_3, None)
+            .unwrap();
         let trigger = swarm
             .transcript
             .bot_message(
@@ -2742,13 +2770,7 @@ mod tests {
             }
 
             async fn probe(&self) -> Result<swarmbot_llm::BackendStatus, swarmbot_llm::LlmError> {
-                Ok(swarmbot_llm::BackendStatus {
-                    backend: "gate".to_string(),
-                    ok: true,
-                    detail: "ok".to_string(),
-                    model: None,
-                    version: None,
-                })
+                Ok(swarmbot_llm::BackendStatus::report("gate", true, "ok"))
             }
         }
 
@@ -2843,13 +2865,7 @@ mod tests {
         }
 
         async fn probe(&self) -> Result<swarmbot_llm::BackendStatus, swarmbot_llm::LlmError> {
-            Ok(swarmbot_llm::BackendStatus {
-                backend: "hold".to_string(),
-                ok: true,
-                detail: "ok".to_string(),
-                model: None,
-                version: None,
-            })
+            Ok(swarmbot_llm::BackendStatus::report("hold", true, "ok"))
         }
     }
 
@@ -3154,13 +3170,7 @@ mod tests {
             }
 
             async fn probe(&self) -> Result<swarmbot_llm::BackendStatus, swarmbot_llm::LlmError> {
-                Ok(swarmbot_llm::BackendStatus {
-                    backend: "panic".to_string(),
-                    ok: true,
-                    detail: "ok".to_string(),
-                    model: None,
-                    version: None,
-                })
+                Ok(swarmbot_llm::BackendStatus::report("panic", true, "ok"))
             }
         }
 

@@ -100,13 +100,7 @@ impl LlmBackend for AgentDouble {
     }
 
     async fn probe(&self) -> Result<BackendStatus, LlmError> {
-        Ok(BackendStatus {
-            backend: self.id().to_string(),
-            ok: true,
-            detail: "agent double".to_string(),
-            model: None,
-            version: None,
-        })
+        Ok(BackendStatus::report(self.id(), true, "agent double"))
     }
 }
 

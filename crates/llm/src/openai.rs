@@ -750,6 +750,10 @@ impl LlmBackend for OpenAiCompat {
                 detail: self.missing_key().to_string(),
                 model: self.spec.model.clone(),
                 version: None,
+                // The one refusal that has an owner action: provide the key.
+                auth_methods: Vec::new(),
+                auth_required: true,
+                login_command: None,
             });
         }
         let headers = self.build_headers(&BTreeMap::new(), false);
@@ -760,6 +764,11 @@ impl LlmBackend for OpenAiCompat {
                 detail: models_detail(response.body(), self.spec.model.as_deref()),
                 model: self.spec.model.clone(),
                 version: None,
+                // A gateway has no auth methods to advertise: its credential is
+                // the key, and `api_key_env` names where it comes from.
+                auth_methods: Vec::new(),
+                auth_required: false,
+                login_command: None,
             }),
             Err(HttpError::Status { status, body, .. }) => {
                 let detail = if status == 401 || status == 403 {
@@ -779,6 +788,11 @@ impl LlmBackend for OpenAiCompat {
                     detail,
                     model: self.spec.model.clone(),
                     version: None,
+                    auth_methods: Vec::new(),
+                    // 401/403 is a credential problem the owner can fix; any
+                    // other status is the gateway's own state.
+                    auth_required: status == 401 || status == 403,
+                    login_command: None,
                 })
             }
             Err(HttpError::Transport { reason }) => Err(LlmError::Unavailable { backend, reason }),

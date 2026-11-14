@@ -3,19 +3,23 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use tracing::info;
+use tracing::{debug, info};
 
 use swarmbot_contracts::bot::{Bot, BotStatus};
 use swarmbot_contracts::config::{BotSpec, TeamSpec};
 use swarmbot_contracts::conversation::Conversation;
+use swarmbot_contracts::delivery::Delivery;
 use swarmbot_contracts::error::DomainError;
 use swarmbot_contracts::id::{BotId, ConversationId, NodeId};
 use swarmbot_contracts::repo::Persistence;
 use swarmbot_contracts::tool::Toolset;
 
 use crate::bus::{Change, LiveHub};
+use crate::routines::settle_delivery;
 use crate::runners::RunnerMap;
 use crate::session::Session;
+use crate::tasks::abandon_task;
+use crate::transcript::Transcript;
 
 /// What it takes to make a bot.
 #[derive(Clone, Debug)]
@@ -49,6 +53,11 @@ pub struct BotService {
     store: Arc<dyn Persistence>,
     hub: Arc<LiveHub>,
     runners: Arc<RunnerMap>,
+    /// Needed only to close the work a bot can no longer do: a task row has to
+    /// be ended and its origin conversation told, and both go through the
+    /// transcript. Held as a value, not as `BackgroundTasks`, so this stays a
+    /// peer of the task service rather than a layer above it.
+    transcript: Arc<Transcript>,
 }
 
 impl BotService {
@@ -56,11 +65,13 @@ impl BotService {
         store: Arc<dyn Persistence>,
         hub: Arc<LiveHub>,
         runners: Arc<RunnerMap>,
+        transcript: Arc<Transcript>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
             hub,
             runners,
+            transcript,
         })
     }
 
@@ -176,6 +187,14 @@ impl BotService {
             // "the runner … is gone" — a bot that can never be woken again.
             handle.shutdown();
         }
+        if !enabled {
+            // Work that was waiting for this bot will never run, and a parked
+            // delivery is a zombie rather than a queue: nothing drains it, while
+            // `wait_for_idle` refuses to call the team quiet until
+            // `parked_count()` is zero. Drop the queue too, so the row says
+            // `Dropped` instead of "queued for a bot that is switched off".
+            self.abandon_pending_work(id, "the bot was disabled")?;
+        }
         Ok(bot)
     }
 
@@ -186,9 +205,54 @@ impl BotService {
         if let Some(handle) = self.runners.unregister(id) {
             handle.shutdown();
         }
+        // A deleted bot never comes back, so anything still queued or parked
+        // for it is work nobody will do. Dropping it here is what keeps
+        // `wait_for_idle` from being permanently false for the whole team.
+        self.abandon_pending_work(id, "the bot was deleted")?;
         self.store.delete_session(id)?;
         self.store.delete_bot(id)?;
         Ok(())
+    }
+
+    /// Drop the work a bot can no longer take: the deliveries parked in
+    /// [`RunnerMap`] (which the store also has as `Queued`) and any queued row
+    /// of its own.
+    ///
+    /// A routine run whose delivery dies here is closed as failed, because a
+    /// run row still saying `Running` is a screen that claims work is in
+    /// progress forever.
+    fn abandon_pending_work(&self, id: &BotId, reason: &str) -> Result<(), DomainError> {
+        for mut delivery in self.runners.drop_parked(id) {
+            self.drop_delivery(&mut delivery, reason);
+        }
+        for mut delivery in self.store.queued_deliveries(id)? {
+            self.drop_delivery(&mut delivery, reason);
+        }
+        // A task is not a delivery until `pump` hands it over, so the loop above
+        // cannot see one that was still queued — and a task already handed over
+        // keeps its own row even after its delivery is dropped. Either way the
+        // row would say `Running` or `Queued` with nobody left to run it.
+        for task in self.store.tasks_of(id)? {
+            if let Err(err) = abandon_task(self.store.as_ref(), &self.transcript, &task, reason) {
+                debug!(error = %err, task = %task.id, "cannot close a task of an abandoned bot");
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark one delivery `Dropped` and close the routine run it carried.
+    ///
+    /// Best effort on purpose: this runs on the disable/delete path, where
+    /// failing to write a tombstone must not stop the bot from being turned
+    /// off. The error is logged rather than returned.
+    fn drop_delivery(&self, delivery: &mut Delivery, reason: &str) {
+        if let Err(err) = settle_delivery(self.store.as_ref(), delivery, false, Some(reason)) {
+            debug!(error = %err, delivery = %delivery.id, "cannot close a dropped routine run");
+        }
+        delivery.mark_dropped(Utc::now());
+        if let Err(err) = self.store.update_delivery(delivery) {
+            debug!(error = %err, delivery = %delivery.id, "cannot mark a delivery dropped");
+        }
     }
 
     /// "New session": the model forgets, the read cursors do not.
@@ -317,7 +381,12 @@ mod tests {
     fn rig() -> Rig {
         let fixture = testing::Fixture::memory();
         let runners = RunnerMap::new();
-        let service = BotService::new(fixture.store.clone(), fixture.hub.clone(), runners.clone());
+        let service = BotService::new(
+            fixture.store.clone(),
+            fixture.hub.clone(),
+            runners.clone(),
+            fixture.transcript.clone(),
+        );
         let settings = SettingsHandle::new(fixture.store.clone());
         let tasks = crate::tasks::BackgroundTasks::new(
             fixture.store.clone(),
@@ -444,7 +513,7 @@ mod tests {
         fn transcript_note(&self, bot: &Bot) {
             // Through the transcript, not a raw upsert: it owns the sequence.
             self.transcript
-                .owner_message(&bot.direct_conversation_id, "before the delete")
+                .owner_message(&bot.direct_conversation_id, "before the delete", None)
                 .unwrap();
         }
     }

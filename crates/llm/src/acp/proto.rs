@@ -18,6 +18,30 @@
 //! * **No secrets.** Nothing on this wire is ours to leak: prompts are the
 //!   bot's own history, and authentication uses the agent's own login (or an
 //!   environment variable set at spawn) — never a value this module renders.
+//!
+//! # No token counts on this wire, and none are invented
+//!
+//! An ACP turn's `swarmbot_contracts::Usage` is reported as `llm_calls: 1` with
+//! **zero tokens**, and that is a fact about the protocol rather than a gap in
+//! this module:
+//!
+//! * `session/prompt`'s result is `{stopReason, _meta?}` — modelled here as
+//!   [`PromptResult`] — and carries no input/output token fields at all.
+//! * The one numeric shape ACP v1 does define is the `session/update` kind
+//!   `usage_update`, whose `used`/`size` are **tokens currently in the context
+//!   window** (plus an optional cumulative `cost`), not what this turn spent.
+//!   Reading `used` as `input_tokens` would report a context size as a bill, so
+//!   that update classifies as [`SessionUpdate::Ignored`] like every kind this
+//!   adapter does not act on.
+//! * `_meta` is explicitly implementation-defined ("Implementations MUST NOT
+//!   make assumptions about values at these keys"), so this module does not
+//!   harvest token counts from it either — a field name one agent chose is not
+//!   a protocol promise.
+//!
+//! Zeros therefore mean "the protocol did not report any" — the same honesty
+//! `UsageReport`'s doc requires, where zeros are never "nothing was spent".
+//! Pinned by `a_usage_update_is_ignored_and_never_becomes_token_counts` here
+//! and by `a_usage_update_is_not_decoded_into_token_counts` in `tests/acp.rs`.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -61,8 +85,21 @@ impl RpcError {
     /// callers treat it as "unsupported", not as a failure.
     pub const METHOD_NOT_FOUND: i64 = -32601;
 
+    /// ACP's own "a login is needed first" (`RequestError.authRequired()` in the
+    /// reference SDK, and what `claude-code-acp` throws from `session/new` when
+    /// `~/.claude.json` is missing). It is the one code that says *why* the
+    /// refusal happened, so the Settings screen can offer a login instead of a
+    /// generic failure.
+    pub const AUTH_REQUIRED: i64 = -32000;
+
     pub fn is_method_not_found(&self) -> bool {
         self.code == Self::METHOD_NOT_FOUND
+    }
+
+    /// The agent refused because a login is needed. Never inferred from the
+    /// message text: a code is a fact, a sentence is a guess.
+    pub fn is_auth_required(&self) -> bool {
+        self.code == Self::AUTH_REQUIRED
     }
 }
 
@@ -170,15 +207,67 @@ pub(crate) struct McpCapabilities {
 }
 
 /// One authentication method an agent advertises (`claude-login`,
-/// `ANTHROPIC_API_KEY`, …). We never *perform* an interactive login: the
-/// agent's own CLI login or its environment is the owner's business. The list
-/// exists so `probe` and errors can name what the agent expects.
+/// `ANTHROPIC_API_KEY`, …).
+///
+/// This adapter never runs an interactive login on the owner's behalf: the
+/// agent's own CLI login (its terminal, its prompts) or its environment is the
+/// owner's business. Two things are therefore carried forward verbatim and
+/// shown, never guessed at: the human description, and — when the agent names
+/// one — an exact `_meta["terminal-auth"]` command the owner can copy.
 #[derive(Clone, Debug, Deserialize)]
 pub struct AuthMethod {
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(rename = "_meta", default)]
+    pub meta: Option<AuthMethodMeta>,
+}
+
+impl AuthMethod {
+    /// The exact command this method names, when it names one:
+    /// `_meta["terminal-auth"]`'s `command` plus `args`, joined for display.
+    ///
+    /// `None` when the agent said nothing about how to log in (a stock
+    /// `claude-code-acp` does this unless the client claims the `terminal-auth`
+    /// capability, which this build deliberately does not claim because it never
+    /// opens a terminal). The UI then shows `description` and does not pretend
+    /// to have a command.
+    pub fn command(&self) -> Option<String> {
+        let terminal = self.meta.as_ref()?.terminal_auth.as_ref()?;
+        let command = terminal.command.trim();
+        if command.is_empty() {
+            return None;
+        }
+        let mut rendered = command.to_string();
+        for arg in &terminal.args {
+            rendered.push(' ');
+            rendered.push_str(arg);
+        }
+        Some(rendered)
+    }
+}
+
+/// The `_meta` block of an advertised auth method. Only the terminal-auth
+/// shape this build understands is typed; everything else is ignored
+/// (tolerant parsing: the protocol is additive).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AuthMethodMeta {
+    #[serde(rename = "terminal-auth", default)]
+    pub terminal_auth: Option<TerminalAuth>,
+}
+
+/// `_meta["terminal-auth"]`: the command an agent says will complete its login,
+/// run by the owner in their own terminal.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TerminalAuth {
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)] // kept for the sentence a future card may print
+    pub label: Option<String>,
 }
 
 /// The `session/new` result. `models` drives the best-effort
@@ -895,5 +984,34 @@ mod tests {
         assert_eq!(opt.current_value_str(), Some("m1"));
         assert_eq!(opt.options.len(), 2);
         assert_eq!(opt.options[1].value, "m2");
+    }
+
+    /// ACP v1's one numeric update is `usage_update`, and it reports *context
+    /// occupancy* (`used`/`size`) plus a cumulative cost — not this turn's
+    /// input/output tokens. Nothing may turn it into `Usage` fields: a context
+    /// size rendered as token spend is a bill nobody can audit, which is why
+    /// the classifier keeps it out instead of decoding it.
+    #[test]
+    fn a_usage_update_is_ignored_and_never_becomes_token_counts() {
+        let update = json!({
+            "sessionUpdate": "usage_update",
+            "used": 12_345u64,
+            "size": 200_000u64,
+            "cost": {"amount": 0.05, "currency": "USD"},
+        });
+        match classify_update(&update) {
+            SessionUpdate::Ignored(tag) => assert_eq!(tag, "usage_update"),
+            other => panic!("usage_update must stay ignored, got {other:?}"),
+        }
+
+        // The prompt result is `{stopReason, _meta?}` only; an agent that puts
+        // a token count in `_meta` is making an implementation-defined
+        // extension, not a protocol promise, so it is not read either.
+        let result: PromptResult = serde_json::from_value(json!({
+            "stopReason": "end_turn",
+            "_meta": {"inputTokens": 1234, "outputTokens": 56},
+        }))
+        .expect("parses");
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
     }
 }

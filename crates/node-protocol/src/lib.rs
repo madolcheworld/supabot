@@ -58,9 +58,9 @@ pub use identity::{
     BrainIdentity, IdentityError, NodeIdentity, parse_public_key_base64url, public_key_base64url,
 };
 pub use mux::{
-    BoxFuture, CancellationToken, ChunkSink, Handler, Peer, PeerConfig, RpcHandler, Socket,
-    WsCallback, WsErrorResponse, WsRequest, WsResponse, WsSocket, accept_ws, accept_ws_hdr,
-    connect_ws, connect_ws_with_headers,
+    BoxFuture, CancellationToken, ChunkSink, DEFAULT_MAX_IN_FLIGHT, Handler, Peer, PeerConfig,
+    RpcHandler, Socket, WsCallback, WsErrorResponse, WsRequest, WsResponse, WsSocket, accept_ws,
+    accept_ws_hdr, connect_ws, connect_ws_with_headers,
 };
 pub use pairing::{
     CODE_ALPHABET, CODE_LEN, PairCode, PairError, constant_time_eq, format_display, hash_code,

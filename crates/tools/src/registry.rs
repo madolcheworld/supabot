@@ -27,8 +27,8 @@ use swarmbot_contracts::{
 use crate::audit::{AuditDecision, AuditEntry, AuditLog, AuditOutcome};
 use crate::handler::{ToolContext, ToolHandler};
 use crate::handlers::{
-    TOOL_EDIT_FILE, TOOL_GLOB, TOOL_GREP, TOOL_LIST_DIR, TOOL_READ_FILE, TOOL_SHELL,
-    TOOL_WRITE_FILE,
+    TOOL_DOWNLOAD_FILE, TOOL_EDIT_FILE, TOOL_GLOB, TOOL_GREP, TOOL_LIST_DIR, TOOL_READ_FILE,
+    TOOL_SHELL, TOOL_WRITE_FILE,
 };
 
 /// Task-management tools. A task's own session must not see them: a task that
@@ -417,6 +417,10 @@ fn surface_for_tool(tool: &str) -> Option<Surface> {
         // The three walkers ask on `read_file`: they read, and the ceiling
         // that governs reading is the one that governs them.
         TOOL_READ_FILE | TOOL_LIST_DIR | TOOL_GLOB | TOOL_GREP => Some(Surface::ReadFile),
+        // A download reads the source on the far machine; the destination is
+        // chosen by the tool inside the bot's workspace, so the surface that
+        // governs it is the read, not a write the owner never granted.
+        TOOL_DOWNLOAD_FILE => Some(Surface::ReadFile),
         TOOL_WRITE_FILE => Some(Surface::WriteFile),
         TOOL_EDIT_FILE => Some(Surface::EditFile),
         _ => None,
@@ -660,15 +664,15 @@ mod tests {
         let rig = Rig::new();
         let registry = registry_from(&rig);
 
-        // The seven node tools, full caps.
+        // The eight node tools, full caps.
         let caps = Capabilities::new(["fs@1", "shell@1"]);
         let visible = registry.visible_specs(&[Toolset::Node], Some(&caps), false);
-        assert_eq!(visible.len(), 7, "{visible:?}");
+        assert_eq!(visible.len(), 8, "{visible:?}");
 
         // A node without shell loses exactly the shell tool.
         let fs_only = Capabilities::new(["fs@1"]);
         let visible = registry.visible_specs(&[Toolset::Node], Some(&fs_only), false);
-        assert_eq!(visible.len(), 6);
+        assert_eq!(visible.len(), 7);
         assert!(visible.iter().all(|spec| spec.name != "shell"));
 
         // No node toolset → nothing.
@@ -680,7 +684,7 @@ mod tests {
         // Unknown caps do not gate.
         assert_eq!(
             registry.visible_specs(&[Toolset::Node], None, false).len(),
-            7
+            8
         );
 
         // Task and ask tools vanish inside a task.

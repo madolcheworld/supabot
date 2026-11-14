@@ -6,8 +6,10 @@
 //! `capabilities()` says so (see the two flags below). What `chat` does today:
 //!
 //! * spawn
-//!   `claude -p --output-format stream-json --input-format stream-json --mcp-config <file> [--resume <id>]`
-//!   as a child with piped stdio, per turn;
+//!   `claude -p --output-format stream-json --input-format stream-json --mcp-config <file> [--strict-mcp-config] [--resume <id>]`
+//!   as a child with piped stdio, per turn; `--strict-mcp-config` is passed
+//!   only when the turn supplied its own servers (see "Our tools reach the
+//!   harness" below);
 //! * write the turn as a stream-json user message on stdin and then **close
 //!   stdin** (`drop(stdin)` in `chat`). Steering would mean writing another
 //!   message while the turn runs, but `ChatRequest` has no channel to carry
@@ -40,23 +42,37 @@
 //! `--version`, so the Settings screen can show "claude CLI installed / not
 //! found" without spending a model call.
 //!
-//! Our tools reach the harness through MCP, not through the response:
-//! `crates/mcp` serves the registry, the brain writes
-//! `<data>/swarmbot-mcp.json` (owner token in an `Authorization` header), and
-//! this adapter passes `--mcp-config` when it can locate that file —
-//! `options.mcp_config_path`, then `<config_dir>/swarmbot-mcp.json`, then
-//! `options.data_dir/swarmbot-mcp.json`. The spec has to name one of those; the
-//! adapter does not guess the brain's data dir.
+//! Our tools reach the harness through MCP, not through the response, and the
+//! servers are the ones **this turn** registered: when `ChatRequest::mcp_servers`
+//! is non-empty (the runner registers a turn-scoped endpoint whose URL carries a
+//! one-time token), the adapter writes those specs to a private `0600` file in
+//! `options.mcp_config_dir` (default: the OS temp dir), passes it as
+//! `--mcp-config` together with `--strict-mcp-config` (so no user-level server
+//! silently widens the turn's tool set), and deletes the file when the turn
+//! ends. The file, not an inline JSON argument, because argv is visible in `ps`
+//! and the URL is a credential.
+//!
+//! A request with **no** registered servers falls back to the static config the
+//! owner configured: `options.mcp_config_path`, then
+//! `<config_dir>/swarmbot-mcp.json`, then `options.data_dir/swarmbot-mcp.json`
+//! (the brain writes that one, 0600, with the owner token in an `Authorization`
+//! header). The spec has to name one of those; the adapter does not guess the
+//! brain's data dir. The static file is deliberately *not* consulted for a turn
+//! that registered its own servers — two sources would mean the model saw tools
+//! the runner never offered, and the audit line would name a bot whose tools
+//! were not the ones it ran.
 //!
 //! Still missing, and therefore never claimed: a mid-turn steer channel in the
 //! port. Steering is a queue-level delivery today, so no `ChatRequest` can
 //! carry one.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -69,7 +85,8 @@ use swarmbot_contracts::{BackendKind, BackendSpec, Usage};
 use crate::backend::{LlmBackend, LlmError, emit};
 use crate::openai::truncate_utf8;
 use crate::types::{
-    BackendStatus, Capabilities, ChatRequest, ChatResponse, FinishReason, LlmEvent, Role,
+    BackendStatus, Capabilities, ChatRequest, ChatResponse, FinishReason, LlmEvent, McpServerSpec,
+    Role,
 };
 
 /// The `claude -p` harness adapter.
@@ -162,6 +179,117 @@ fn default_config_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claude")
+}
+
+/// Serial number for turn config file names, so two turns in one process (or
+/// two tests in one binary) never collide even inside one clock tick.
+static TURN_MCP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// One turn's `--mcp-config` document: the same shape the brain writes for the
+/// static route (`{"mcpServers": {…}}`), so a harness parses one format
+/// whichever path supplied it.
+fn mcp_config_document(specs: &[McpServerSpec]) -> Value {
+    let mut servers = serde_json::Map::new();
+    for spec in specs {
+        let (name, entry) = match spec {
+            McpServerSpec::Http { name, url, headers } => {
+                let mut entry = serde_json::Map::new();
+                entry.insert("type".to_string(), json!("http"));
+                entry.insert("url".to_string(), json!(url));
+                if !headers.is_empty() {
+                    // A JSON object, which is the static config's shape — not
+                    // ACP's list of `{name, value}` pairs.
+                    entry.insert("headers".to_string(), json!(headers));
+                }
+                (name, Value::Object(entry))
+            }
+            McpServerSpec::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => {
+                let mut entry = serde_json::Map::new();
+                entry.insert("type".to_string(), json!("stdio"));
+                entry.insert("command".to_string(), json!(command));
+                if !args.is_empty() {
+                    entry.insert("args".to_string(), json!(args));
+                }
+                if !env.is_empty() {
+                    entry.insert("env".to_string(), json!(env));
+                }
+                (name, Value::Object(entry))
+            }
+        };
+        servers.insert(name.clone(), entry);
+    }
+    json!({ "mcpServers": servers })
+}
+
+/// A private `--mcp-config` file for one turn, removed when it goes out of
+/// scope.
+///
+/// A file rather than inline JSON because `claude --mcp-config` accepts both
+/// and argv is world-readable on Linux: a turn-scoped server's URL is
+/// `…/mcp/t/<token>`, a one-time bearer that must never show up in `ps`. It
+/// lives in `options.mcp_config_dir` (default: the OS temp directory, which
+/// honours `TMPDIR`) because that is somewhere a short-lived file can always be
+/// created, and it is created `0600` with `create_new` (no shared temp name
+/// another process could pre-create and read). `Drop` removes it on every exit
+/// path — success, failure and cancellation alike — because the guard lives in
+/// `chat` for exactly as long as the turn does.
+struct TurnMcpConfig {
+    path: PathBuf,
+}
+
+impl TurnMcpConfig {
+    fn write(dir: &Path, specs: &[McpServerSpec]) -> Result<Self, std::io::Error> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let serial = TURN_MCP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(
+            "swarmbot-turn-mcp-{}-{nanos}-{serial}.json",
+            std::process::id()
+        ));
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // The URL in this file authenticates a turn, exactly like the
+            // static config the brain writes 0600.
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        let body =
+            serde_json::to_string(&mcp_config_document(specs)).map_err(std::io::Error::other)?;
+        file.write_all(body.as_bytes())?;
+        file.flush()?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TurnMcpConfig {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            // Loud, not silent: the file names a live credential, so a failed
+            // cleanup is something an operator should be able to find. Its
+            // token stops authenticating when the turn's MCP registration
+            // drops, which is why this is a warning rather than a failure.
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "could not remove this turn's MCP config file"
+            );
+        }
+    }
 }
 
 /// Kill the spawned child process group cleanly to avoid orphan grand-children.
@@ -291,18 +419,59 @@ impl LlmBackend for ClaudeCli {
             cmd.arg("--resume").arg(sid);
         }
 
-        let mcp_cfg =
-            if self.spec.option_str("mcp_config_path").is_some() || self.mcp_config_path.exists() {
-                Some(self.mcp_config_path.clone())
-            } else if let Some(data_dir) = self.spec.option_str("data_dir").map(PathBuf::from)
-                && data_dir.join("swarmbot-mcp.json").exists()
-            {
-                Some(data_dir.join("swarmbot-mcp.json"))
-            } else {
-                None
-            };
+        // The servers this turn registered win, and they are the *only* ones:
+        // the runner's per-turn endpoint carries a one-time token that expires
+        // with the turn, while the static file names the owner-scoped route.
+        // Passing both (or the static one alone for a turn that registered
+        // servers) would hand the model tools the runner never offered, and the
+        // turn's audit line would then describe a bot whose tools were not the
+        // ones it ran. The guard must outlive the child, so it is bound here
+        // and dropped when `chat` returns.
+        let turn_mcp = if request.mcp_servers.is_empty() {
+            None
+        } else {
+            let dir = self
+                .spec
+                .option_str("mcp_config_dir")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            Some(
+                TurnMcpConfig::write(&dir, &request.mcp_servers).map_err(|error| {
+                    LlmError::Unavailable {
+                        backend: self.spec.id.clone(),
+                        reason: format!(
+                            "cannot write this turn's MCP config ({error}); refusing the turn \
+                             rather than running it without the tools the caller registered"
+                        ),
+                    }
+                })?,
+            )
+        };
+        let mcp_cfg = match turn_mcp {
+            Some(ref config) => Some(config.path().to_path_buf()),
+            None => {
+                if self.spec.option_str("mcp_config_path").is_some()
+                    || self.mcp_config_path.exists()
+                {
+                    Some(self.mcp_config_path.clone())
+                } else if let Some(data_dir) = self.spec.option_str("data_dir").map(PathBuf::from)
+                    && data_dir.join("swarmbot-mcp.json").exists()
+                {
+                    Some(data_dir.join("swarmbot-mcp.json"))
+                } else {
+                    None
+                }
+            }
+        };
         if let Some(ref path) = mcp_cfg {
             cmd.arg("--mcp-config").arg(path);
+            if turn_mcp.is_some() {
+                // Only the turn's own servers: a user-level `~/.claude.json`
+                // server would otherwise be visible to a bot whose toolsets
+                // were gated, and the transcript would name a tool the runner
+                // never offered.
+                cmd.arg("--strict-mcp-config");
+            }
         }
 
         let model = if !request.model.trim().is_empty() && request.model != "default" {
@@ -662,6 +831,11 @@ impl LlmBackend for ClaudeCli {
                     ),
                     model,
                     version: (!version.is_empty()).then_some(version),
+                    // `--version` says the binary exists; it says nothing about
+                    // a login, and this build does not guess one.
+                    auth_methods: Vec::new(),
+                    auth_required: false,
+                    login_command: None,
                 })
             }
             Ok(output) => Ok(BackendStatus {
@@ -675,6 +849,9 @@ impl LlmBackend for ClaudeCli {
                 ),
                 model,
                 version: None,
+                auth_methods: Vec::new(),
+                auth_required: false,
+                login_command: None,
             }),
             Err(error) => Ok(BackendStatus {
                 backend,
@@ -682,6 +859,9 @@ impl LlmBackend for ClaudeCli {
                 detail: format!("cannot run `{}`: {error}", self.binary.display()),
                 model,
                 version: None,
+                auth_methods: Vec::new(),
+                auth_required: false,
+                login_command: None,
             }),
         }
     }
@@ -689,6 +869,7 @@ impl LlmBackend for ClaudeCli {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1291,5 +1472,258 @@ EOF
         assert!(!lines[1].contains("--resume"), "b1: {}", lines[1]);
         assert!(lines[2].contains("--resume sid-bot-a"), "a2: {}", lines[2]);
         assert!(!lines[3].contains("--resume"), "a3: {}", lines[3]);
+    }
+
+    /// A stand-in harness that reports, from inside the turn, which
+    /// `--mcp-config` it was handed: the argv line, the file's path, a copy of
+    /// its bytes (it is deleted when the turn ends) and the file's mode.
+    #[cfg(unix)]
+    fn mcp_probe_script(temp: &TempDir, log: &Path, copy: &Path) -> PathBuf {
+        let script = temp.path().join("mock_mcp_probe.sh");
+        let body = r#"#!/bin/sh
+LOG="@LOG@"
+COPY="@COPY@"
+CFG=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--mcp-config" ]; then CFG="$a"; fi
+  prev="$a"
+done
+printf 'ARGS=%s\n' "$*" >> "$LOG"
+printf 'CFG=%s\n' "$CFG" >> "$LOG"
+if [ -n "$CFG" ] && [ -f "$CFG" ]; then
+  cp "$CFG" "$COPY"
+  stat -c '%a' "$CFG" >> "$LOG"
+fi
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"mcp-turn"}'
+printf '%s\n' '{"type":"result","result":"ok","session_id":"mcp-turn","usage":{"input_tokens":1,"output_tokens":1},"is_error":false}'
+"#
+        .replace("@LOG@", &log.display().to_string())
+        .replace("@COPY@", &copy.display().to_string());
+        fs::write(&script, body).expect("write mock script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        script
+    }
+
+    /// The per-turn servers a caller registered are what the harness gets:
+    /// `ChatRequest::mcp_servers` is materialized into a private config file
+    /// that names the turn's own URL, and the file is gone when the turn ends.
+    ///
+    /// This is the test that fails without the fix: before it, `chat` read only
+    /// the static path, so the runner's per-turn endpoint was registered and
+    /// then silently discarded — the model had no team tools while the audit
+    /// line said the turn had them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn per_turn_mcp_servers_are_written_to_a_private_config_file_and_deleted() {
+        let temp = TempDir::new("turn-mcp");
+        let log = temp.path().join("probe.log");
+        let copy = temp.path().join("config-copy.json");
+        let script = mcp_probe_script(&temp, &log, &copy);
+
+        // A static config exists and is *not* what this turn may use: it names
+        // the owner-scoped route with a different credential.
+        let static_cfg = temp.path().join("static-mcp.json");
+        fs::write(
+            &static_cfg,
+            json!({
+                "mcpServers": {
+                    "swarmbot": {
+                        "type": "http",
+                        "url": "http://static.invalid/mcp",
+                        "headers": {"Authorization": "Bearer static-token"},
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("write static config");
+
+        let mut options = serde_json::Map::new();
+        options.insert("binary".into(), json!(script.display().to_string()));
+        options.insert(
+            "mcp_config_path".into(),
+            json!(static_cfg.display().to_string()),
+        );
+        // The turn's config file is created here, inside this test's TempDir:
+        // no test writes outside one, and the deletion assertion below is about
+        // a directory this test owns.
+        options.insert(
+            "mcp_config_dir".into(),
+            json!(temp.path().display().to_string()),
+        );
+        let harness = ClaudeCli::from_spec(spec_with_options(options)).expect("valid spec");
+
+        let mut request = ChatRequest::new("", "");
+        request.mcp_servers = vec![
+            McpServerSpec::Http {
+                name: "swarmbot".into(),
+                url: "http://127.0.0.1:9/mcp/t/turn-token-9f3".into(),
+                headers: BTreeMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer turn-secret".to_string(),
+                )]),
+            },
+            McpServerSpec::Stdio {
+                name: "local-tools".into(),
+                command: "/bin/true".into(),
+                args: vec!["--flag".into()],
+                env: BTreeMap::from([("KEY".to_string(), "value".to_string())]),
+            },
+        ];
+        chat_turn(&harness, request).await.0.expect("the turn runs");
+
+        let logged = fs::read_to_string(&log).expect("read log");
+        let cfg_path = logged
+            .lines()
+            .find_map(|line| line.strip_prefix("CFG="))
+            .expect("the harness reports its --mcp-config argument");
+        let cfg_path = PathBuf::from(cfg_path);
+        assert_ne!(
+            cfg_path, static_cfg,
+            "a turn that registered servers must not fall back to the static config"
+        );
+        assert!(
+            cfg_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("swarmbot-turn-mcp-")),
+            "{cfg_path:?}"
+        );
+        assert!(
+            logged.contains("--strict-mcp-config"),
+            "only the turn's servers may be visible: {logged}"
+        );
+
+        let content = fs::read_to_string(&copy).expect("the child saw a config file");
+        let parsed: Value = serde_json::from_str(&content).expect("the config is JSON");
+        assert_eq!(parsed["mcpServers"]["swarmbot"]["type"], json!("http"));
+        assert_eq!(
+            parsed["mcpServers"]["swarmbot"]["url"],
+            json!("http://127.0.0.1:9/mcp/t/turn-token-9f3"),
+            "the file must name this turn's URL"
+        );
+        assert_eq!(
+            parsed["mcpServers"]["swarmbot"]["headers"]["Authorization"],
+            json!("Bearer turn-secret")
+        );
+        assert_eq!(parsed["mcpServers"]["local-tools"]["type"], json!("stdio"));
+        assert_eq!(
+            parsed["mcpServers"]["local-tools"]["command"],
+            json!("/bin/true")
+        );
+        assert_eq!(
+            parsed["mcpServers"]["local-tools"]["args"][0],
+            json!("--flag")
+        );
+        assert_eq!(
+            parsed["mcpServers"]["local-tools"]["env"]["KEY"],
+            json!("value")
+        );
+        assert!(
+            !content.contains("static-token"),
+            "the static credential must not leak into the turn's file: {content}"
+        );
+
+        assert!(
+            logged.lines().any(|line| line == "600"),
+            "the file carries a bearer token and must be 0600: {logged}"
+        );
+        assert!(
+            !cfg_path.exists(),
+            "the turn's MCP config must be deleted once the turn ends"
+        );
+    }
+
+    /// A caller that registered nothing keeps the documented static-path
+    /// behaviour (the owner's own file, no `--strict-mcp-config`). This pins
+    /// the fallback so the per-turn fix cannot quietly drop it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_turn_without_registered_servers_keeps_the_static_mcp_config() {
+        let temp = TempDir::new("static-mcp");
+        let log = temp.path().join("probe.log");
+        let copy = temp.path().join("config-copy.json");
+        let script = mcp_probe_script(&temp, &log, &copy);
+
+        let static_cfg = temp.path().join("static-mcp.json");
+        fs::write(&static_cfg, json!({"mcpServers": {}}).to_string()).expect("write config");
+
+        let mut options = serde_json::Map::new();
+        options.insert("binary".into(), json!(script.display().to_string()));
+        options.insert(
+            "mcp_config_path".into(),
+            json!(static_cfg.display().to_string()),
+        );
+        let harness = ClaudeCli::from_spec(spec_with_options(options)).expect("valid spec");
+
+        chat_turn(&harness, ChatRequest::new("", ""))
+            .await
+            .0
+            .expect("the turn runs");
+
+        let logged = fs::read_to_string(&log).expect("read log");
+        assert!(
+            logged.contains(&format!("--mcp-config {}", static_cfg.display())),
+            "{logged}"
+        );
+        assert!(
+            !logged.contains("--strict-mcp-config"),
+            "the static path is the operator's own config; nothing narrows it: {logged}"
+        );
+    }
+
+    /// If the turn's config cannot be written, the turn is **refused** rather
+    /// than run without the tools the caller registered. Running anyway is the
+    /// silent-lie case this whole item exists to remove: the runner would have
+    /// recorded an MCP-bound turn whose model never saw a single team tool.
+    #[tokio::test]
+    async fn a_turn_whose_mcp_config_cannot_be_written_is_refused_not_run() {
+        let temp = TempDir::new("mcp-write-fail");
+        let told = temp.path().join("spawned.log");
+        let script = temp.path().join("mock_never.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho spawned >> \"{}\"\nprintf '%s\\n' '{{\"type\":\"result\",\"result\":\"ran\",\"is_error\":false}}'\n",
+                told.display()
+            ),
+        )
+        .expect("write script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+
+        let mut options = serde_json::Map::new();
+        options.insert("binary".into(), json!(script.display().to_string()));
+        // A directory that does not exist: the write must fail.
+        options.insert(
+            "mcp_config_dir".into(),
+            json!(temp.path().join("missing-dir").display().to_string()),
+        );
+        let harness = ClaudeCli::from_spec(spec_with_options(options)).expect("valid spec");
+
+        let mut request = ChatRequest::new("", "");
+        request.mcp_servers = vec![McpServerSpec::http("swarmbot", "http://127.0.0.1:9/mcp")];
+        let (result, _events) = chat_turn(&harness, request).await;
+
+        match result {
+            Err(LlmError::Unavailable { reason, .. }) => {
+                assert!(reason.contains("MCP config"), "{reason}");
+                assert!(
+                    reason.contains("refusing the turn"),
+                    "the refusal must say the turn did not run: {reason}"
+                );
+            }
+            other => panic!("a turn that cannot carry its MCP servers must be refused: {other:?}"),
+        }
+        assert!(
+            !told.exists(),
+            "the harness must never be spawned for a refused turn"
+        );
     }
 }

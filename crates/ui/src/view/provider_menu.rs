@@ -30,7 +30,7 @@ use crate::proto::Command;
 use crate::state::AppState;
 use crate::theme;
 use crate::view::conversation::dm_bot;
-use crate::view::settings::backend_kind_label;
+use crate::view::settings::{backend_kind_label, connection_state, handshake_only_note};
 use crate::widgets::bits::{self, Tone};
 use crate::widgets::text_input::TextInput;
 
@@ -199,14 +199,19 @@ pub fn render(
                         let _ = commands_fetch.send(Command::FetchModels(backend));
                     }
                 })
+                // Two different facts on one dot: the ring colour says
+                // whether this is the bot's current backend, the dot says
+                // whether the last handshake passed. "Which one am I on" and
+                // "which ones work" are not the same question.
                 .child(bits::dot(
-                    if is_current {
-                        theme::SUCCESS
-                    } else {
-                        theme::BORDER
-                    },
+                    // `NotChecked` is dim, which is exactly right before any
+                    // handshake has run.
+                    connection_state(s.probe_for(&backend.id)).tone(),
                     px(7.0),
                 ))
+                .when(is_current, |d| {
+                    d.border_1().border_color(rgb(theme::SUCCESS))
+                })
                 .child(
                     div()
                         .flex_1()
@@ -234,6 +239,148 @@ pub fn render(
                     },
                 )),
         );
+    }
+
+    // --- the selected provider's connection strip --------------------------
+    //
+    // The provider menu picks a provider; it can also *bring one up*, because
+    // "I picked opencode and nothing answers" is the situation this panel
+    // exists to fix. Same report as the Settings screen, compact, and the same
+    // honesty: Connect is a handshake, never a claim that a turn works.
+    let selected_probe = s.probe_for(&selected_backend);
+    let selected_state = connection_state(selected_probe);
+    let selected_connecting = s.is_connecting(&selected_backend);
+    let connect_commands = commands.clone();
+    let connect_state = state.clone();
+    let connect_backend_id = selected_backend.clone();
+    let mut strip = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .pt_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(bits::section_label("CONNECTION"))
+                .child(bits::badge(
+                    selected_state.label(),
+                    theme::SURFACE_RAISED,
+                    selected_state.tone(),
+                ))
+                .child(div().flex_1())
+                .child(if selected_connecting {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(bits::spinner(0))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child("connecting…"),
+                        )
+                        .into_any_element()
+                } else {
+                    bits::button(selected_state.connect_label(), Tone::Primary)
+                        .id("provider-connect")
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            cx.stop_propagation();
+                            let mut send = false;
+                            let backend = connect_backend_id.clone();
+                            connect_state.update(cx, |s, cx| {
+                                send = s.begin_connect(&backend);
+                                cx.notify();
+                            });
+                            if send {
+                                let _ = connect_commands.send(Command::ConnectBackend {
+                                    backend: connect_backend_id.clone(),
+                                    method: None,
+                                });
+                            }
+                        })
+                        .into_any_element()
+                }),
+        )
+        .children(selected_probe.and_then(|probe| {
+            probe.detail.as_ref().map(|detail| {
+                div()
+                    .w_full()
+                    .max_h(px(52.0))
+                    .overflow_hidden()
+                    .rounded_sm()
+                    .bg(rgb(theme::CODE_BG))
+                    .px_2()
+                    .py_1()
+                    .font_family("DejaVu Sans Mono")
+                    .text_size(px(11.0))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(detail.clone())
+            })
+        }));
+
+    // The logins that backend advertises — buttons, because the whole point is
+    // that the owner should not have to read a manual to know what to do.
+    if let Some(probe) = selected_probe.filter(|probe| !probe.auth_methods.is_empty()) {
+        let mut logins = div().flex().flex_col().gap_1().w_full();
+        for method in &probe.auth_methods {
+            let commands_h = commands.clone();
+            let state_h = state.clone();
+            let backend_h = selected_backend.clone();
+            let method_id = method.id.clone();
+            logins = logins.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(match &method.description {
+                                Some(description) => format!("{}: {description}", method.name),
+                                None => method.name.clone(),
+                            }),
+                    )
+                    .child(if selected_connecting {
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_DIM))
+                            .child("…")
+                            .into_any_element()
+                    } else {
+                        bits::button("Log in", Tone::Ghost)
+                            .id(SharedString::from(format!("provider-login-{}", method.id)))
+                            .on_click(move |_, _, cx: &mut gpui::App| {
+                                cx.stop_propagation();
+                                let mut send = false;
+                                let backend = backend_h.clone();
+                                state_h.update(cx, |s, cx| {
+                                    send = s.begin_connect(&backend);
+                                    cx.notify();
+                                });
+                                if send {
+                                    let _ = commands_h.send(Command::ConnectBackend {
+                                        backend: backend_h.clone(),
+                                        method: Some(method_id.clone()),
+                                    });
+                                }
+                            })
+                            .into_any_element()
+                    }),
+            );
+        }
+        strip = strip.child(logins);
+    }
+    if let Some(note) = handshake_only_note(selected_probe) {
+        // Dim, like the Settings card: the handshake passed, so this is a fact
+        // about the login, not a warning about the backend.
+        strip = strip.child(div().text_xs().text_color(rgb(theme::TEXT_DIM)).child(note));
     }
 
     // --- right column: models of the selected provider ---------------------
@@ -607,6 +754,11 @@ pub fn render(
                             .child(div().w(px(1.0)).bg(rgb(0xf3f4f6)))
                             .child(models_col),
                     )
+                    // What it takes to make this provider answer, under the
+                    // two columns: the state, the brain's own words, and the
+                    // buttons (Connect, and one per login the agent advertises).
+                    .child(div().w_full().h(px(1.0)).bg(rgb(0xf3f4f6)))
+                    .child(strip)
                     .when(pick_may_not_reach && effective_model.is_some(), |d| {
                         d.child(
                             div()

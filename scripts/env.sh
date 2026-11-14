@@ -17,10 +17,16 @@ export CARGO_HOME="$ROOT/.cargo-home"
 
 export LIBCLANG_PATH="${LIBCLANG_PATH:-/usr/lib64}"
 
-# Vulkan driver selection:
-# Prefer hardware acceleration via NVIDIA if the GPU and driver are reachable;
-# otherwise fall back to Mesa llvmpipe software rasterizer to keep headless/sandboxed
-# sessions deterministic.
+# Vulkan driver selection, in order of how much they cost:
+#   1. the caller's own choice (already exported) — never second-guessed;
+#   2. hardware, when an NVIDIA device node AND its ICD are both present;
+#   3. the system's Mesa llvmpipe (software), when the distro ships it;
+#   4. a lavapipe staged *inside this checkout* by `scripts/software-vulkan.sh`,
+#      which is what makes `swarmbot-ui --selftest` work in a sandbox whose
+#      `/dev` has no DRM node (this container, CI, a headless box) without root.
+# Only when all four miss does the window become impossible — and then the
+# message names the one command that fixes it instead of letting GPUI panic with
+# "Unable to init GPU context: NoSupportedDeviceFound", which reads like a bug.
 if [ -z "${VK_ICD_FILENAMES:-}" ]; then
     if [ -e /dev/nvidia0 ] && [ -f /usr/share/vulkan/icd.d/nvidia_icd.json ]; then
         export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/nvidia_icd.json"
@@ -30,14 +36,17 @@ if [ -z "${VK_ICD_FILENAMES:-}" ]; then
         export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
     elif [ -f /usr/share/vulkan/icd.d/lvp_icd.json ]; then
         export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/lvp_icd.json"
+    elif [ -f "$ROOT/.tmp-ui-gpu/lvp_local.json" ]; then
+        # Staged software driver. The ICD file names its library by absolute
+        # path, so no LD_LIBRARY_PATH is involved (see the script's header).
+        export VK_ICD_FILENAMES="$ROOT/.tmp-ui-gpu/lvp_local.json"
     else
-        # Neither a reachable NVIDIA device nor the llvmpipe ICD. Saying nothing
-        # here would leave the reader to discover it as `swarmbot-ui` panicking
-        # with "Unable to init GPU context: NoSupportedDeviceFound" — which
-        # reads like a bug in the app. It is a missing driver: the fix is
-        # `sudo pacman -S vulkan-swrast` (or the distro's Mesa software Vulkan
-        # package). Everything except the window runs without it.
-        echo "VK_ICD_FILENAMES unset: no Vulkan ICD found; swarmbot-ui cannot open a window" >&2
+        # No device and no software driver. Everything except the window still
+        # runs; say which command fixes the window rather than leaving the
+        # reader to discover it as a panic.
+        echo "VK_ICD_FILENAMES unset: no Vulkan driver (no DRM device, no llvmpipe ICD)." >&2
+        echo "  swarmbot-ui cannot open a window. Fix without root:" >&2
+        echo "    scripts/software-vulkan.sh && source scripts/env.sh" >&2
     fi
 fi
 

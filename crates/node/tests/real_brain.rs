@@ -1298,3 +1298,86 @@ fn a_timestamp_is_never_mistaken_for_the_message() {
     assert_eq!(message_of("plain output"), "plain output");
     assert_eq!(message_of(""), "");
 }
+
+/// `download_file` — the tool call the data-stream half never had.
+///
+/// `docs/node-protocol.md` §13 said this twice over several rounds: the transfer
+/// was built and proven with real binaries, and **nothing asked for one**, so the
+/// feature had no user surface. This test drives the same machinery through the
+/// port a tool actually uses (`NodeExecutor::download`, which
+/// `download_file` calls) and then asserts the three things that would make it a
+/// lie: the bytes are the node's bytes, they are on **the brain's** disk at the
+/// named destination, and the digest the result reports is the digest of what
+/// arrived rather than the one the node claimed.
+///
+/// A decoy file with the same name is planted on the brain's side first, so a
+/// "download" that silently read locally, or left the destination untouched,
+/// cannot pass: the two files differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_download_file_port_brings_a_remote_file_to_the_brains_disk() {
+    use swarmbot_contracts::Invocation;
+    use swarmbot_node_protocol::chunk_sha256;
+
+    let rig = Rig::boot(TempDir::new().expect("a temp dir")).await;
+    let node = rig.pair().await;
+    let daemon = rig.run_daemon("download-node", &[]);
+    rig.wait_for_online(&node, "download-node", &daemon).await;
+
+    // What the node has…
+    let from_node: Vec<u8> = b"on the node\n\x00\xff\x01end".to_vec();
+    std::fs::write(rig.node_root.join("report.csv"), &from_node).expect("the node's file");
+    // …and a decoy of the same name on the brain's machine, so a local read
+    // (or a no-op that leaves the destination alone) is a detectable failure.
+    let dest = rig.tmp.path().join("brain-side").join("report.csv");
+    std::fs::create_dir_all(dest.parent().expect("parent")).expect("dest dir");
+    std::fs::write(&dest, b"from the brain\n").expect("the decoy");
+
+    let inv = Invocation::new(
+        BotId::from_suffix("lead"),
+        ConversationId::from_suffix("dm-lead"),
+    );
+    let result = tokio::time::timeout(
+        BUDGET,
+        rig.brain
+            .swarm
+            .nodes
+            .download(&node, &inv, "report.csv", &dest),
+    )
+    .await
+    .expect("the download finishes within the budget")
+    .expect("the download succeeds");
+
+    // The file on the brain's disk is the node's file, byte for byte.
+    let landed = std::fs::read(&dest).expect("the destination is readable");
+    assert_eq!(
+        landed, from_node,
+        "the destination holds the node's bytes, not the decoy and not a truncated copy"
+    );
+    assert_ne!(
+        landed.as_slice(),
+        b"from the brain\n",
+        "the download must not have read the brain's own file"
+    );
+
+    // The result reports the size and the digest of what arrived.
+    let text = result.text_only();
+    assert!(
+        text.contains(&format!("downloaded {} bytes", from_node.len())),
+        "the result names the size that arrived: {text}"
+    );
+    assert!(
+        text.contains(&chunk_sha256(&from_node)),
+        "the result carries the digest of the arriving bytes: {text}"
+    );
+    assert!(
+        text.contains(&dest.display().to_string()),
+        "the result names where the file went: {text}"
+    );
+
+    // No `.part` file left behind: a failed or interrupted transfer must not
+    // leave a truncated file wearing the destination's shape.
+    assert!(
+        !dest.with_extension("part").exists(),
+        "a temporary .part file was left next to the download"
+    );
+}

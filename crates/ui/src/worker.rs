@@ -212,6 +212,24 @@ pub fn run_command(brain: &dyn Brain, command: Command) -> Option<CommandResult>
         }
         Command::FetchBackends => CommandResult::Backends(brain.backends()),
         Command::ProbeBackends => CommandResult::Probes(brain.probe_backends()),
+        Command::ConnectBackend { backend, method } => {
+            let result = brain.connect_backend(&backend, method.as_deref());
+            // A handshake that passed is the only moment the model list is
+            // worth asking for again: before it, the agent refuses, and the
+            // menu would cache that refusal as "this backend advertises
+            // nothing". A failed connect therefore leaves the cache alone.
+            let models = match &result {
+                Ok(probe) if probe.ok => {
+                    Some(brain.models(&backend).map_err(|err| err.to_string()))
+                }
+                _ => None,
+            };
+            CommandResult::ConnectBackend {
+                backend,
+                result,
+                models,
+            }
+        }
         Command::SetBotBackend { bot, backend } => CommandResult::BotUpdated(
             brain
                 .update_bot(bot.as_str(), &serde_json::json!({"backend": backend}))
@@ -229,6 +247,11 @@ pub fn run_command(brain: &dyn Brain, command: Command) -> Option<CommandResult>
                 )
                 .map(|_| ()),
         ),
+        Command::SetBotSkills { bot, skills } => CommandResult::BotUpdated(
+            brain
+                .update_bot(bot.as_str(), &serde_json::json!({"skills": skills}))
+                .map(|_| ()),
+        ),
         Command::FetchNodes => CommandResult::Nodes(brain.nodes()),
         Command::FetchRoutines => CommandResult::Routines(brain.routines(None)),
         Command::CreateRoutine(req) => CommandResult::RoutineCreated(brain.create_routine(&req)),
@@ -241,6 +264,17 @@ pub fn run_command(brain: &dyn Brain, command: Command) -> Option<CommandResult>
             CommandResult::RoutineRuns(id.clone(), brain.routine_runs(&id, Some(20)))
         }
         Command::FetchUsage { since } => CommandResult::Usage(brain.usage(since.as_deref())),
+        Command::FetchRules => CommandResult::Rules(brain.rules()),
+        Command::DeleteRule(id) => CommandResult::RuleDeleted(id.clone(), brain.delete_rule(&id)),
+        Command::EntriesBefore {
+            conversation,
+            before_seq,
+            limit,
+        } => CommandResult::EntriesBefore {
+            result: brain.entries_before(&conversation, before_seq, limit),
+            conversation,
+            limit,
+        },
         Command::Shutdown => CommandResult::Shutdown(brain.shutdown()),
         Command::Stop => return None,
     };

@@ -12,7 +12,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -56,6 +58,16 @@ pub struct McpTurnRequest {
     pub toolsets: Vec<Toolset>,
     pub node_caps: Option<Capabilities>,
     pub in_task: bool,
+    /// The turn's own cancellation token, so a tool the *agent* calls through
+    /// the per-turn MCP server dies when the owner presses Stop.
+    ///
+    /// Without it the MCP server minted a private token that nobody ever trips:
+    /// the agent's `session/cancel` stops the agent, but a `shell` our own tool
+    /// handler was already running kept going, because the handler checks
+    /// `ToolContext::cancel` and had been handed one that could never fire. A
+    /// stopped turn must not keep acting, and that has to be true for the MCP
+    /// path too — it is the path every ACP bot's tools take.
+    pub cancel: CancellationToken,
 }
 
 /// Per-turn MCP server specs and RAII cleanup guard.
@@ -263,7 +275,12 @@ impl Swarm {
             Arc::clone(&tasks),
             Arc::clone(&approval),
         );
-        let bots = BotService::new(Arc::clone(&store), Arc::clone(&hub), Arc::clone(&runners));
+        let bots = BotService::new(
+            Arc::clone(&store),
+            Arc::clone(&hub),
+            Arc::clone(&runners),
+            Arc::clone(&transcript),
+        );
         let conversations = ConversationService::new(
             Arc::clone(&store),
             Arc::clone(&hub),
@@ -350,7 +367,9 @@ impl Swarm {
         )
     }
 
-    /// A durable swarm under `data_dir`, with the JSONL transcript mirror on.
+    /// A durable swarm under `data_dir`, with the JSONL transcript mirror on
+    /// unless the stored settings turn it off ([`Settings::transcript_mirror`],
+    /// which `compose::durable` honours too — one switch, one meaning).
     pub fn durable(
         config: BrainConfig,
         data_dir: &Path,
@@ -358,14 +377,15 @@ impl Swarm {
         parts: SwarmParts,
     ) -> Result<Arc<Self>, DomainError> {
         let store = crate::testing::sqlite_store(data_dir)?;
-        let mirror = Arc::new(JsonlMirror::new(data_dir.join("transcripts")));
+        let mirror_on = store.settings().unwrap_or_default().transcript_mirror;
+        let mirror = mirror_on.then(|| Arc::new(JsonlMirror::new(data_dir.join("transcripts"))));
         Self::new(
             config,
             data_dir.to_path_buf(),
             store,
             backends,
             parts,
-            Some(mirror),
+            mirror,
         )
     }
 
@@ -836,6 +856,178 @@ mod tests {
             swarmbot_contracts::routine::RunStatus::Failed,
             "a run no turn ever finished must not stay Running forever"
         );
+    }
+
+    /// A delivery parked for a bot that is then switched off must not keep the
+    /// whole team looking busy.
+    ///
+    /// Parking is for "the runner is not up yet", not for "the bot can never
+    /// take this". A disabled bot gets no runner (`ensure_runners` skips it),
+    /// so a routine that fired just before the owner hit Disable left a
+    /// delivery in the park map and a `Running` run behind — and because
+    /// `wait_for_idle` demands `parked_count() == 0`, `swarmbot run --wait`
+    /// could never report quiet again.
+    #[tokio::test]
+    async fn disabling_a_bot_drops_what_was_parked_for_it() {
+        use swarmbot_contracts::delivery::Delivery;
+        use swarmbot_contracts::routine::{RoutineSchedule, RunStatus};
+
+        let (swarm, _dir) = test_swarm();
+        let lead = swarm.bots.by_name("lead").expect("lead");
+        let now = chrono::Utc::now();
+        let mut routine = swarm
+            .routines
+            .create_routine(
+                lead.id.clone(),
+                "Nightly",
+                "check the build",
+                RoutineSchedule::Interval { every_secs: 60 },
+                now,
+            )
+            .expect("routine");
+        routine.next_run_at = Some(now - chrono::Duration::seconds(1));
+        swarm.store.update_routine(&routine).expect("update");
+        assert_eq!(swarm.routines.fire_due(now).expect("fire"), 1);
+        assert_eq!(
+            swarm.runners.parked_count(),
+            1,
+            "the lead has no runner in this fixture, so the delivery parks"
+        );
+        assert!(
+            !swarm
+                .wait_for_idle(std::time::Duration::from_millis(100))
+                .await,
+            "a parked delivery is work in flight, not idleness"
+        );
+
+        swarm
+            .bots
+            .set_enabled(&lead.id, false)
+            .expect("the owner switches the bot off");
+
+        assert_eq!(
+            swarm.runners.parked_count(),
+            0,
+            "a disabled bot's parked work is dropped"
+        );
+        assert!(
+            swarm
+                .store
+                .queued_deliveries(&lead.id)
+                .expect("queue")
+                .is_empty(),
+            "and the stored row says dropped, not queued"
+        );
+        let runs = swarm.routines.list_runs(&routine.id, 5).expect("runs");
+        assert_eq!(
+            runs[0].status,
+            RunStatus::Failed,
+            "the run the dropped delivery carried is closed, not left Running"
+        );
+        assert!(
+            swarm
+                .wait_for_idle(std::time::Duration::from_millis(500))
+                .await,
+            "the team is quiet again"
+        );
+
+        // A plain delivery for a bot with no runner parks too, and a delete
+        // drops it just the same.
+        let scout = swarm.bots.by_name("scout").expect("scout");
+        let delivery = Delivery::owner_message(
+            scout.direct_conversation_id.clone(),
+            scout.id.clone(),
+            "are you there?",
+        );
+        swarm.store.insert_delivery(&delivery).expect("delivery");
+        swarm.runners.deliver(delivery).expect("parked");
+        assert_eq!(swarm.runners.parked_count(), 1);
+        swarm.bots.delete(&scout.id).expect("deleted");
+        assert_eq!(swarm.runners.parked_count(), 0);
+        assert!(
+            swarm
+                .wait_for_idle(std::time::Duration::from_millis(500))
+                .await
+        );
+    }
+
+    /// A task parked for a bot that is then switched off ends honestly.
+    ///
+    /// The delivery is dropped (as in the test above), and the `Task` row goes
+    /// with it: before this, disabling a bot whose task was already handed over
+    /// left the row saying `Running` forever, with no delivery, no turn and no
+    /// runner — a lie the whole UI reads.
+    #[tokio::test]
+    async fn disabling_a_bot_closes_the_task_it_had_parked() {
+        use swarmbot_contracts::task::{StepKind, TaskStatus};
+
+        let (swarm, _dir) = test_swarm();
+        let lead = swarm.bots.by_name("lead").expect("lead");
+        let task = swarm
+            .tasks
+            .start(
+                &lead,
+                lead.direct_conversation_id.clone(),
+                "audit the diff",
+                "look for holes",
+            )
+            .expect("task");
+        assert_eq!(
+            swarm
+                .store
+                .get_task(&task.id)
+                .expect("read")
+                .unwrap()
+                .status,
+            TaskStatus::Running,
+            "the pump handed it to a runner that does not exist yet"
+        );
+        assert_eq!(swarm.runners.parked_count(), 1);
+
+        swarm.bots.set_enabled(&lead.id, false).expect("disabled");
+
+        assert_eq!(swarm.runners.parked_count(), 0);
+        let after = swarm.store.get_task(&task.id).expect("read").unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Failed,
+            "the task does not keep saying it is running: {:?}",
+            after.error
+        );
+        assert!(
+            after
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("disabled"),
+            "{:?}",
+            after.error
+        );
+        assert!(after.result.is_none(), "and it does not claim a result");
+        let steps = swarm.tasks.steps(&task.id).expect("steps");
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.kind == StepKind::Notice && step.text.contains("disabled")),
+            "the task pane says why: {steps:?}"
+        );
+        assert!(
+            swarm
+                .wait_for_idle(std::time::Duration::from_millis(500))
+                .await,
+            "a closed task leaves nothing for the team to look busy about"
+        );
+
+        // Enabling it again must not revive the work that never ran.
+        swarm.bots.set_enabled(&lead.id, true).expect("enabled");
+        assert_eq!(swarm.tasks.pump().expect("pump"), 0);
+        let after = swarm.store.get_task(&task.id).expect("read").unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Failed,
+            "re-enabling the bot does not report success for work nobody did"
+        );
+        assert_eq!(swarm.runners.parked_count(), 0);
     }
 
     /// A turn the store still calls `Running` keeps the swarm from reporting

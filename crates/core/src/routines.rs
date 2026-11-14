@@ -10,6 +10,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
+use swarmbot_contracts::bot::BotStatus;
 use swarmbot_contracts::delivery::Delivery;
 use swarmbot_contracts::error::{DomainError, not_found};
 use swarmbot_contracts::id::{BotId, RoutineId, RunId};
@@ -130,10 +131,37 @@ impl RoutineScheduler {
     }
 
     /// Check and trigger all routines that are due at `now`.
+    ///
+    /// A routine whose bot is disabled or gone does **not** fire. It used to,
+    /// and the tick is once a second: every tick wrote a delivery and a
+    /// `Running` run, parked both for a bot that would never take them, and
+    /// `wait_for_idle` requires `parked_count() == 0` — so one disabled bot's
+    /// routine made the whole team look busy forever and `swarmbot run --wait`
+    /// could never report quiet. The bot is checked before anything is
+    /// written, so a skip leaves no trace but a log line.
     pub fn fire_due(&self, now: DateTime<Utc>) -> Result<usize, DomainError> {
         let due = self.store.due_routines(now)?;
         let mut fired = 0;
         for mut routine in due {
+            match self.store.get_bot(&routine.bot_id)? {
+                None => {
+                    debug!(
+                        bot_id = %routine.bot_id,
+                        routine_id = %routine.id,
+                        "routine's bot is gone; skipping it"
+                    );
+                    continue;
+                }
+                Some(bot) if matches!(bot.status, BotStatus::Disabled) => {
+                    debug!(
+                        bot = %bot.name,
+                        routine_id = %routine.id,
+                        "routine's bot is disabled; skipping it"
+                    );
+                    continue;
+                }
+                Some(_) => {}
+            }
             let dm = match self.store.direct_conversation(&routine.bot_id)? {
                 Some(dm) => dm,
                 None => {
@@ -304,6 +332,57 @@ mod tests {
         // Delete routine
         scheduler.delete_routine(&routine.id).unwrap();
         assert_eq!(scheduler.get_routine(&routine.id).unwrap(), None);
+    }
+
+    #[test]
+    fn a_routine_whose_bot_is_disabled_or_gone_never_fires() {
+        // The bug this pins: `fire_due` never looked at the bot, and the tick is
+        // once a second. A disabled bot's routine therefore wrote a delivery and
+        // a `Running` run every second, parked both for a bot with no runner,
+        // and `wait_for_idle` requires `parked_count() == 0` — one disabled bot
+        // made the whole team look busy forever. Nothing may be written at all.
+        let store = testing::memory_store();
+        let bot = testing::seed_bot(&store, "lead");
+        let runners = RunnerMap::new();
+        let scheduler = RoutineScheduler::new(store.clone(), runners.clone());
+        let now = Utc::now();
+        let mut routine = scheduler
+            .create_routine(
+                bot.id.clone(),
+                "Nightly",
+                "check the build",
+                RoutineSchedule::Interval { every_secs: 60 },
+                now,
+            )
+            .unwrap();
+        routine.next_run_at = Some(now - Duration::seconds(1));
+        store.update_routine(&routine).unwrap();
+
+        let mut disabled = bot.clone();
+        disabled.status = swarmbot_contracts::bot::BotStatus::Disabled;
+        store.update_bot(&disabled).unwrap();
+
+        assert_eq!(
+            scheduler.fire_due(now).unwrap(),
+            0,
+            "a disabled bot's routine does not fire"
+        );
+        assert_eq!(runners.parked_count(), 0, "nothing was parked for it");
+        assert!(
+            store.queued_deliveries(&bot.id).unwrap().is_empty(),
+            "and nothing was queued either"
+        );
+        assert!(
+            scheduler.list_runs(&routine.id, 10).unwrap().is_empty(),
+            "no `Running` row was invented either"
+        );
+
+        // The same holds for a bot that is gone: `fire_due` must not resurrect
+        // one from a stored conversation id.
+        store.delete_bot(&bot.id).unwrap();
+        assert_eq!(scheduler.fire_due(now).unwrap(), 0);
+        assert_eq!(runners.parked_count(), 0);
+        assert!(scheduler.list_runs(&routine.id, 10).unwrap().is_empty());
     }
 
     #[test]

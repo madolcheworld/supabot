@@ -16,6 +16,12 @@
 //! * `cursor` is the newest [`LiveCursor`] seen; a reconnect resumes from it.
 //! * collections are upserted by id, so an event for an unknown id inserts
 //!   rather than being dropped on the floor.
+//! * a collection whose emptiness is *news* is a [`Fetched`], not a `Vec`:
+//!   "unknown", "the fetch failed" and "there is genuinely nothing" are three
+//!   different facts, and only the third may be rendered as an empty state.
+//! * `entries[conv]` is merged, never replaced, when a page or a snapshot
+//!   arrives (see [`AppState::merge_older_entries`]); [`History`] records how far
+//!   back the owner has paged so the transcript's top is never a dead button.
 //! * a toast is **time-bounded**: `toast_at` records when it was set, and
 //!   [`AppState::expire_toast`] drops it once [`TOAST_TTL`] has passed. A
 //!   status line that outlives its cause is a lie about the present.
@@ -26,11 +32,175 @@ use std::time::{Duration, Instant};
 
 use swarmbot_client::{BackendProbe, BackendView, Health, PairingCode};
 use swarmbot_contracts::{
-    Bot, BotId, BotStatus, Conversation, ConversationId, ConversationKind, Entry, EntryId,
-    LiveCursor, NodeId, NodeInfo, RequestId, Routine, RoutineId, RoutineRun, RoutineSchedule,
-    RuntimeRequest, Settings, Task, TaskId, TaskStatus, TaskStep, Turn, TurnId, TurnStatus,
-    UsageReport,
+    ApprovalRule, Bot, BotId, BotStatus, Conversation, ConversationId, ConversationKind, Entry,
+    EntryId, LiveCursor, NodeId, NodeInfo, RequestId, Routine, RoutineId, RoutineRun,
+    RoutineSchedule, RuleId, RuntimeRequest, Settings, Task, TaskId, TaskStatus, TaskStep, Turn,
+    TurnId, TurnStatus, UsageReport,
 };
+
+/// What the UI knows about one collection the brain reports.
+///
+/// Three states, and keeping them apart is the whole point (see
+/// [`../../../docs/ui.md`] §3): `Unknown` means *nobody (or nothing) has told us
+/// yet*, `Failed` means the fetch broke, and only `Ready` with an empty vector
+/// may be rendered as "there is nothing here". A screen that prints "no nodes
+/// paired yet" while its fetch is in flight — or after it failed — is telling the
+/// owner something it does not know, and the owner then goes looking for a
+/// problem that may not exist.
+///
+/// The Usage screen established the pattern with `Option<Result<..>>`; this enum
+/// is the same three states with names, so a view cannot match on two of them
+/// and forget the third.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Fetched<T> {
+    /// Never fetched (cold start, the socket is not up, or nothing asked).
+    #[default]
+    Unknown,
+    /// The last fetch failed, in the brain's or the client's own words.
+    Failed(String),
+    /// An answer. It may legitimately be empty — that is the *only* empty that
+    /// may be shown as "nothing here".
+    Ready(T),
+}
+
+impl<T> Fetched<T> {
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    /// The failure reason, if this collection's last fetch failed.
+    pub fn failure(&self) -> Option<&str> {
+        match self {
+            Self::Failed(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+impl<T> Fetched<Vec<T>> {
+    /// The rows, or an empty slice when there is no answer.
+    ///
+    /// For **questions about content**, not for deciding what to print: an empty
+    /// slice here means "nothing known", which is not "nothing exists". A view
+    /// that shows an empty state must match on [`Fetched`] itself.
+    pub fn as_slice(&self) -> &[T] {
+        match self {
+            Self::Ready(rows) => rows,
+            Self::Unknown | Self::Failed(_) => &[],
+        }
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.as_slice().iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+
+    pub fn first(&self) -> Option<&T> {
+        self.as_slice().first()
+    }
+
+    pub fn find(&self, matches: impl Fn(&T) -> bool) -> Option<&T> {
+        self.as_slice().iter().find(|row| matches(row))
+    }
+
+    pub fn find_mut(&mut self, matches: impl Fn(&T) -> bool) -> Option<&mut T> {
+        match self {
+            Self::Ready(rows) => rows.iter_mut().find(|row| matches(row)),
+            Self::Unknown | Self::Failed(_) => None,
+        }
+    }
+}
+
+/// Iterating a collection iterates what is known. `for bot in &state.bots` reads
+/// the same as it did when the field was a `Vec`, which keeps render code honest
+/// by default: an unknown list renders no rows. What it must **not** do is
+/// decide an empty-state sentence — that is a match on [`Fetched`] itself, and
+/// the views that print one do exactly that.
+impl<'a, T> IntoIterator for &'a Fetched<Vec<T>> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+/// Fold one row into a collection, keyed by whatever `same` compares.
+///
+/// A live row is *knowledge about the list*, so it promotes `Unknown` to a
+/// one-row `Ready` — an event naming a bot proves the roster exists. It
+/// deliberately does **not** clear `Failed`: one live row does not make a failed
+/// list fetch complete, and a screen that says "could not load the list" must
+/// keep saying so (with its retry) rather than be quietly replaced by a one-row
+/// list that merely looks whole.
+fn upsert_row<T>(slot: &mut Fetched<Vec<T>>, row: T, same: impl Fn(&T, &T) -> bool) {
+    match slot {
+        Fetched::Ready(rows) => match rows.iter_mut().find(|existing| same(existing, &row)) {
+            Some(found) => *found = row,
+            None => rows.push(row),
+        },
+        Fetched::Unknown => *slot = Fetched::Ready(vec![row]),
+        Fetched::Failed(_) => {}
+    }
+}
+
+/// Drop rows from a collection that has an answer; a collection with no answer
+/// stays without one.
+fn retain_rows<T>(slot: &mut Fetched<Vec<T>>, keep: impl Fn(&T) -> bool) {
+    if let Fetched::Ready(rows) = slot {
+        rows.retain(|row| keep(row));
+    }
+}
+
+impl History {
+    /// Whether there is still an older page worth asking for.
+    ///
+    /// The view uses this to decide between a live button and the "beginning of
+    /// the conversation" line: a control that has to be clicked to discover it
+    /// does nothing is exactly the failure this bar exists to prevent. A
+    /// conversation with no entries has no top of the list to hang it on.
+    pub fn can_load(&self, entries: &[Entry]) -> bool {
+        !self.exhausted && !self.loading && !entries.is_empty()
+    }
+}
+
+/// The paging state of a conversation nobody has paged. A `static` (not a
+/// `const`) so [`AppState::history`] can hand out a reference to it: the value
+/// holds a `String` and so cannot be const-promoted from a borrow of a const.
+/// It is never written to — every mutation goes through `&mut self`.
+static EMPTY_HISTORY: History = History {
+    loading: false,
+    failed: None,
+    exhausted: false,
+};
+
+/// How far back one conversation's transcript has been paged.
+///
+/// A transcript arrives as the newest [`swarmbot_contracts::SNAPSHOT_ENTRIES`]
+/// entries, so a long conversation is missing its beginning. "Load earlier" asks
+/// [`swarmbot_client::BrainClient::entries_before`] for the page before the
+/// oldest row held. This struct is what the button needs to be honest about:
+/// whether a page is in flight, whether the last one failed, and whether a short
+/// page already proved there is nothing older — so the button can turn into
+/// "beginning of the conversation" instead of staying a control that does
+/// nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct History {
+    /// A page request is in flight; a second click must not send another.
+    pub loading: bool,
+    /// The last page request failed, in the client's own words.
+    pub failed: Option<String>,
+    /// A page came back shorter than asked for, or the transcript is already at
+    /// seq 1: there is nothing older left to fetch.
+    pub exhausted: bool,
+}
 
 /// Which pane the main area shows. The delegation graph is an overlay panel
 /// toggled independently of this.
@@ -40,6 +210,10 @@ pub enum Screen {
     Conversation,
     Nodes,
     Routines,
+    /// The saved approval rules (`GET /api/rules`) — the answers "Always allow"
+    /// writes, which used to be visible nowhere in the app and deletable nowhere
+    /// at all.
+    Rules,
     /// What the backends reported the team spent (`GET /api/usage`). Read-only:
     /// nothing here can change the spend, so nothing here writes to the brain.
     Usage,
@@ -107,14 +281,29 @@ pub struct AppState {
     pub health: Option<Health>,
 
     // --- domain data (from the snapshot + upserts) ------------------------
-    pub bots: Vec<Bot>,
-    pub conversations: Vec<Conversation>,
-    pub nodes: Vec<NodeInfo>,
+    //
+    // Four of these are [`Fetched`], not plain vectors, because they are the
+    // collections whose emptiness is *news*: "no nodes paired yet" is an
+    // instruction to go and pair one, and it must not be printed while the fetch
+    // is in flight, after it failed, or before anyone asked. `tasks`,
+    // `requests` and `turns` stay plain vectors: they ride the snapshot, which
+    // is itself the answer, and no screen invites the owner to fix their
+    // absence.
+    pub bots: Fetched<Vec<Bot>>,
+    pub conversations: Fetched<Vec<Conversation>>,
+    pub nodes: Fetched<Vec<NodeInfo>>,
+    /// The saved approval rules. Fetched on demand (the Rules screen and the
+    /// palette), upserted from create/delete answers.
+    pub approval_rules: Fetched<Vec<ApprovalRule>>,
     pub tasks: Vec<Task>,
     pub requests: Vec<RuntimeRequest>,
     pub turns: Vec<Turn>,
     /// Entries per conversation, sorted by `seq`, unique by id.
     pub entries: HashMap<ConversationId, Vec<Entry>>,
+    /// How far back the owner has paged each transcript, so "Load earlier" can
+    /// say where it is and can refuse to ask again once a short page proved
+    /// there is nothing older.
+    pub history: HashMap<ConversationId, History>,
     /// Unread non-owner entries per conversation, reset when it is opened.
     pub unread: HashMap<ConversationId, u32>,
     /// Task steps fetched on demand (clicking a graph node).
@@ -127,6 +316,11 @@ pub struct AppState {
     pub settings_draft: Option<Settings>,
     pub backends: Vec<BackendView>,
     pub probes: Option<Vec<BackendProbe>>,
+    /// Backend ids whose **Connect** handshake is in flight. A set, not a flag,
+    /// because two rows can be connected at once and each row's button must
+    /// report only its own progress; a click on a backend already in this set
+    /// is ignored (one handshake per backend, never a pile of agent processes).
+    pub connecting: HashSet<String>,
     /// The provider menu (per-bot backend + model override) is open.
     pub bot_menu_open: bool,
     /// The bot being configured inside the open menu (`None` = infer from DM).
@@ -141,7 +335,9 @@ pub struct AppState {
     /// backend has nothing to offer.
     pub models: HashMap<String, Result<swarmbot_client::BackendModels, String>>,
     pub pairing: Option<PairingCode>,
-    pub routines: Vec<Routine>,
+    /// Scheduled triggers, fetched on demand by the Routines screen.
+    pub routines: Fetched<Vec<Routine>>,
+    /// Absent key = not fetched (the three-state rule, keyed by routine).
     pub routine_runs: HashMap<RoutineId, Vec<RoutineRun>>,
     /// The usage screen's last answer. Three states, kept distinct on purpose:
     /// `None` = never fetched, `Ok` = a report, `Err` = the fetch failed and the
@@ -158,6 +354,15 @@ pub struct AppState {
     pub routine_draft_schedule: RoutineSchedule,
     /// Popup menu opened by the `+` button in the left sidebar.
     pub plus_menu_open: bool,
+    /// The bot whose skills are being edited on the Settings screen.
+    ///
+    /// Only the *selection* lives here; the text being typed lives in the one
+    /// [`crate::widgets::text_input::TextInput`] entity the Settings screen
+    /// shares, because that is where every other draft in this app lives (a text
+    /// buffer is view state, not domain data — see this module's header). Keeping
+    /// a second copy here would be a string that nothing renders and something
+    /// has to remember to clear.
+    pub skills_editor: Option<BotId>,
     pub create_group_open: bool,
     pub create_group_title: String,
     pub create_group_members: Vec<BotId>,
@@ -217,26 +422,29 @@ impl AppState {
             cursor: None,
             resynced_at: None,
             health: None,
-            bots: Vec::new(),
-            conversations: Vec::new(),
-            nodes: Vec::new(),
+            bots: Fetched::Unknown,
+            conversations: Fetched::Unknown,
+            nodes: Fetched::Unknown,
+            approval_rules: Fetched::Unknown,
             tasks: Vec::new(),
             requests: Vec::new(),
             turns: Vec::new(),
             entries: HashMap::new(),
+            history: HashMap::new(),
             unread: HashMap::new(),
             steps: HashMap::new(),
             settings: None,
             settings_draft: None,
             backends: Vec::new(),
             probes: None,
+            connecting: HashSet::new(),
             bot_menu_open: false,
             menu_bot: None,
             menu_backend: None,
             menu_model: None,
             models: HashMap::new(),
             pairing: None,
-            routines: Vec::new(),
+            routines: Fetched::Unknown,
             routine_runs: HashMap::new(),
             usage: None,
             // The brain's own default (`DEFAULT_WINDOW_HOURS`), so the first
@@ -244,6 +452,7 @@ impl AppState {
             usage_hours: swarmbot_contracts::turn::DEFAULT_WINDOW_HOURS,
             selected_routine: None,
             routine_creator_open: false,
+            skills_editor: None,
             routine_draft_bot: None,
             routine_draft_schedule: RoutineSchedule::Interval { every_secs: 300 },
             plus_menu_open: false,
@@ -318,15 +527,15 @@ impl AppState {
     // --- lookups ----------------------------------------------------------
 
     pub fn bot(&self, id: &BotId) -> Option<&Bot> {
-        self.bots.iter().find(|b| &b.id == id)
+        self.bots.find(|b| &b.id == id)
     }
 
     pub fn conversation(&self, id: &ConversationId) -> Option<&Conversation> {
-        self.conversations.iter().find(|c| &c.id == id)
+        self.conversations.find(|c| &c.id == id)
     }
 
     pub fn node(&self, id: &NodeId) -> Option<&NodeInfo> {
-        self.nodes.iter().find(|n| &n.id == id)
+        self.nodes.find(|n| &n.id == id)
     }
 
     pub fn task(&self, id: &TaskId) -> Option<&Task> {
@@ -636,41 +845,101 @@ impl AppState {
     }
 
     pub fn upsert_bot(&mut self, bot: Bot) {
-        match self.bots.iter_mut().find(|b| b.id == bot.id) {
-            Some(slot) => *slot = bot,
-            None => self.bots.push(bot),
+        upsert_row(&mut self.bots, bot, |a, b| a.id == b.id);
+    }
+
+    /// Record the whole roster as an answer. Only a snapshot or a fetch does
+    /// this; an `Unknown` or `Failed` list is never replaced by guesswork.
+    pub fn set_bots(&mut self, bots: Vec<Bot>) {
+        self.bots = Fetched::Ready(bots);
+    }
+
+    pub fn set_conversations(&mut self, conversations: Vec<Conversation>) {
+        self.conversations = Fetched::Ready(conversations);
+    }
+
+    pub fn set_nodes(&mut self, nodes: Vec<NodeInfo>) {
+        self.nodes = Fetched::Ready(nodes);
+    }
+
+    pub fn set_routines(&mut self, routines: Vec<Routine>) {
+        let mut routines = routines;
+        routines.sort_by(|a, b| a.name.cmp(&b.name));
+        self.routines = Fetched::Ready(routines);
+    }
+
+    pub fn set_rules(&mut self, rules: Vec<ApprovalRule>) {
+        self.approval_rules = Fetched::Ready(rules);
+    }
+
+    pub fn remove_rule(&mut self, id: &RuleId) {
+        retain_rows(&mut self.approval_rules, |rule| &rule.id != id);
+    }
+
+    // --- backend connection state ----------------------------------------
+
+    /// Mark one backend's Connect as in flight. Returns `false` when it already
+    /// was — the caller then does **not** send the command, so a double click
+    /// cannot spawn two agents.
+    pub fn begin_connect(&mut self, backend: &str) -> bool {
+        self.connecting.insert(backend.to_string())
+    }
+
+    pub fn end_connect(&mut self, backend: &str) {
+        self.connecting.remove(backend);
+    }
+
+    pub fn is_connecting(&self, backend: &str) -> bool {
+        self.connecting.contains(backend)
+    }
+
+    /// The last report for one backend, if it has been checked at all.
+    pub fn probe_for(&self, backend: &str) -> Option<&BackendProbe> {
+        self.probes
+            .as_ref()
+            .and_then(|probes| probes.iter().find(|probe| probe.backend == backend))
+    }
+
+    /// Replace one backend's row with a fresher report, keeping the other rows.
+    ///
+    /// An upsert by backend id, like every other collection here: a Connect
+    /// answer for one backend must never blank what is known about the others.
+    /// When nothing has been probed yet this creates the list with the single
+    /// row, because "one backend checked" is a real state.
+    pub fn upsert_probe(&mut self, probe: BackendProbe) {
+        let probes = self.probes.get_or_insert_with(Vec::new);
+        match probes
+            .iter_mut()
+            .find(|existing| existing.backend == probe.backend)
+        {
+            Some(slot) => *slot = probe,
+            None => probes.push(probe),
         }
     }
 
     /// Update only a bot's live status (the roster-only `BotStatus` event).
     pub fn set_bot_status(&mut self, id: &BotId, status: swarmbot_contracts::BotStatus) {
-        if let Some(bot) = self.bots.iter_mut().find(|b| &b.id == id) {
+        if let Some(bot) = self.bots.find_mut(|b| &b.id == id) {
             bot.status = status;
         }
     }
 
     pub fn remove_bot(&mut self, id: &BotId) {
-        if let Some(bot) = self.bots.iter().find(|b| &b.id == id) {
+        if let Some(bot) = self.bots.find(|b| &b.id == id) {
             let dm = bot.direct_conversation_id.clone();
             self.remove_conversation(&dm);
         }
-        self.bots.retain(|b| &b.id != id);
+        retain_rows(&mut self.bots, |b| &b.id != id);
     }
 
     pub fn upsert_conversation(&mut self, conversation: Conversation) {
-        match self
-            .conversations
-            .iter_mut()
-            .find(|c| c.id == conversation.id)
-        {
-            Some(slot) => *slot = conversation,
-            None => self.conversations.push(conversation),
-        }
+        upsert_row(&mut self.conversations, conversation, |a, b| a.id == b.id);
     }
 
     pub fn remove_conversation(&mut self, id: &ConversationId) {
-        self.conversations.retain(|c| &c.id != id);
+        retain_rows(&mut self.conversations, |c| &c.id != id);
         self.entries.remove(id);
+        self.history.remove(id);
         self.unread.remove(id);
         if self.open_conversation.as_ref() == Some(id) {
             self.open_conversation = None;
@@ -683,14 +952,11 @@ impl AppState {
     }
 
     pub fn upsert_node(&mut self, node: NodeInfo) {
-        match self.nodes.iter_mut().find(|n| n.id == node.id) {
-            Some(slot) => *slot = node,
-            None => self.nodes.push(node),
-        }
+        upsert_row(&mut self.nodes, node, |a, b| a.id == b.id);
     }
 
     pub fn set_node_presence(&mut self, id: &NodeId, online: bool) {
-        if let Some(node) = self.nodes.iter_mut().find(|n| &n.id == id) {
+        if let Some(node) = self.nodes.find_mut(|n| &n.id == id) {
             node.online = online;
         }
     }
@@ -745,15 +1011,14 @@ impl AppState {
     }
 
     pub fn upsert_routine(&mut self, routine: Routine) {
-        match self.routines.iter_mut().find(|r| r.id == routine.id) {
-            Some(slot) => *slot = routine,
-            None => self.routines.push(routine),
+        upsert_row(&mut self.routines, routine, |a, b| a.id == b.id);
+        if let Fetched::Ready(routines) = &mut self.routines {
+            routines.sort_by(|a, b| a.name.cmp(&b.name));
         }
-        self.routines.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
     pub fn remove_routine(&mut self, id: &RoutineId) {
-        self.routines.retain(|r| &r.id != id);
+        retain_rows(&mut self.routines, |r| &r.id != id);
         self.routine_runs.remove(id);
         if self.selected_routine.as_ref() == Some(id) {
             self.selected_routine = None;
@@ -762,11 +1027,125 @@ impl AppState {
 
     /// Replace a conversation's entries wholesale (used when a snapshot or a
     /// per-conversation `tail` arrives).
+    ///
+    /// Paging state is kept, not reset: a snapshot brings the newest window, and
+    /// the response to that is "the oldest row moved forward", which can be a
+    /// reason to re-enable "Load earlier" — but never a reason to *forget* that
+    /// the owner already paged back to the beginning (a refresh that resurrected
+    /// the button would produce a page it already has).
     pub fn set_entries(&mut self, id: ConversationId, mut entries: Vec<Entry>) {
         entries.retain(|e| !self.dismissed.contains(&e.id));
         entries.sort_by_key(|e| e.seq);
         entries.dedup_by(|a, b| a.id == b.id);
         self.entries.insert(id, entries);
+    }
+
+    // --- transcript paging ("Load earlier") --------------------------------
+
+    /// The oldest `seq` held for a conversation, which is what the next page is
+    /// asked to come before.
+    pub fn oldest_seq(&self, id: &ConversationId) -> Option<u64> {
+        self.entries(id).first().map(|entry| entry.seq)
+    }
+
+    /// Claim the right to send one page request for `id`.
+    ///
+    /// Returns `false` when a request is already in flight, when the transcript
+    /// is already at its beginning, or when there is nothing to page — that is
+    /// how a double click stops being two requests and how a button whose work
+    /// is done stops being clickable.
+    pub fn begin_older_page(&mut self, id: &ConversationId) -> bool {
+        let entries_empty = self.entries(id).is_empty();
+        let oldest = self.oldest_seq(id);
+        let history = self.history.entry(id.clone()).or_default();
+        if history.loading || history.exhausted || entries_empty {
+            return false;
+        }
+        // A transcript that already starts at seq 1 has no earlier page, and
+        // asking for one would be a request whose answer can only be "nothing".
+        if oldest.is_some_and(|seq| seq <= 1) {
+            history.exhausted = true;
+            return false;
+        }
+        history.loading = true;
+        history.failed = None;
+        true
+    }
+
+    /// Fold one page of older entries into a transcript.
+    ///
+    /// Merge, not replace: the transcript already holds the newer rows, and a
+    /// page that arrived while a live event was streaming must not drop the
+    /// stream. Rows are keyed by `EntryId` (a page can overlap a row that was
+    /// appended live), and the list stays sorted by `seq`.
+    ///
+    /// `requested` is the limit that was sent, and it is what makes the honest
+    /// "there is nothing older" conclusion possible: a *short* page proves the
+    /// beginning was reached, while a full page only proves that more might
+    /// exist. Silence is never read as "the end".
+    pub fn merge_older_entries(
+        &mut self,
+        id: &ConversationId,
+        older: Vec<Entry>,
+        requested: u32,
+    ) -> usize {
+        let returned = older.len();
+        let list = self.entries.entry(id.clone()).or_default();
+        let mut added = 0;
+        for entry in older {
+            if self.dismissed.contains(&entry.id) {
+                continue;
+            }
+            match list.iter_mut().find(|existing| existing.id == entry.id) {
+                Some(slot) => *slot = entry,
+                None => {
+                    list.push(entry);
+                    added += 1;
+                }
+            }
+        }
+        list.sort_by_key(|e| e.seq);
+        list.dedup_by(|a, b| a.id == b.id);
+
+        // A transcript whose oldest row is seq 1 has nothing before it, whatever
+        // the page's size: the page reached the actual first entry.
+        let starts_at_beginning = list.first().is_some_and(|entry| entry.seq <= 1);
+        let history = self.history.entry(id.clone()).or_default();
+        history.loading = false;
+        history.failed = None;
+        // Three independent proofs that the older side is empty; any one is
+        // enough, and the first is the rule the client documents:
+        //
+        // * a transcript that now starts at seq 1 has literally nothing older;
+        // * an empty page is the end said plainly;
+        // * a page shorter than `limit` is the end too — but only because the page
+        //   size is one the server never clamps (50, far below the 1000 cap), so a
+        //   short page cannot be a truncated full one. A limit above the cap would
+        //   make this test wrong, which is the reason `HISTORY_PAGE` is small;
+        // * a page that added no row the transcript did not already have (the
+        //   request overlapped what was loaded) proves the same thing, and is what
+        //   a reconnect can produce.
+        //
+        // A *full* page proves nothing — it may have more behind it — so it leaves
+        // the button available.
+        history.exhausted = starts_at_beginning
+            || returned == 0
+            || (returned as u64) < u64::from(requested)
+            || added == 0;
+        added
+    }
+
+    /// Record that a page request failed: the reason stays visible, and the
+    /// button becomes a retry instead of a control that does nothing.
+    pub fn fail_older_page(&mut self, id: &ConversationId, reason: String) {
+        let history = self.history.entry(id.clone()).or_default();
+        history.loading = false;
+        history.failed = Some(reason);
+    }
+
+    /// The paging state for one conversation.
+    pub fn history(&self, id: &ConversationId) -> &History {
+        self.history.get(id).unwrap_or(&EMPTY_HISTORY)
     }
 
     // --- the transient status line ----------------------------------------

@@ -185,6 +185,7 @@ async fn a_node_dials_signs_hellos_and_serves_over_a_real_websocket() {
                         handler: Some(recorder as swarmbot_node_protocol::Handler),
                         ping_interval: Duration::from_secs(3600),
                         liveness_timeout: Duration::from_secs(3600),
+                        ..Default::default()
                     },
                 );
                 {

@@ -46,8 +46,9 @@ pub mod live;
 pub mod testing;
 
 pub use client::{
-    BackendModels, BackendProbe, BackendView, BrainClient, Health, ModelOption, NewBotRequest,
-    NewRoutineRequest, PairingCode, SentMessage, SessionAction, TaskDetail,
+    BackendAuthMethod, BackendModels, BackendProbe, BackendView, BotPatch, BrainClient,
+    EXPORT_MAX_BYTES, Health, Metrics, ModelOption, NewBotRequest, NewRoutineRequest, PairingCode,
+    SecretName, SecretWrite, SentMessage, SessionAction, TaskDetail,
 };
 pub use error::ClientError;
 pub use live::LiveSubscription;

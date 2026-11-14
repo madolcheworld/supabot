@@ -13,8 +13,9 @@ use swarmbot_client::{
     SentMessage, SessionAction, TaskDetail,
 };
 use swarmbot_contracts::{
-    Bot, BotId, Conversation, ConversationId, Decision, EntryId, LiveEvent, NodeId, NodeInfo,
-    RequestId, Routine, RoutineId, RoutineRun, RuntimeRequest, Settings, Task, TaskId, UsageReport,
+    ApprovalRule, Bot, BotId, Conversation, ConversationId, Decision, Entry, EntryId, LiveEvent,
+    NodeId, NodeInfo, RequestId, Routine, RoutineId, RoutineRun, RuleId, RuntimeRequest, Settings,
+    Task, TaskId, UsageReport,
 };
 
 /// An owner credential in transit: the value behind `--token`,
@@ -111,6 +112,13 @@ pub enum Command {
     UpdateSettings(Value),
     FetchBackends,
     ProbeBackends,
+    /// The Settings screen's **Connect**: the brain's handshake for one backend,
+    /// plus `method` when the owner picked one of the logins that backend
+    /// advertised. Costs no model call; may spawn the agent for a moment.
+    ConnectBackend {
+        backend: String,
+        method: Option<String>,
+    },
     /// Switch the configured backend (provider) one bot runs on. The brain
     /// validates the id; the next turn picks it up.
     SetBotBackend {
@@ -123,6 +131,13 @@ pub enum Command {
         bot: BotId,
         model: Option<String>,
     },
+    /// Replace one bot's skill list (`PATCH /api/bots/{id}` with `skills`). An
+    /// empty list removes every skill, which is a real answer and not a mistake
+    /// to guard against.
+    SetBotSkills {
+        bot: BotId,
+        skills: Vec<String>,
+    },
     /// The model list one backend advertises, for the provider menu's right
     /// column. Cached in state; an empty list is an honest "no menu".
     FetchModels(String),
@@ -133,6 +148,11 @@ pub enum Command {
     ResumeRoutine(RoutineId),
     DeleteRoutine(RoutineId),
     FetchRoutineRuns(RoutineId),
+    /// `GET /api/rules` — the saved approval rules, i.e. the answers "Always
+    /// allow" wrote. Read via a screen rather than only through SQLite.
+    FetchRules,
+    /// `DELETE /api/rules/{id}` — unsave one rule.
+    DeleteRule(RuleId),
     /// `GET /api/usage` — what the backends reported the team spent.
     ///
     /// `since` is an RFC 3339 instant computed by the caller from its own
@@ -143,6 +163,19 @@ pub enum Command {
     /// worker.
     FetchUsage {
         since: Option<String>,
+    },
+    /// One page of an older transcript: the entries with `seq < before_seq`
+    /// (the bound is **exclusive**, so the caller sends the smallest `seq` it
+    /// already shows and cannot get that row back), at most `limit`.
+    ///
+    /// `limit` is carried through to the answer as well: a page shorter than
+    /// what was asked proves the transcript has no older entries, and reading
+    /// that off the sent limit is the only way to tell "the beginning" from "a
+    /// full page that may have more behind it".
+    EntriesBefore {
+        conversation: ConversationId,
+        before_seq: u64,
+        limit: u32,
     },
     Shutdown,
     /// Ask the worker threads to exit.
@@ -206,6 +239,18 @@ pub enum CommandResult {
     UpdateSettings(Result<Settings, ClientError>),
     Backends(Result<Vec<BackendView>, ClientError>),
     Probes(Result<Vec<BackendProbe>, ClientError>),
+    /// One backend's Connect answer, in the same row shape as a probe — plus
+    /// the model list the worker fetched right after a *successful* handshake.
+    ///
+    /// The follow-up fetch is folded into this result on purpose: the useful
+    /// thing about connecting is that the provider's model menu fills in, and
+    /// a view cannot send commands from `render`. Doing it here keeps the
+    /// reducer a pure function and the two calls in the order they matter.
+    ConnectBackend {
+        backend: String,
+        result: Result<BackendProbe, ClientError>,
+        models: Option<Result<swarmbot_client::BackendModels, String>>,
+    },
     /// A bot field was patched; the new state arrives as a live `BotUpsert`,
     /// so this only carries success or the refusal to show.
     BotUpdated(Result<(), ClientError>),
@@ -216,6 +261,17 @@ pub enum CommandResult {
     RoutineUpdated(Result<Routine, ClientError>),
     RoutineDeleted(RoutineId, Result<(), ClientError>),
     RoutineRuns(RoutineId, Result<Vec<RoutineRun>, ClientError>),
+    /// The saved approval rules, or why they could not be read.
+    Rules(Result<Vec<ApprovalRule>, ClientError>),
+    /// A page of older entries. The conversation and the limit travel with the
+    /// result so the reducer can merge into the right transcript and decide
+    /// whether the beginning was reached.
+    EntriesBefore {
+        conversation: ConversationId,
+        limit: u32,
+        result: Result<Vec<Entry>, ClientError>,
+    },
+    RuleDeleted(RuleId, Result<(), ClientError>),
     /// A usage report, or the reason there is none. `Err` is kept as a failure
     /// and never folded into an empty report: "the fetch broke" and "nothing
     /// ran in this window" are different truths, and the screen says so.

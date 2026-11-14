@@ -108,6 +108,32 @@ impl Http {
         self.finish(url, request)
     }
 
+    /// POST with an explicit budget (used by `connect_backend`, which may spawn
+    /// an agent on the brain's side).
+    pub(crate) fn post_with_timeout<B: Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> Result<T, ClientError> {
+        let request = self
+            .timed(self.authed(self.agent.post(url)), timeout)
+            .send_json(body);
+        self.finish(url, request)
+    }
+
+    /// PUT with a JSON body and a JSON answer (`PUT /api/secrets`).
+    pub(crate) fn put<B: Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T, ClientError> {
+        let request = self
+            .timed(self.authed(self.agent.put(url)), self.timeout)
+            .send_json(body);
+        self.finish(url, request)
+    }
+
     pub(crate) fn patch<B: Serialize, T: DeserializeOwned>(
         &self,
         url: &str,
@@ -116,6 +142,52 @@ impl Http {
         let request = self
             .timed(self.authed(self.agent.patch(url)), self.timeout)
             .send_json(body);
+        self.finish(url, request)
+    }
+
+    /// GET a body that is **not** JSON and must be handed back verbatim.
+    ///
+    /// `GET /api/conversations/{id}/export` answers NDJSON, and decoding it as
+    /// JSON would fail on line two. `limit` is explicit because the caller knows
+    /// how much it is willing to hold in memory: ureq's own default is 10 MiB,
+    /// which a long transcript can exceed — and exceeding it must be a visible
+    /// error, never a short file that looks like a complete export.
+    pub(crate) fn get_text(&self, url: &str, limit: u64) -> Result<String, ClientError> {
+        let request = self
+            .timed(self.authed(self.agent.get(url)), self.timeout)
+            .call()
+            .map_err(|err| Self::transport(url, err))?;
+        let status = request.status().as_u16();
+        let mut response = request;
+        let text = if status >= 400 {
+            // An error body is the documented envelope and is small; read it the
+            // ordinary way so the status can be turned into a typed error.
+            Self::body_text(response, url)?
+        } else {
+            response
+                .body_mut()
+                .with_config()
+                .limit(limit)
+                .read_to_string()
+                .map_err(|err| Self::transport(url, err))?
+        };
+        if status >= 400 {
+            return Err(ClientError::from_response(status, &text));
+        }
+        Ok(text)
+    }
+
+    /// DELETE whose answer carries a body (`DELETE /api/secrets/{name}` answers the
+    /// name and whether the change needs a restart).
+    ///
+    /// Separate from [`Self::delete`] rather than one function with an `Option`:
+    /// most DELETEs in this API answer 204, and a caller that expected JSON from
+    /// one of them would report a decode error where the honest outcome is
+    /// success.
+    pub(crate) fn delete_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, ClientError> {
+        let request = self
+            .timed(self.authed(self.agent.delete(url)), self.timeout)
+            .call();
         self.finish(url, request)
     }
 

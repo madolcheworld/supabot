@@ -47,6 +47,33 @@ pub trait LlmBackend: Send + Sync {
     /// Install/version/auth status without spending a model call.
     async fn probe(&self) -> Result<BackendStatus, LlmError>;
 
+    /// Bring this backend to a working state **without spending a model call**,
+    /// and report what happened.
+    ///
+    /// `method` names one of the backend's own advertised auth methods (from an
+    /// earlier [`BackendStatus::auth_methods`]); `None` means "just the
+    /// handshake". Two rules keep this from becoming a lie:
+    ///
+    /// * the default implementation is [`LlmBackend::probe`], because a backend
+    ///   with nothing to connect *is* its probe — an adapter does not have to
+    ///   implement this to be honest about it;
+    /// * a backend with no auth surface **refuses** a named method with a typed
+    ///   error instead of reporting a success it did not perform.
+    ///
+    /// A successful `connect` still does not prove a turn answers (D9.28): it
+    /// proves the handshake the caller asked for, and the report says so.
+    async fn connect(&self, method: Option<&str>) -> Result<BackendStatus, LlmError> {
+        match method {
+            None => self.probe().await,
+            Some(method) => Err(LlmError::Unavailable {
+                backend: self.id().to_string(),
+                reason: format!(
+                    "`{method}`: this backend has no ACP auth to perform (its probe is the whole connection check)"
+                ),
+            }),
+        }
+    }
+
     /// The models this backend can run, when it can list them **without
     /// spending a completion**: an OpenAI-compatible gateway's `/models`, an
     /// ACP agent's advertised session models, the fake's one script model.

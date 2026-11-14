@@ -17,10 +17,11 @@ that routes a bot's tool call to the right machine — and
 `crates/node/tests/real_brain.rs` pins an in-process brain against the **real
 `swarmbot-node` binary**, including a remote tool call proven by a marker file on
 the node and a decoy on the brain ([`node-protocol.md`](node-protocol.md) §11.1).
-The last full `scripts/check.sh` was **1.283 passed, 0 failed, 4 ignored** (tests
-289 s, 336 s total); the ignored ones are the live-gateway LLM test behind
-`PROTO_LIVE_LLM`, the live ACP-agent test behind `PROTO_LIVE_ACP`, and two
-doctests in `store/src/threaded.rs` that need a runtime a doctest does not have.
+The last full `scripts/check.sh` was **1.547 registered / 1.542 passed, 0 failed,
+5 ignored** (418 s, `swarmbot-ui` included); the ignored ones are the live-gateway
+LLM test behind `PROTO_LIVE_LLM`, the live ACP-agent test behind `PROTO_LIVE_ACP`,
+`node`'s `live_two_process` (D9.26), and two doctests in `store/src/threaded.rs`
+that need a runtime a doctest does not have.
 
 ---
 
@@ -417,9 +418,10 @@ Each of these is a hole with a shape, not a hole in the dark:
 | --- | --- | --- |
 | ~~`NodeExecutor::exec` carrying the `Invocation`~~ | **Built (D9.12).** The port takes `&Invocation`, the dispatcher forwards it verbatim, and `attribute()` is gone. `unattributed()` survives only for `node.requestApproval` when a node names a bot this brain cannot place | — |
 | A remote dispatcher in the embedded CLI | Not a missing wire but a property of the mode: a node dials the brain's gateway, and the embedded CLI has no listener, so nothing can pair with it. `LocalExecutor` knows its own `node_id` and **refuses** a call addressed elsewhere instead of absorbing it (D9.11 — absorbing ran a remote bot's tools on the brain's machine, invisibly). Use `--brain` when remote nodes matter; see [`node-protocol.md`](node-protocol.md) §13 item 6 | — |
-| Data streams (pty, file transfer) | **Transfer built on both sides (D9.21).** Tokens, `StreamKind`, `StreamFrame`, `GET /node/stream/:id`, `StreamHub`, and the node's dialer (`node/src/stream.rs`) all exist; `fs.download` moved from the refused table to the implemented one, and `crates/node/tests/real_brain.rs` drives a real node child sending a binary file to a real brain over a loopback WebSocket. Missing: **a caller** (no route, tool or CLI command asks for a download yet) and pty (`pty.open` is still refused). See [`node-protocol.md`](node-protocol.md) §8 | M7 (in progress) |
+| Token cancellation reaching MCP tools | `ToolContext::with_cancel` exists and is tested, but `McpTurnRequest` carries no token and `ToolContext::local` mints a private one, so a `shell` running through the per-turn MCP server **does not die when the owner presses Stop**. The fix is two lines in `core::swarm` + `brain::state`; it is listed here because it is a *safety* gap, not a feature request |
+| Data streams — **file transfer is done** (D9.21 + D9.36); pty is not | Tokens, `StreamKind`, `StreamFrame`, `GET /node/stream/:id`, `StreamHub`, the node's dialer (`node/src/stream.rs`) — and now its **caller**: the `download_file` tool, through the port method `NodeExecutor::download` (a download is not a `NodeCall`, because its payload travels on a data stream and its answer is a `{size, sha256}` claim the receiver checks). A local download goes through the same policy and reports the same result shape, so a bot cannot tell the transports apart. Proven end to end against the real `swarmbot-node` binary. **Still missing: pty** (`pty.open` is refused) and `fs.upload` (the transfer is one-way by design: `fs.write` refuses base64) | — (pty: open) |
 | ~~`codex app-server` backend~~ | **Deleted (D9.19), not built.** Codex is reached as `codex-acp` over the ACP adapter — the protocol this crate already speaks (the shipped config uses the same adapter with **opencode**, the only ACP agent on this machine that completes a turn — D9.28). The variant existed only as a typed `Unavailable` that still appeared as a selectable provider, and a config naming it now fails to load instead of refusing every turn | — |
-| A skill *library* UI, and per-skill enable/disable | `Bot.skills` is rendered from `<data>/skills/<name>/SKILL.md` (or `<name>.md`), capped per skill and per turn; there is no editor and no discovery, so the owner writes the files | M7 |
+| A skill *library* UI, and per-skill enable/disable | `Bot.skills` is rendered from `<data>/skills/<name>/SKILL.md` (or `<name>.md`), capped per skill and per turn. The *names* are now editable from the client (`NewBotRequest.skills`, `BotPatch.skills`, and a Settings row in the desktop app); the library files themselves are still written by the owner — there is no discovery and no per-skill toggle | M7 |
 | ~~TLS~~ | **Built (D9.25).** `brain::tls::TlsListener` terminates TLS for the public listener over the same router and shutdown path, and the node's `--brain-ca` trusts a private CA. Proven with the real binaries (`brain/tests/tls.rs`, `node/tests/tls_brain.rs`). Not claimed: certificate hot reload, and a public-CA chain | — |
 | Any non-unix host | `crates/node` calls `libc::gethostname` and `killpg` unconditionally, so the daemon is unix-only in practice | — |
 
@@ -441,13 +443,21 @@ is the protocol's own order — a single-use ten-minute code for `/node/pair`, a
 | `GET /api/health` | liveness, and what `--spawn-brain` waits for |
 | `POST /api/session` | exchange the owner token for a session cookie |
 | `GET`/`POST /api/bots`, `POST /api/bots/{id}/session` | the roster; New session / Compact |
-| `GET /api/conversations/{id}/tail`, `POST /api/conversations/{id}/messages` | transcript paging; the owner's message in |
+| `GET /api/conversations/{id}/tail`, `GET …/entries?after_seq=`/`?before_seq=`, `POST …/messages` | transcript paging in both directions (`before_seq` is exclusive and answers ascending, so a client can prepend without re-sorting; asking for both directions at once is a `400`); the owner's message in |
 | `GET /api/requests`, `POST /api/requests/{id}/respond` | pending cards; Allow once / Always / Deny, and answers |
 | `GET /api/tasks`, `GET /api/tasks/{id}`, `POST /api/tasks/{id}/cancel` | the delegation graph's data |
 | `GET /api/nodes`, `POST /api/nodes/pairing-codes`, `DELETE /api/nodes/{id}` | the node roster, a pairing code, revocation |
 | `GET`/`POST /api/rules`, `DELETE /api/rules/{id}` | approval rules |
 | `GET`/`PATCH /api/settings` | the kill switch, hop limit, ceilings, and the two token caps (D9.27). A cap is a number of tokens or `null` for **no cap**; `0` is a `400 invalid_input`, not a second spelling of unlimited, and clearing one cap leaves the other alone |
-| `GET /api/backends`, `GET /api/backends/probe` | the backend list (redacted) and `probe()` results |
+| `GET /api/backends`, `GET /api/backends/probe` | the backend list (redacted) and `probe()` results — one row per backend, including the ones that failed |
+| `POST /api/backends/{id}/connect` | the Settings screen's **Connect**: the same handshake `probe` runs, for **one** backend, plus the login the caller named when it names one of that backend's own advertised `auth_methods`. Answers a row in the probe shape (`auth_methods`, `auth_required`, `login_command` included), spends no model call, and never claims a turn works (D9.33 / D9.28) |
+| `GET /api/backends/{id}/models` | the models one backend advertises, empty when it advertises none |
+| `PATCH /api/nodes/{id}` | the node's label and its **approved** capability set. `approved` *replaces* the set (an empty list means "nothing"), must be a subset of what the node declared — a name it never declared is a `400` that names it, because a node's ceiling cannot be raised from the brain — and goes through `mutate_node`, so a heartbeat cannot overwrite it. A revoked node is a `409`: re-approving is not a back door |
+| `GET /api/metrics` | what the brain can actually count: bots by status, live runners, running turns, queued and **parked** deliveries (separated, because the second is why `wait_for_idle` never settles), queued/running tasks, pending requests, nodes online/total, uptime, version. No rate and no memory/CPU: this route stores no history and cannot verify another process's resources |
+| `GET /api/conversations/{id}/export` | the whole transcript as `application/x-ndjson`, one `Entry` per line, streamed a page at a time (a 404 is answered before the first byte; no `content-length`, so a truncated transfer is detectable) |
+| `GET /api/secrets` | the secret **names** the brain can see and which backend ids name each one. There is deliberately no route that returns a value |
+| `PUT`/`DELETE /api/secrets/{name}` | write or remove one secret: temp file `create_new` + mode `0600` + `rename`, registered with the log scrubber before it can appear anywhere. The answer says `applies: "restart"`, which is the truth — `BackendRegistry` resolves its keys once at compose. Deleting a name that also exists in the process environment is a `409`, because a process cannot unset its own env |
+| `POST /api/auth/revoke-sessions` | log every **session cookie** out (the owner token keeps working — that is what makes this different from rotating it). Previously `OwnerAuth::revoke_sessions` had no caller at all |
 | `GET /api/usage?since=…` | a `UsageReport`: what the window's turns spent, per bot and in total, **as the backends reported it**. Default window 24 h, `since` inclusive and RFC 3339; a malformed or future `since` is a 400, not zeros. The same rolling 24 h is the window `max_tokens_per_day` is measured over (D9.27) |
 | `POST /api/shutdown` | ask the daemon to stop; the CLI's `shutdown` then polls `/api/health` for up to 10 s and says whether it actually went down |
 | `GET /ws/live` | the live event socket (§6), cookie or bearer, `Origin` allow-listed |

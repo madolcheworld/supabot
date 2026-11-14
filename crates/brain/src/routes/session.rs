@@ -16,7 +16,7 @@ use axum::http::header::SET_COOKIE;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::IntoResponse;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::auth::constant_time_eq;
@@ -58,6 +58,36 @@ pub async fn create(
             .map_err(|err| ApiError::internal(format!("cannot render a session cookie: {err}")))?,
     );
     Ok((headers, Json(json!({ "ok": true }))))
+}
+
+/// `POST /api/auth/revoke-sessions` — log every session out, keep the owner token.
+///
+/// Why this exists: `OwnerAuth::revoke_sessions` had no caller, so a session
+/// cookie — minted by [`create`] and valid for the life of the process — could not
+/// be taken back. A laptop left logged in had a credential until the brain
+/// restarted, and the only mitigation was rotating the owner token, which logs out
+/// the CLI as well and invalidates the printed login URL.
+///
+/// Two rules the answer states plainly:
+///
+/// * **the owner token still works.** That is the point of the split: a bearer
+///   token can be rotated by hand, a session cannot be un-minted once it is in a
+///   browser's jar. A caller that authenticates with a *cookie* is therefore
+///   logging itself out too — `revoked` says how many credentials died, and the
+///   session id that was used for this request is one of them.
+/// * **it is idempotent.** A second call revokes zero and answers 200; a client
+///   that retried a revoke should not have to read a 409 as "the first one failed".
+pub async fn revoke_sessions(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let revoked = state.auth.revoke_sessions();
+    // Sessions are registered with the log scrubber when they are minted. A dead
+    // session authenticates nothing, so it is no longer a secret and does not need
+    // to keep costing every log line a scan; the *owner token* stays registered,
+    // because it survives this call.
+    tracing::info!(
+        revoked,
+        "every session was revoked; the owner token is unchanged and still works"
+    );
+    Ok(Json(json!({ "revoked": revoked })))
 }
 
 /// The cookie a test client should send back, extracted from a response.

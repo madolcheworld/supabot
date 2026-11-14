@@ -27,8 +27,8 @@ use serde_json::{Value, json};
 use swarmbot_contracts::{
     ApprovalRule, BackendSpec, Bot, BotId, Conversation, ConversationId, ConversationKind,
     Decision, Entry, EntryId, EntryKind, LiveCursor, LiveEvent, NodeInfo, PolicyMap, RequestId,
-    RequestStatus, Responder, RuleEffect, RuleScope, RuntimeRequest, Settings, Snapshot, Surface,
-    Task, TaskId, TaskStatus, TaskStep,
+    RequestStatus, Responder, Routine, RoutineRun, RoutineStatus, RuleEffect, RuleScope,
+    RuntimeRequest, Settings, Snapshot, Surface, Task, TaskId, TaskStatus, TaskStep,
 };
 
 /// One request the stub received, as tests see it.
@@ -220,6 +220,15 @@ impl Reply {
         Self::json(status, json!({"error": {"code": code, "message": message}}))
     }
 
+    /// A non-JSON body with an explicit content type (the NDJSON export).
+    fn raw(status: u16, content_type: &str, body: &str) -> Self {
+        Self {
+            status,
+            headers: vec![("content-type", content_type.to_string())],
+            body: body.to_string(),
+        }
+    }
+
     fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
         self.headers.push((name, value.into()));
         self
@@ -322,10 +331,16 @@ fn write_response(stream: &mut TcpStream, reply: &Reply) {
         reply.status
     );
     if reply.status != 204 {
-        head.push_str(&format!(
-            "content-type: application/json\r\ncontent-length: {}\r\n",
-            reply.body.len()
-        ));
+        // A reply that named its own content type wins: the NDJSON export is not
+        // JSON and must not claim to be, or the stub would drift from the brain.
+        let named = reply
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+        if !named {
+            head.push_str("content-type: application/json\r\n");
+        }
+        head.push_str(&format!("content-length: {}\r\n", reply.body.len()));
     }
     for (name, value) in &reply.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -480,9 +495,77 @@ fn route(request: &RawRequest) -> Reply {
             Vec::new(),
             PolicyMap::default(),
         )]),
+        // The owner's edit of one roster row. The answer is a real `NodeInfo`
+        // carrying what was asked for, so a test can assert both the request body
+        // and the decoded answer.
+        ("PATCH", ["api", "nodes", id]) => {
+            let asked: Value = serde_json::from_str(&body()).unwrap_or(Value::Null);
+            let mut node = NodeInfo::local("stub-node", Vec::new(), PolicyMap::default());
+            if let Some(label) = asked["label"].as_str() {
+                node.label = label.to_string();
+            }
+            if let Some(approved) = asked["approved"].as_array() {
+                let names: Vec<String> = approved
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect();
+                node.approved = swarmbot_contracts::node::Capabilities::new(names);
+            }
+            // A remote node echoes the id it was addressed by, which is how a
+            // client test can tell the id it sent is the one the server used.
+            if let Ok(parsed) = swarmbot_contracts::NodeId::parse(*id) {
+                node.id = parsed;
+                node.kind = swarmbot_contracts::node::NodeKind::Remote;
+            }
+            Reply::value(&node)
+        }
+        ("GET", ["api", "metrics"]) => Reply::ok(json!({
+            "version": "0.1.0", "uptime_secs": 42, "epoch": 7,
+            "bots_total": 1, "bots_idle": 1, "bots_working": 0, "bots_queued": 0,
+            "bots_error": 0, "bots_disabled": 0, "runners": 1,
+            "turns_running": 0, "deliveries_queued": 0, "deliveries_parked": 0,
+            "tasks_queued": 0, "tasks_running": 0, "requests_pending": 0,
+            "nodes_total": 1, "nodes_online": 1
+        })),
+        ("GET", ["api", "secrets"]) => Reply::ok(json!([{
+            "name": "INFERHUB_API_KEY", "used_by": ["inferhub"]
+        }])),
+        ("PUT", ["api", "secrets"]) => {
+            let asked: Value = serde_json::from_str(&body()).unwrap_or(Value::Null);
+            Reply::ok(json!({
+                "name": asked["name"].clone(),
+                // The stub answers the word the brain answers today, so a client
+                // test cannot pass by inventing "hot".
+                "applies": "restart",
+                // Deliberately *not* echoed back: no endpoint returns a value.
+            }))
+        }
+        ("DELETE", ["api", "secrets", name]) => Reply::ok(json!({
+            "name": name, "applies": "restart"
+        })),
+        ("POST", ["api", "auth", "revoke-sessions"]) => Reply::ok(json!({"revoked": 3})),
+        // NDJSON, not JSON: one `Entry` per line, exactly as the brain writes it.
+        ("GET", ["api", "conversations", _id, "export"]) => Reply::raw(
+            200,
+            "application/x-ndjson",
+            &format!("{}\n{}\n", to_value(&stub_entry()), to_value(&stub_reply())),
+        ),
         ("POST", ["api", "nodes", "pairing-codes"]) => Reply::ok(json!({
             "code": "ABCD-EFGH", "expires_at": "2026-01-01T00:00:00Z", "node_id": null
         })),
+        // Routines: the canned row, its pause/resume round trip, and one finished
+        // run. The statuses are what a CLI prints, so they are the real contract
+        // types rather than hand-typed JSON.
+        ("GET", ["api", "routines"]) => Reply::value(&[stub_routine()]),
+        ("POST", ["api", "routines"]) => Reply::json(201, to_value(&echo_routine(&body()))),
+        ("GET", ["api", "routines", _id]) => Reply::value(&stub_routine()),
+        ("POST", ["api", "routines", _id, "pause"]) => {
+            Reply::value(&routine_with(RoutineStatus::Paused))
+        }
+        ("POST", ["api", "routines", _id, "resume"]) => {
+            Reply::value(&routine_with(RoutineStatus::Active))
+        }
+        ("GET", ["api", "routines", _id, "runs"]) => Reply::value(&[stub_routine_run()]),
         ("GET", ["api", "rules"]) => Reply::value(&[stub_rule()]),
         ("POST", ["api", "rules"]) => match serde_json::from_str::<ApprovalRule>(&body()) {
             Ok(rule) => Reply::json(201, to_value(&rule)),
@@ -492,8 +575,42 @@ fn route(request: &RawRequest) -> Reply {
         ("PATCH", ["api", "settings"]) => Reply::ok(merge_settings(&body())),
         ("GET", ["api", "backends"]) => Reply::ok(json!([BackendSpec::fake("fake").public_view()])),
         ("GET", ["api", "backends", "probe"]) => Reply::ok(json!([{
-            "backend": "fake", "ok": true, "detail": null, "model": "fake", "version": null
+            "backend": "fake", "ok": true, "detail": null, "model": "fake",
+            "version": null, "auth_methods": [], "auth_required": false,
+            "login_command": null
         }])),
+        // Connect answers a row in the probe shape, and echoes the method it was
+        // asked for so a client test can assert the body it sent actually
+        // reached the wire (a `null` method is the plain handshake).
+        ("POST", ["api", "backends", _id, "connect"]) => {
+            let asked: Value = serde_json::from_str(&body()).unwrap_or(Value::Null);
+            let method = asked.get("method").cloned().unwrap_or(Value::Null);
+            if method.is_null() {
+                Reply::ok(json!({
+                    "backend": "claude", "ok": false,
+                    "detail": "Authentication required",
+                    "model": null, "version": null,
+                    "auth_methods": [{
+                        "id": "claude-login", "name": "Log in with Claude Code",
+                        "description": "Run `claude /login` in the terminal"
+                    }],
+                    "auth_required": true,
+                    "login_command": "claude /login"
+                }))
+            } else {
+                Reply::ok(json!({
+                    "backend": "claude", "ok": false,
+                    "detail": format!("authenticate({method}) refused: Method not implemented"),
+                    "model": null, "version": null,
+                    "auth_methods": [{
+                        "id": "claude-login", "name": "Log in with Claude Code",
+                        "description": "Run `claude /login` in the terminal"
+                    }],
+                    "auth_required": true,
+                    "login_command": "claude /login"
+                }))
+            }
+        }
         ("POST", ["api", "shutdown"]) => Reply::ok(json!({"ok": true})),
         // Explicit failure routes so error mapping can be tested end to end.
         ("GET", ["api", "boom", "409"]) => Reply::error(409, "conflict", "stub conflict"),
@@ -588,6 +705,50 @@ fn stub_request() -> RuntimeRequest {
     request
 }
 
+/// A canned routine, `active`, on an hourly interval, with a next run in the
+/// future. Built by **deserializing** a wire value instead of calling
+/// `Routine::new`, because this crate has no `chrono` dependency on purpose — the
+/// timestamps are RFC 3339 text, exactly as the brain sends them.
+fn stub_routine() -> Routine {
+    let value = json!({
+        "id": "rtn_000000000000000000000000000000f1",
+        "bot_id": stub_bot().id,
+        "name": "Nightly build",
+        "description": "compiles everything",
+        "schedule": {"kind": "interval", "every_secs": 3600},
+        "status": "active",
+        "prompt": "run the build",
+        "next_run_at": "2099-01-01T00:00:00Z",
+        "last_run_at": null,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+    });
+    serde_json::from_value(value).unwrap_or_else(|err| panic!("stub routine: {err}"))
+}
+
+/// [`stub_routine`] with a different status, for pause/resume.
+fn routine_with(status: RoutineStatus) -> Routine {
+    let mut routine = stub_routine();
+    routine.status = status;
+    routine
+}
+
+/// One finished run of [`stub_routine`].
+fn stub_routine_run() -> RoutineRun {
+    let value = json!({
+        "id": "run_000000000000000000000000000000a2",
+        "routine_id": stub_routine().id,
+        "bot_id": stub_bot().id,
+        "conversation_id": stub_conversation().id,
+        "delivery_id": null,
+        "status": "success",
+        "started_at": "2026-01-01T00:00:00Z",
+        "ended_at": "2026-01-01T00:01:00Z",
+        "error": null
+    });
+    serde_json::from_value(value).unwrap_or_else(|err| panic!("stub routine run: {err}"))
+}
+
 fn stub_rule() -> ApprovalRule {
     ApprovalRule::new(RuleScope::Global, RuleEffect::Allow)
 }
@@ -616,6 +777,25 @@ struct GroupCreateBody {
     members: Vec<BotId>,
     #[serde(default)]
     lead: Option<BotId>,
+}
+
+/// `POST /api/routines`: the canned routine carrying the name and prompt that
+/// were asked for, so a client test can assert on what it sent.
+fn echo_routine(body: &str) -> Routine {
+    let mut routine = stub_routine();
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        if let Some(name) = value["name"].as_str() {
+            routine.name = name.to_string();
+        }
+        if let Some(prompt) = value["prompt"].as_str() {
+            routine.prompt = prompt.to_string();
+        }
+        if let Some(every_secs) = value["schedule"]["every_secs"].as_u64() {
+            routine.schedule =
+                swarmbot_contracts::routine::RoutineSchedule::Interval { every_secs };
+        }
+    }
+    routine
 }
 
 /// `POST /api/conversations`: a group carrying the requested title, members, and lead.

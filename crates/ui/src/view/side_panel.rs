@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use gpui::{Entity, div, prelude::*, px, rgb};
 
 use crate::proto::Command;
-use crate::state::{AppState, Screen};
+use crate::state::{AppState, Fetched, Screen};
 use crate::theme;
 use crate::view::graph;
 use crate::widgets::bits;
@@ -21,7 +21,8 @@ pub fn render(
 ) -> gpui::Div {
     let state_toggle = state.clone();
 
-    // Determine target bot name
+    // Determine target bot name. The bot screen card is only shown when there is
+    // a bot to describe; an unknown roster has nothing to draw.
     let has_bots = !s.bots.is_empty();
     let bot_name = if let Some(conv) = s.open_conversation() {
         match &conv.kind {
@@ -175,26 +176,39 @@ fn routines_section(
 
     let mut list = div().flex().flex_col().gap_3p5();
 
-    if !s.routines.is_empty() {
-        for routine in &s.routines {
-            let sched = format_schedule(&routine.schedule);
-            list = list.child(routine_item(&routine.name, &sched));
+    // Three states again: this panel is small, so it states the fact in one line
+    // and leaves the retry to the Routines screen rather than growing a button.
+    match &s.routines {
+        Fetched::Ready(routines) if routines.is_empty() => {
+            list = list.child(dim_note("No routines scheduled."));
         }
-    } else {
-        list = list.child(
-            div()
-                .py_2()
-                .px_3()
-                .rounded_xl()
-                .bg(rgb(theme::SURFACE_RAISED))
-                .text_xs()
-                .text_color(rgb(theme::TEXT_DIM))
-                .child("No routines yet"),
-        );
+        Fetched::Ready(routines) => {
+            for routine in routines {
+                let sched = format_schedule(&routine.schedule);
+                list = list.child(routine_item(&routine.name, &sched));
+            }
+        }
+        Fetched::Unknown => {
+            list = list.child(dim_note("Routines not loaded yet."));
+        }
+        Fetched::Failed(reason) => {
+            list = list.child(dim_note(&format!("Routines could not be loaded: {reason}")));
+        }
     }
 
     section = section.child(list);
     section
+}
+
+fn dim_note(text: &str) -> gpui::Div {
+    div()
+        .py_2()
+        .px_3()
+        .rounded_xl()
+        .bg(rgb(theme::SURFACE_RAISED))
+        .text_xs()
+        .text_color(rgb(theme::TEXT_DIM))
+        .child(text.to_string())
 }
 
 fn routine_item(name: &str, sched: &str) -> gpui::Div {

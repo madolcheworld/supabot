@@ -167,6 +167,7 @@ pub fn node_pair(config: impl FnOnce(&Path, &Path) -> NodeConfig) -> (NodeSide, 
             // a liveness deadline happens to fire.
             ping_interval: std::time::Duration::from_secs(3600),
             liveness_timeout: std::time::Duration::from_secs(3600),
+            ..Default::default()
         },
     );
     handler.attach(swarmbot_node::handlers::PeerLink::shared(peer.clone()));

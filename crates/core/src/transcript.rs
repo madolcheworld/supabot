@@ -137,6 +137,7 @@ impl Transcript {
         &self,
         conversation: &ConversationId,
         text: impl Into<String>,
+        reply_to: Option<EntryId>,
     ) -> Result<Entry, DomainError> {
         self.append(
             conversation,
@@ -144,7 +145,7 @@ impl Transcript {
             EntryKind::Message(Box::new(MessageEntry {
                 text: text.into(),
                 attachments: Vec::new(),
-                reply_to: None,
+                reply_to,
                 // The orchestrator flips this to `Queued` when the bot is busy
                 // in another conversation, so the owner can see it waiting.
                 post: PostState::Posted,
@@ -162,13 +163,47 @@ impl Transcript {
         turn_id: Option<TurnId>,
         addressed_to: Option<BotId>,
     ) -> Result<Entry, DomainError> {
+        self.write_bot_message(conversation, bot, text, turn_id, addressed_to, None)
+    }
+
+    /// [`bot_message`](Self::bot_message) that also records the entry it
+    /// answers.
+    ///
+    /// A second constructor rather than a sixth argument on `bot_message`
+    /// because `crates/cli` already calls the five-argument form and the crates
+    /// are built in parallel: widening the signature would break a neighbour's
+    /// build for a field only some callers have. A caller that *does* answer a
+    /// specific entry should use this one — a transcript that knows what a
+    /// message replies to can show the thread, and one that always says `None`
+    /// cannot, even when the answer is right in front of it.
+    pub fn bot_message_replying(
+        &self,
+        conversation: &ConversationId,
+        bot: &BotId,
+        text: impl Into<String>,
+        turn_id: Option<TurnId>,
+        addressed_to: Option<BotId>,
+        reply_to: Option<EntryId>,
+    ) -> Result<Entry, DomainError> {
+        self.write_bot_message(conversation, bot, text, turn_id, addressed_to, reply_to)
+    }
+
+    fn write_bot_message(
+        &self,
+        conversation: &ConversationId,
+        bot: &BotId,
+        text: impl Into<String>,
+        turn_id: Option<TurnId>,
+        addressed_to: Option<BotId>,
+        reply_to: Option<EntryId>,
+    ) -> Result<Entry, DomainError> {
         self.append(
             conversation,
             Author::bot(bot.clone()),
             EntryKind::Message(Box::new(MessageEntry {
                 text: text.into(),
                 attachments: Vec::new(),
-                reply_to: None,
+                reply_to,
                 post: PostState::Posted,
                 addressed_to,
                 turn_id,
@@ -411,11 +446,40 @@ mod tests {
     }
 
     #[test]
+    fn a_bot_message_can_name_the_entry_it_answers() {
+        let (_, _, transcript, conversation) = setup();
+        let bot = BotId::new();
+        let question = transcript
+            .owner_message(&conversation, "why?", None)
+            .unwrap();
+        let answer = transcript
+            .bot_message_replying(
+                &conversation,
+                &bot,
+                "because",
+                None,
+                None,
+                Some(question.id.clone()),
+            )
+            .unwrap();
+        let stored = transcript.get(&answer.id).unwrap().unwrap();
+        assert_eq!(
+            stored.as_message().unwrap().reply_to.as_ref(),
+            Some(&question.id)
+        );
+        // The five-argument form still exists and still means "not a reply".
+        let plain = transcript
+            .bot_message(&conversation, &bot, "unrelated", None, None)
+            .unwrap();
+        assert_eq!(plain.as_message().unwrap().reply_to, None);
+    }
+
+    #[test]
     fn sequences_count_up_without_holes() {
         let (store, _, transcript, conversation) = setup();
         for i in 0..3 {
             let entry = transcript
-                .owner_message(&conversation, format!("line {i}"))
+                .owner_message(&conversation, format!("line {i}"), None)
                 .unwrap();
             assert_eq!(entry.seq, (i + 1) as Seq);
         }
@@ -427,12 +491,14 @@ mod tests {
     #[test]
     fn a_restart_continues_from_the_stored_counter() {
         let (store, hub, transcript, conversation) = setup();
-        transcript.owner_message(&conversation, "before").unwrap();
+        transcript
+            .owner_message(&conversation, "before", None)
+            .unwrap();
         drop(transcript);
 
         // A fresh writer must not hand out seq 1 again.
         let again = Transcript::new(store.clone(), hub, None);
-        let entry = again.owner_message(&conversation, "after").unwrap();
+        let entry = again.owner_message(&conversation, "after", None).unwrap();
         assert_eq!(entry.seq, 2);
     }
 
@@ -488,7 +554,7 @@ mod tests {
     #[test]
     fn a_stale_revision_is_a_conflict() {
         let (_, _, transcript, conversation) = setup();
-        let entry = transcript.owner_message(&conversation, "v1").unwrap();
+        let entry = transcript.owner_message(&conversation, "v1", None).unwrap();
         // Somebody else already moved it on.
         let mut newer = entry.clone();
         newer.revision = 5;
@@ -552,7 +618,7 @@ mod tests {
         let hub = LiveHub::new(store.clone());
         let transcript = Transcript::new(store, hub, None);
         let err = transcript
-            .owner_message(&ConversationId::new(), "nowhere")
+            .owner_message(&ConversationId::new(), "nowhere", None)
             .unwrap_err();
         assert_eq!(err.code(), "not_found");
     }
@@ -560,9 +626,9 @@ mod tests {
     #[test]
     fn a_deleted_group_leaves_no_cached_counter() {
         let (store, _, transcript, conversation) = setup();
-        transcript.owner_message(&conversation, "x").unwrap();
+        transcript.owner_message(&conversation, "x", None).unwrap();
         transcript.forget(&conversation);
         store.delete_conversation(&conversation).unwrap();
-        assert!(transcript.owner_message(&conversation, "y").is_err());
+        assert!(transcript.owner_message(&conversation, "y", None).is_err());
     }
 }

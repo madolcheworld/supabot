@@ -1772,7 +1772,7 @@ mod tests {
         // There has to be somebody else's message to react to.
         rig.env
             .transcript
-            .owner_message(&rig.lead.direct_conversation_id, "thanks, seen")
+            .owner_message(&rig.lead.direct_conversation_id, "thanks, seen", None)
             .unwrap();
         let result = rig
             .call(BotToolKind::React, &ctx, json!({"emoji": "👍"}))

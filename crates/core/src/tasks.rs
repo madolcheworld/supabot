@@ -21,7 +21,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use tracing::{debug, warn};
 
-use swarmbot_contracts::bot::Bot;
+use swarmbot_contracts::bot::{Bot, BotStatus};
 use swarmbot_contracts::delivery::Delivery;
 use swarmbot_contracts::entry::NoticeLevel;
 use swarmbot_contracts::error::DomainError;
@@ -111,6 +111,26 @@ impl BackgroundTasks {
                 self.hub.publish(Change::Task(task));
                 continue;
             };
+            // A disabled bot has no runner and never will until the owner
+            // switches it back on, so handing it a delivery parks the work for
+            // nobody: the row says `Running`, the park map never empties, and
+            // `wait_for_idle` — which requires `parked_count() == 0` — can never
+            // report a quiet team again. The task is closed here instead, with
+            // the reason naming the real cause (see `abandon_task` for why the
+            // status is `Failed` and not `Interrupted`).
+            if matches!(bot.status, BotStatus::Disabled) {
+                abandon_task(
+                    self.store.as_ref(),
+                    &self.transcript,
+                    &task,
+                    &format!(
+                        "the bot @{} is disabled, so this task did not run; enable the bot and \
+                         start the task again",
+                        bot.name
+                    ),
+                )?;
+                continue;
+            }
             // The work happens in the bot's own DM; the result travels later.
             let mut delivery = Delivery::task(
                 bot.direct_conversation_id.clone(),
@@ -267,13 +287,21 @@ impl BackgroundTasks {
     }
 
     /// Re-run what a restart cut off, within the budget; report the rest.
+    ///
+    /// The budget is `settings.max_task_restarts`, read here rather than taken
+    /// from `Task::can_restart`'s built-in default: the setting existed,
+    /// validated, showed up on the Settings screen, and no code ever read it, so
+    /// an owner who set it to zero still got two restart attempts. A zero
+    /// budget means "do not re-run anything", and the task is reported instead
+    /// of restarted.
     pub fn recover(&self, report: &RecoveryReport) -> Result<usize, DomainError> {
+        let limit = self.settings.get().max_task_restarts;
         let mut restarted = 0;
         for task_id in &report.interrupted_tasks {
             let Some(mut task) = self.store.get_task(task_id)? else {
                 continue;
             };
-            if task.can_restart() {
+            if task.can_restart_with(limit) {
                 task.bump_restart();
                 self.store.update_task(&task)?;
                 self.hub.publish(Change::Task(task));
@@ -328,6 +356,57 @@ impl BackgroundTasks {
     }
 }
 
+/// Close a task whose work will never run, and tell the origin conversation.
+///
+/// A free function rather than a method, for the same reason as
+/// [`crate::routines::settle_delivery`]: the other caller is the bot lifecycle
+/// (`BotService::set_enabled(false)` and `delete`), which holds the store and
+/// the transcript but must not own `BackgroundTasks` — that would put tasks
+/// underneath bots in the dependency order to serve one cleanup.
+///
+/// **The status is `Failed`, deliberately.** `Interrupted` in this codebase
+/// means one specific thing — `Task::interrupt` writes "interrupted by a
+/// restart", and boot recovery is what re-runs those, from its own report — so a
+/// task closed here would wear a label naming a cause that did not happen, and
+/// would look recoverable when nothing would ever recover it. `Cancelled` would
+/// claim somebody cancelled it on purpose. `Failed` is terminal (so re-enabling
+/// the bot cannot make this row claim success, and `pump` never picks it up
+/// again) and `Task::error` carries the real reason, which `result_text()`
+/// surfaces to the reader as `FAILED: …`.
+///
+/// `Ok(())` for a task that is already terminal: this runs while a bot is being
+/// switched off, and a row that has already ended must not be rewritten.
+pub fn abandon_task(
+    store: &dyn Persistence,
+    transcript: &Transcript,
+    task: &Task,
+    reason: &str,
+) -> Result<(), DomainError> {
+    let Some(mut task) = store.get_task(&task.id)? else {
+        return Ok(());
+    };
+    if task.is_terminal() {
+        return Ok(());
+    }
+    task.fail(Utc::now(), reason.to_string());
+    store.update_task(&task)?;
+    transcript.hub().publish(Change::Task(task.clone()));
+    let seq = store.task_steps(&task.id)?.len() as u32 + 1;
+    store.append_task_step(&TaskStep::new(
+        task.id.clone(),
+        seq,
+        StepKind::Notice,
+        reason,
+    ))?;
+    transcript.notice(
+        &task.origin,
+        format!("The task \"{}\" did not run: {reason}", task.title),
+        NoticeLevel::Warning,
+    )?;
+    debug!(task = %task.id, reason, "closed a task whose work will never run");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +416,7 @@ mod tests {
         tasks: Arc<BackgroundTasks>,
         store: Arc<dyn Persistence>,
         runners: Arc<RunnerMap>,
+        settings: Arc<SettingsHandle>,
         bot: Bot,
         origin: ConversationId,
     }
@@ -350,13 +430,14 @@ mod tests {
             fixture.store.clone(),
             fixture.hub.clone(),
             fixture.transcript.clone(),
-            settings,
+            settings.clone(),
             runners.clone(),
         );
         Rig {
             tasks,
             store: fixture.store,
             runners,
+            settings,
             origin: bot.direct_conversation_id.clone(),
             bot,
         }
@@ -579,6 +660,160 @@ mod tests {
                 .unwrap_or_default()
                 .contains("could not be finished")
         }));
+    }
+
+    #[test]
+    fn the_configured_restart_budget_is_the_one_that_counts() {
+        // `settings.max_task_restarts` validated, showed up on the Settings
+        // screen, and no code read it: the decision used the built-in
+        // `MAX_TASK_RESTARTS` constant, so an owner who set the budget to zero
+        // still got two restart attempts.
+        let rig = rig();
+        rig.settings
+            .update(|settings| settings.max_task_restarts = 0)
+            .unwrap();
+
+        let mut task = Task::own(rig.bot.id.clone(), rig.origin.clone(), "audit", "x");
+        task.interrupt(Utc::now());
+        rig.store.insert_task(&task).unwrap();
+        let mut report = RecoveryReport::default();
+        report.interrupted_tasks.push(task.id.clone());
+
+        assert_eq!(
+            rig.tasks.recover(&report).unwrap(),
+            0,
+            "a budget of zero means do not re-run anything"
+        );
+        let after = rig.store.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(after.restarts, 0);
+        assert_eq!(after.status, TaskStatus::Interrupted, "it stays as it was");
+        let entries = rig.store.entry_tail(&rig.origin, 10).unwrap();
+        assert!(
+            entries.iter().any(|e| {
+                e.kind
+                    .text()
+                    .unwrap_or_default()
+                    .contains("could not be finished")
+            }),
+            "and the origin conversation is told, rather than left guessing"
+        );
+
+        // The other direction too: a budget above the built-in default is
+        // honoured, so the setting (not the constant) decides.
+        rig.settings
+            .update(|settings| settings.max_task_restarts = 4)
+            .unwrap();
+        let mut patient = Task::own(rig.bot.id.clone(), rig.origin.clone(), "second", "x");
+        patient.restarts = swarmbot_contracts::task::MAX_TASK_RESTARTS;
+        patient.interrupt(Utc::now());
+        rig.store.insert_task(&patient).unwrap();
+        let mut report = RecoveryReport::default();
+        report.interrupted_tasks.push(patient.id.clone());
+        assert_eq!(rig.tasks.recover(&report).unwrap(), 1);
+        let after = rig.store.get_task(&patient.id).unwrap().unwrap();
+        assert_eq!(
+            after.restarts,
+            swarmbot_contracts::task::MAX_TASK_RESTARTS + 1
+        );
+    }
+
+    #[test]
+    fn a_disabled_bots_task_is_closed_instead_of_parked() {
+        // The pump used to check only that the owner bot *exists*. A disabled bot
+        // has no runner and `ensure_runners` skips it, so its delivery parked
+        // forever while the task row said `Running`: `wait_for_idle` requires
+        // `parked_count() == 0`, so one disabled bot froze the whole team's idea
+        // of "quiet", and the task pane showed work in progress that nobody was
+        // doing.
+        let rig = rig();
+        let mut disabled = rig.bot.clone();
+        disabled.status = BotStatus::Disabled;
+        rig.store.update_bot(&disabled).unwrap();
+
+        let task = rig
+            .tasks
+            .start(&disabled, rig.origin.clone(), "audit", "x")
+            .unwrap();
+
+        assert_eq!(
+            rig.runners.parked_count(),
+            0,
+            "a disabled bot's work is not parked for a runner that will never exist"
+        );
+        assert!(
+            rig.store
+                .queued_deliveries(&disabled.id)
+                .unwrap()
+                .is_empty(),
+            "and no delivery was written either"
+        );
+        let after = rig.store.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Failed,
+            "the row does not claim it ran"
+        );
+        assert!(
+            after
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("disabled"),
+            "the reason names the real cause: {:?}",
+            after.error
+        );
+        // `Interrupted` would be the other candidate and is wrong on purpose: it
+        // means "a restart cut this off" everywhere else in the codebase, and
+        // boot recovery is what re-runs those.
+        assert_ne!(after.status, TaskStatus::Interrupted);
+        // The origin conversation is told, the way `recover` tells it.
+        let entries = rig.store.entry_tail(&rig.origin, 10).unwrap();
+        assert!(
+            entries.iter().any(|e| {
+                let text = e.kind.text().unwrap_or_default();
+                text.contains("did not run") && text.contains("disabled")
+            }),
+            "the requester is told the work did not run"
+        );
+    }
+
+    #[test]
+    fn a_closed_task_is_not_revived_when_the_bot_is_enabled_again() {
+        // Requirement (c): re-enabling a bot must not turn work that never ran
+        // into a success — or into a queue entry that silently starts later.
+        let rig = rig();
+        let mut disabled = rig.bot.clone();
+        disabled.status = BotStatus::Disabled;
+        rig.store.update_bot(&disabled).unwrap();
+        let task = rig
+            .tasks
+            .start(&disabled, rig.origin.clone(), "audit", "x")
+            .unwrap();
+        assert_eq!(
+            rig.store.get_task(&task.id).unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
+
+        let mut enabled = disabled.clone();
+        enabled.status = BotStatus::Idle;
+        rig.store.update_bot(&enabled).unwrap();
+        assert_eq!(rig.tasks.pump().unwrap(), 0, "nothing is queued to start");
+
+        let after = rig.store.get_task(&task.id).unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            TaskStatus::Failed,
+            "a failure stays a failure: the work never ran"
+        );
+        assert!(after.result.is_none(), "and it never claims a result");
+        assert_eq!(rig.runners.parked_count(), 0);
+        assert!(
+            rig.tasks
+                .steps(&task.id)
+                .unwrap()
+                .iter()
+                .any(|s| { s.kind == StepKind::Notice && s.text.contains("disabled") })
+        );
     }
 
     #[test]

@@ -384,6 +384,10 @@ impl LlmBackend for FakeBackend {
             },
             model: Some("fake".to_string()),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            // Nothing to log in to: the scripted backend has no auth surface.
+            auth_methods: Vec::new(),
+            auth_required: false,
+            login_command: None,
         })
     }
 }
@@ -422,6 +426,27 @@ mod tests {
     use std::sync::Arc;
     use swarmbot_contracts::ToolSpec;
     use swarmbot_contracts::Toolset;
+
+    /// The default `connect` on a backend with no auth surface: a plain connect
+    /// *is* the probe, and a named login is refused with a typed error instead
+    /// of a success nobody performed. The Settings screen relies on both halves.
+    #[tokio::test]
+    async fn a_backend_without_auth_surface_probes_on_connect_and_refuses_a_login() {
+        use crate::backend::LlmBackend;
+
+        let backend = FakeBackend::new("fake");
+        let probed = backend.connect(None).await.expect("connect reports");
+        assert!(probed.ok, "{probed:#?}");
+        assert!(probed.auth_methods.is_empty(), "{probed:#?}");
+        assert!(!probed.auth_required, "{probed:#?}");
+        assert_eq!(probed.detail, "fake backend: always healthy, never online");
+
+        let refused = backend
+            .connect(Some("claude-login"))
+            .await
+            .expect_err("a backend with nothing to log in to refuses the method");
+        assert!(refused.to_string().contains("no ACP auth"), "{refused}");
+    }
 
     async fn collect(
         backend: &FakeBackend,

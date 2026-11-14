@@ -32,7 +32,7 @@ use swarmbot_contracts::{
 };
 
 use crate::proto::{Command, CommandResult, ConnEvent, WorkerMsg};
-use crate::state::{AppState, ConnectionState};
+use crate::state::{AppState, ConnectionState, Fetched};
 
 /// Apply one frame from the live socket, stamping anything time-bounded with
 /// the wall clock. Tests call [`apply_at`] with a fabricated instant instead.
@@ -45,15 +45,40 @@ pub fn apply_at(state: &mut AppState, event: LiveEvent, now: Instant) {
     match event {
         LiveEvent::Snapshot(snapshot) => {
             let had_cursor = state.cursor.is_some();
-            state.bots = snapshot.bots;
-            state.conversations = snapshot.conversations;
-            state.nodes = snapshot.nodes;
+            // The conversation ids the snapshot vouches for, captured before the
+            // vectors are moved into the state: the transcript merge below needs
+            // them to drop the entries of a conversation that is gone.
+            let live: Vec<ConversationId> = snapshot
+                .conversations
+                .iter()
+                .map(|c| c.id.clone())
+                .collect();
+            // A snapshot *is* an answer: it is the live hub's whole projection,
+            // so the three collections it carries are `Ready` from here on — a
+            // snapshot with no bots legitimately means "the roster is empty",
+            // and that is the only case in which the app may say so.
+            state.set_bots(snapshot.bots);
+            state.set_conversations(snapshot.conversations);
+            state.set_nodes(snapshot.nodes);
             state.tasks = snapshot.tasks;
             state.requests = snapshot.requests;
             state.turns = snapshot.turns;
 
-            // Replace the transcript wholesale, grouped per conversation.
-            state.entries.clear();
+            // Merge the transcript, never replace it.
+            //
+            // A snapshot carries only the newest `SNAPSHOT_ENTRIES` window, so
+            // replacing would silently throw away every page the owner loaded
+            // with "Load earlier" — precisely at the moments a snapshot arrives
+            // (a reconnect, a resync after a gap), which is when they are most
+            // likely to have paged back. Every row is keyed by `EntryId` with a
+            // revision guard, so a snapshot row cannot overwrite a newer live
+            // one, and an entry the owner dismissed stays dismissed.
+            //
+            // Entries of a conversation the snapshot no longer lists are the one
+            // thing that *is* dropped: that conversation is gone (deleted, or a
+            // brain on a new epoch), and keeping its rows would resurrect it in
+            // the transcript.
+            state.entries.retain(|id, _| live.contains(id));
             for entry in snapshot.entries {
                 state.upsert_entry(entry);
             }
@@ -347,10 +372,43 @@ pub fn apply_result_at(state: &mut AppState, result: CommandResult, now: Instant
             state.models.insert(backend, Err(err.to_string()));
         }
         CommandResult::Probes(Err(err)) => fail(state, "probe failed", &err, now),
-        CommandResult::Nodes(Ok(nodes)) => state.nodes = nodes,
-        CommandResult::Nodes(Err(err)) => fail(state, "could not load nodes", &err, now),
-        CommandResult::Routines(Ok(routines)) => state.routines = routines,
-        CommandResult::Routines(Err(err)) => fail(state, "could not load routines", &err, now),
+        // Connect replaces exactly one backend's row: the answer is a report
+        // (which may still say `auth_required`), so it is *not* a toast — the
+        // card renders it. Only a transport-level failure is worth a status
+        // line, and it must clear the in-flight mark either way or the button
+        // would spin forever.
+        CommandResult::ConnectBackend {
+            backend,
+            result,
+            models,
+        } => {
+            state.end_connect(&backend);
+            match result {
+                Ok(probe) => state.upsert_probe(probe),
+                Err(err) => fail(state, "could not connect", &err, now),
+            }
+            // On a successful handshake the worker also refreshed the model
+            // list; cache it under the same three-state rule the menu already
+            // uses (`Err` = the fetch broke, not "advertises nothing").
+            if let Some(models) = models {
+                state.models.insert(backend, models);
+            }
+        }
+        // A fetch answer is the *only* thing that can make an empty list mean
+        // "nothing exists", so a failure is stored rather than swallowed: the
+        // screen then shows the reason and a retry instead of "no nodes paired
+        // yet", which would send the owner looking for a problem that may not be
+        // theirs.
+        CommandResult::Nodes(Ok(nodes)) => state.set_nodes(nodes),
+        CommandResult::Nodes(Err(err)) => {
+            state.nodes = Fetched::Failed(err.to_string());
+            fail(state, "could not load nodes", &err, now);
+        }
+        CommandResult::Routines(Ok(routines)) => state.set_routines(routines),
+        CommandResult::Routines(Err(err)) => {
+            state.routines = Fetched::Failed(err.to_string());
+            fail(state, "could not load routines", &err, now);
+        }
         CommandResult::RoutineCreated(Ok(routine)) => {
             state.upsert_routine(routine);
             state.routine_creator_open = false;
@@ -378,6 +436,47 @@ pub fn apply_result_at(state: &mut AppState, result: CommandResult, now: Instant
         }
         CommandResult::RoutineRuns(_, Err(err)) => {
             fail(state, "could not load routine runs", &err, now)
+        }
+        // A page of older transcript. Merged, never substituted: the rows on
+        // screen are still the truth about the newest part of the conversation,
+        // and a page that lands while a reply is streaming must not drop the
+        // stream. `limit` decides whether the beginning was reached — a short
+        // page proves it, a full one does not.
+        CommandResult::EntriesBefore {
+            conversation,
+            limit,
+            result,
+        } => match result {
+            Ok(older) => {
+                let added = state.merge_older_entries(&conversation, older, limit);
+                if added == 0 {
+                    // Nothing new almost always means the beginning was reached
+                    // (the page repeated rows already held); say so instead of
+                    // leaving a button that would do the same nothing again.
+                    state.set_toast("no older messages", now);
+                }
+            }
+            Err(err) => {
+                // The failure is stored *and* shown: the button becomes a retry
+                // with the reason next to it, and the transcript keeps the rows
+                // it has.
+                state.fail_older_page(&conversation, err.to_string());
+                fail(state, "could not load older messages", &err, now);
+            }
+        },
+        CommandResult::Rules(Ok(rules)) => state.set_rules(rules),
+        // A failed list read is kept as a failure: "could not read the rules" is
+        // not "there are no rules", and only the first one needs a retry.
+        CommandResult::Rules(Err(err)) => {
+            state.approval_rules = Fetched::Failed(err.to_string());
+            fail(state, "could not load approval rules", &err, now);
+        }
+        CommandResult::RuleDeleted(id, Ok(())) => {
+            state.remove_rule(&id);
+            state.set_toast("rule deleted", now);
+        }
+        CommandResult::RuleDeleted(_, Err(err)) => {
+            fail(state, "could not delete the rule", &err, now)
         }
         CommandResult::Usage(Ok(report)) => state.usage = Some(Ok(report)),
         // Kept as a failure rather than folded into an empty report: "the fetch
@@ -498,6 +597,127 @@ mod tests {
             Err(message) => assert!(message.contains("boom"), "{message}"),
             Ok(models) => panic!("a failure must not cache as a list: {models:?}"),
         }
+    }
+
+    fn claude_probe(ok: bool, auth_required: bool) -> swarmbot_client::BackendProbe {
+        swarmbot_client::BackendProbe {
+            backend: "claude".into(),
+            ok,
+            detail: Some("Authentication required".into()),
+            model: None,
+            version: None,
+            auth_methods: vec![swarmbot_client::BackendAuthMethod {
+                id: "claude-login".into(),
+                name: "Log in with [CC]".into(),
+                description: Some("Run `claude /login` in the terminal".into()),
+                command: None,
+            }],
+            auth_required,
+            login_command: Some("claude /login".into()),
+        }
+    }
+
+    /// A Connect answer replaces exactly one backend's row, clears the in-flight
+    /// mark, and — when the handshake passed — carries the refreshed model list
+    /// with it. Rows for other backends are untouched: one backend's handshake
+    /// must not blank what is known about the rest.
+    #[test]
+    fn a_connect_answer_upserts_one_row_and_clears_the_in_flight_mark() {
+        let mut state = AppState::new("http://brain.test");
+        assert!(state.begin_connect("claude"), "the first click starts it");
+        assert!(
+            !state.begin_connect("claude"),
+            "a second click while it runs is dropped, not sent twice"
+        );
+        assert!(state.is_connecting("claude"));
+
+        // Another backend's earlier report must survive this upsert.
+        state.upsert_probe(swarmbot_client::BackendProbe {
+            backend: "opencode".into(),
+            ok: true,
+            detail: Some("ready".into()),
+            model: None,
+            version: None,
+            auth_methods: Vec::new(),
+            auth_required: false,
+            login_command: None,
+        });
+
+        apply_msg(
+            &mut state,
+            WorkerMsg::Result(CommandResult::ConnectBackend {
+                backend: "claude".into(),
+                result: Ok(claude_probe(false, true)),
+                models: None,
+            }),
+        );
+        assert!(
+            !state.is_connecting("claude"),
+            "the spinner must stop when the answer lands"
+        );
+        let row = state.probe_for("claude").expect("the row landed");
+        assert!(row.auth_required, "{row:?}");
+        assert_eq!(
+            state.probe_for("opencode").map(|row| row.ok),
+            Some(true),
+            "the other backend's row is untouched"
+        );
+
+        // A successful handshake also refreshes the model list the menu shows.
+        apply_msg(
+            &mut state,
+            WorkerMsg::Result(CommandResult::ConnectBackend {
+                backend: "claude".into(),
+                result: Ok(claude_probe(true, false)),
+                models: Some(Ok(swarmbot_client::BackendModels {
+                    models: vec![swarmbot_client::ModelOption {
+                        id: "opus".into(),
+                        label: None,
+                    }],
+                    authoritative: true,
+                })),
+            }),
+        );
+        assert_eq!(
+            state
+                .models
+                .get("claude")
+                .and_then(|listed| listed.as_ref().ok())
+                .map(|list| list.models.len()),
+            Some(1),
+            "connecting is what makes the provider's menu worth asking for"
+        );
+        assert_eq!(
+            state.probes.as_ref().map(Vec::len),
+            Some(2),
+            "two backends, two rows — never a duplicated row for the same id"
+        );
+    }
+
+    /// A transport failure ends the in-flight mark and says so; it must not spin
+    /// forever or be cached as a report.
+    #[test]
+    fn a_failed_connect_clears_the_spinner_and_says_why() {
+        let mut state = AppState::new("http://brain.test");
+        state.begin_connect("claude");
+        apply_msg(
+            &mut state,
+            WorkerMsg::Result(CommandResult::ConnectBackend {
+                backend: "claude".into(),
+                result: Err(swarmbot_client::ClientError::Transport {
+                    url: "http://brain.test".into(),
+                    reason: "connection refused".into(),
+                }),
+                models: None,
+            }),
+        );
+        assert!(!state.is_connecting("claude"));
+        assert!(
+            state.probes.is_none(),
+            "a failure is not a report: nothing is invented for the row"
+        );
+        let toast = state.toast.clone().unwrap_or_default();
+        assert!(toast.contains("could not connect"), "{toast}");
     }
 
     #[test]
@@ -856,7 +1076,7 @@ mod tests {
         // Created
         apply_result(&mut state, CommandResult::RoutineCreated(Ok(r.clone())));
         assert_eq!(state.routines.len(), 1);
-        assert_eq!(state.routines[0].id, id);
+        assert_eq!(state.routines.as_slice()[0].id, id);
 
         // Updated
         let mut updated = r.clone();
@@ -864,7 +1084,7 @@ mod tests {
         apply_result(&mut state, CommandResult::RoutineUpdated(Ok(updated)));
         assert_eq!(state.routines.len(), 1);
         assert_eq!(
-            state.routines[0].status,
+            state.routines.as_slice()[0].status,
             swarmbot_contracts::RoutineStatus::Paused
         );
 
@@ -890,7 +1110,7 @@ mod tests {
         // 1. Create bot
         apply_result(&mut state, CommandResult::CreateBot(Ok(bot.clone())));
         assert_eq!(state.bots.len(), 1);
-        assert_eq!(state.bots[0].name, "researcher");
+        assert_eq!(state.bots.as_slice()[0].name, "researcher");
         assert_eq!(state.open_conversation, Some(dm.clone()));
 
         // 2. Delete bot
@@ -1057,6 +1277,417 @@ mod tests {
         assert!(!state.expire_toast(set_at + Duration::from_secs(1)));
         assert!(state.expire_toast(set_at + TOAST_TTL));
         assert_eq!(state.toast, None);
+    }
+
+    // --- unknown is not empty ---------------------------------------------
+
+    /// The bug this pins: a screen that prints "no nodes paired yet" while the
+    /// list has never been read, or after the read failed, tells the owner
+    /// something the app does not know — and sends them looking for a pairing
+    /// problem that may not exist. The three states must stay distinguishable in
+    /// the state itself, because only the state knows which one it is.
+    #[test]
+    fn an_unread_or_failed_list_is_never_folded_into_an_empty_one() {
+        let mut state = AppState::new("http://brain.test");
+        assert!(
+            state.nodes.is_unknown(),
+            "a cold start knows nothing about the node list"
+        );
+
+        // A failed fetch is a failure, with its reason kept.
+        apply_msg(
+            &mut state,
+            WorkerMsg::Result(CommandResult::Nodes(Err(ClientError::Transport {
+                url: "http://brain.test".into(),
+                reason: "connection refused".into(),
+            }))),
+        );
+        match &state.nodes {
+            Fetched::Failed(reason) => assert!(reason.contains("connection refused"), "{reason}"),
+            other => panic!("a failed fetch must not read as a list: {other:?}"),
+        }
+        // A live node event does not pretend the failed list is complete.
+        state.upsert_node(swarmbot_contracts::NodeInfo::local(
+            "here",
+            vec![],
+            swarmbot_contracts::PolicyMap::default(),
+        ));
+        assert!(
+            matches!(state.nodes, Fetched::Failed(_)),
+            "one live row does not repair a list whose fetch failed"
+        );
+
+        // Only an actual answer makes an empty list mean "nothing exists".
+        apply_msg(
+            &mut state,
+            WorkerMsg::Result(CommandResult::Nodes(Ok(Vec::new()))),
+        );
+        assert!(
+            matches!(&state.nodes, Fetched::Ready(nodes) if nodes.is_empty()),
+            "an empty answer is the only empty"
+        );
+    }
+
+    /// A snapshot is an answer about the roster and the conversation list, so it
+    /// is what promotes them from unknown to ready — and that is the only moment
+    /// the sidebar may say "no bots or groups yet".
+    #[test]
+    fn the_first_snapshot_is_what_makes_an_empty_roster_a_fact() {
+        let mut state = drive(vec![LiveEvent::Snapshot(Box::new(Snapshot {
+            cursor: LiveCursor::new(1, 1),
+            bots: Vec::new(),
+            conversations: Vec::new(),
+            entries: Vec::new(),
+            requests: Vec::new(),
+            tasks: Vec::new(),
+            nodes: Vec::new(),
+            turns: Vec::new(),
+        }))]);
+        assert!(
+            matches!(&state.bots, Fetched::Ready(bots) if bots.is_empty()),
+            "the snapshot answered: there are no bots"
+        );
+        assert!(matches!(&state.conversations, Fetched::Ready(_)));
+        // And a bot upsert afterwards lands in the ready list.
+        let bot = swarmbot_contracts::Bot::new(
+            "lead",
+            "Lead",
+            "",
+            "fake",
+            ConversationId::from_suffix("dm-lead"),
+        );
+        let bot_id = bot.id.clone();
+        apply_at(
+            &mut state,
+            LiveEvent::BotUpsert {
+                cursor: LiveCursor::new(1, 2),
+                bot,
+            },
+            Instant::now(),
+        );
+        assert!(state.bot(&bot_id).is_some());
+    }
+
+    // --- paging back through a transcript ----------------------------------
+
+    fn entries_with_seqs(conversation: &ConversationId, seqs: &[u64]) -> Vec<Entry> {
+        seqs.iter()
+            .map(|seq| Entry::owner_message(conversation.clone(), *seq, format!("m{seq}")))
+            .collect()
+    }
+
+    /// The page is *merged*, not substituted: a transcript already on screen
+    /// (including a reply streaming in) must not be replaced by the page. And a
+    /// short page is the proof that the beginning was reached — the button can
+    /// then say so instead of asking again.
+    #[test]
+    fn a_short_older_page_prepends_the_rows_and_marks_the_beginning() {
+        use crate::view::conversation::HISTORY_PAGE;
+
+        let conversation = Conversation::direct(BotId::new());
+        let mut state = drive(vec![snapshot_with(
+            entries_with_seqs(&conversation.id, &[101, 102, 103]),
+            vec![conversation.clone()],
+        )]);
+        let before = state.entries(&conversation.id).len();
+
+        // What "Load earlier" sends: the oldest seq held.
+        assert_eq!(state.oldest_seq(&conversation.id), Some(101));
+        assert!(state.begin_older_page(&conversation.id));
+        assert!(state.history(&conversation.id).loading, "the button spins");
+        assert!(
+            !state.begin_older_page(&conversation.id),
+            "a second click while a page is in flight is dropped, not sent"
+        );
+        assert_eq!(
+            state.history(&conversation.id).failed,
+            None,
+            "starting a page clears the previous failure, so the spinner is not              shown next to a stale reason"
+        );
+
+        // A page shorter than asked for: this is the beginning of the thread.
+        apply_result_at(
+            &mut state,
+            CommandResult::EntriesBefore {
+                conversation: conversation.id.clone(),
+                limit: HISTORY_PAGE,
+                result: Ok(entries_with_seqs(&conversation.id, &[95, 96])),
+            },
+            Instant::now(),
+        );
+        let entries = state.entries(&conversation.id);
+        assert_eq!(entries.len(), before + 2, "the page was added");
+        assert_eq!(
+            entries.first().map(|e| e.seq),
+            Some(95),
+            "ascending, at the top"
+        );
+        assert_eq!(
+            entries.last().map(|e| e.seq),
+            Some(103),
+            "the newest row survived"
+        );
+        let history = state.history(&conversation.id);
+        assert!(history.exhausted, "a short page proves the beginning");
+        assert!(!history.loading);
+        assert!(history.exhausted, "a finished button is not offered again");
+    }
+
+    /// A *full* page proves nothing about the older side, so the button must stay
+    /// available — reading silence or a full page as "the end" would hide the
+    /// rest of a long conversation behind a control that quietly stopped.
+    #[test]
+    fn a_full_older_page_leaves_the_older_side_open() {
+        use crate::view::conversation::HISTORY_PAGE;
+
+        let conversation = Conversation::direct(BotId::new());
+        let mut state = drive(vec![snapshot_with(
+            entries_with_seqs(&conversation.id, &[201]),
+            vec![conversation.clone()],
+        )]);
+        state.begin_older_page(&conversation.id);
+        let full: Vec<u64> = (151..151 + u64::from(HISTORY_PAGE)).collect();
+        apply_result_at(
+            &mut state,
+            CommandResult::EntriesBefore {
+                conversation: conversation.id.clone(),
+                limit: HISTORY_PAGE,
+                result: Ok(entries_with_seqs(&conversation.id, &full)),
+            },
+            Instant::now(),
+        );
+        let history = state.history(&conversation.id);
+        assert!(!history.exhausted, "a full page may have more behind it");
+        assert!(!history.loading);
+        assert!(
+            !history.exhausted && !history.loading,
+            "the button stays available: a full page may have more behind it"
+        );
+        assert_eq!(
+            state.oldest_seq(&conversation.id),
+            Some(151),
+            "the next page is asked from the new oldest row"
+        );
+    }
+
+    /// A transcript that is already at seq 1 has nothing older, and the request
+    /// is refused rather than sent: an answer that can only be "nothing" is not
+    /// worth a round trip, and a spinner would be a lie about work in progress.
+    #[test]
+    fn a_transcript_that_starts_at_seq_one_is_already_at_its_beginning() {
+        let conversation = Conversation::direct(BotId::new());
+        let mut state = drive(vec![snapshot_with(
+            entries_with_seqs(&conversation.id, &[1, 2]),
+            vec![conversation.clone()],
+        )]);
+        assert!(!state.begin_older_page(&conversation.id));
+        assert!(state.history(&conversation.id).exhausted);
+        assert!(!state.history(&conversation.id).loading);
+    }
+
+    /// A failed page keeps the rows already held and records why, so the control
+    /// becomes a retry with an explanation instead of silently doing nothing.
+    #[test]
+    fn a_failed_older_page_keeps_the_rows_and_names_the_reason() {
+        use crate::view::conversation::HISTORY_PAGE;
+
+        let conversation = Conversation::direct(BotId::new());
+        let mut state = drive(vec![snapshot_with(
+            entries_with_seqs(&conversation.id, &[10, 11]),
+            vec![conversation.clone()],
+        )]);
+        state.begin_older_page(&conversation.id);
+        apply_result_at(
+            &mut state,
+            CommandResult::EntriesBefore {
+                conversation: conversation.id.clone(),
+                limit: HISTORY_PAGE,
+                result: Err(ClientError::Transport {
+                    url: "http://brain.test".into(),
+                    reason: "connection reset".into(),
+                }),
+            },
+            Instant::now(),
+        );
+        let history = state.history(&conversation.id);
+        assert!(!history.loading, "the spinner stops");
+        assert!(
+            history
+                .failed
+                .as_deref()
+                .is_some_and(|reason| reason.contains("connection reset")),
+            "{history:?}"
+        );
+        assert_eq!(
+            state.entries(&conversation.id).len(),
+            2,
+            "a failed page changes no transcript row"
+        );
+        let toast = state.toast.clone().unwrap_or_default();
+        assert!(toast.contains("could not load older messages"), "{toast}");
+    }
+
+    /// An answer that adds nothing (the page repeated rows already held) is the
+    /// beginning reached by another route, and it says so rather than leaving a
+    /// button that would repeat the same empty request forever.
+    #[test]
+    fn a_page_that_repeats_known_rows_is_the_beginning_said_twice() {
+        use crate::view::conversation::HISTORY_PAGE;
+
+        let conversation = Conversation::direct(BotId::new());
+        let held = entries_with_seqs(&conversation.id, &[10, 11, 12]);
+        let repeated = held[0].clone();
+        let mut state = drive(vec![snapshot_with(held, vec![conversation.clone()])]);
+        state.begin_older_page(&conversation.id);
+        apply_result_at(
+            &mut state,
+            CommandResult::EntriesBefore {
+                conversation: conversation.id.clone(),
+                limit: HISTORY_PAGE,
+                // A full page, but every row is one already on screen (the same
+                // entry ids, which is what the brain returns for the same rows).
+                result: Ok(vec![repeated]),
+            },
+            Instant::now(),
+        );
+        assert_eq!(state.entries(&conversation.id).len(), 3, "no duplicates");
+        assert_eq!(state.toast.as_deref(), Some("no older messages"));
+        assert!(state.history(&conversation.id).exhausted);
+    }
+
+    /// The request the button produces is exactly the wire shape the brain
+    /// expects: an **exclusive** bound taken from the oldest row held, and the
+    /// page size passed through unchanged (a clamped request would make a full
+    /// page look short and stop the paging early).
+    #[test]
+    fn the_page_request_uses_an_exclusive_bound_and_the_page_size_it_asks_for() {
+        use crate::brain::scripted::ScriptedBrain;
+        use crate::worker::run_command;
+
+        let conversation = Conversation::direct(BotId::new());
+        let state = drive(vec![snapshot_with(
+            entries_with_seqs(&conversation.id, &[42, 43]),
+            vec![conversation.clone()],
+        )]);
+        let before_seq = state
+            .oldest_seq(&conversation.id)
+            .expect("rows to page from");
+
+        let brain = ScriptedBrain::new();
+        let result = run_command(
+            &brain,
+            Command::EntriesBefore {
+                conversation: conversation.id.clone(),
+                before_seq,
+                limit: 50,
+            },
+        )
+        .expect("a page request yields a result");
+        assert!(
+            matches!(result, CommandResult::EntriesBefore { .. }),
+            "{result:?}"
+        );
+        let call = brain
+            .calls()
+            .into_iter()
+            .find(|call| call.name == "entries_before")
+            .expect("the client was called");
+        assert!(
+            call.detail.ends_with("<42 limit 50"),
+            "the bound is the oldest held seq and the limit is unclamped: {}",
+            call.detail
+        );
+    }
+
+    /// The other half of "load earlier": a snapshot carries only the newest
+    /// window, so replacing the transcript with it would throw away every page
+    /// the owner just loaded — on a reconnect or a resync, exactly when they are
+    /// most likely to have paged back. The merge keeps them.
+    #[test]
+    fn a_resync_keeps_the_pages_the_owner_already_loaded() {
+        use crate::view::conversation::HISTORY_PAGE;
+
+        let conversation = Conversation::direct(BotId::new());
+        // The newest window, built once: a resync sends the *same* rows with the
+        // same `EntryId`s, which is why the merge is by id and not by seq.
+        let newest = entries_with_seqs(&conversation.id, &[101, 102]);
+        let mut state = drive(vec![snapshot_with(
+            newest.clone(),
+            vec![conversation.clone()],
+        )]);
+        // The owner pages back and gets two older rows.
+        state.begin_older_page(&conversation.id);
+        apply_result_at(
+            &mut state,
+            CommandResult::EntriesBefore {
+                conversation: conversation.id.clone(),
+                limit: HISTORY_PAGE,
+                result: Ok(entries_with_seqs(&conversation.id, &[99, 100])),
+            },
+            Instant::now(),
+        );
+        assert_eq!(state.entries(&conversation.id).len(), 4);
+
+        // A resync: the same conversation, a snapshot that carries only the
+        // newest window (which is what a real one does).
+        apply_at(
+            &mut state,
+            snapshot_with(newest, vec![conversation.clone()]),
+            Instant::now(),
+        );
+        let entries = state.entries(&conversation.id);
+        assert_eq!(
+            entries.len(),
+            4,
+            "the snapshot is a window, not the whole transcript: the loaded pages survive"
+        );
+        assert_eq!(entries.first().map(|e| e.seq), Some(99));
+        assert_eq!(entries.last().map(|e| e.seq), Some(102));
+        assert_eq!(
+            entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![99, 100, 101, 102],
+            "sorted, with no duplicated rows"
+        );
+    }
+
+    /// Merging is not hoarding: a conversation the snapshot no longer lists is
+    /// gone, and keeping its rows would put a deleted chat back in the window.
+    #[test]
+    fn a_snapshot_drops_entries_for_a_conversation_it_no_longer_lists() {
+        let kept = Conversation::direct(BotId::new());
+        let gone = Conversation::direct(BotId::new());
+        let mut entries = entries_with_seqs(&kept.id, &[1]);
+        entries.extend(entries_with_seqs(&gone.id, &[1]));
+        let mut state = drive(vec![snapshot_with(
+            vec![],
+            vec![kept.clone(), gone.clone()],
+        )]);
+        for entry in entries {
+            apply_at(
+                &mut state,
+                LiveEvent::EntryUpsert {
+                    cursor: LiveCursor::new(1, 1),
+                    entry,
+                },
+                Instant::now(),
+            );
+        }
+        assert_eq!(state.entries(&gone.id).len(), 1);
+
+        apply_at(
+            &mut state,
+            snapshot_with(Vec::new(), vec![kept.clone()]),
+            Instant::now(),
+        );
+        assert!(
+            state.entries(&gone.id).is_empty(),
+            "the deleted chat is gone"
+        );
+        assert_eq!(
+            state.entries(&kept.id).len(),
+            1,
+            "the surviving chat is kept"
+        );
     }
 
     #[test]

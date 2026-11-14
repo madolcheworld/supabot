@@ -8,6 +8,10 @@
 # Scratch dirs (verification installs, agent XDG dirs, check logs)
 /.tmp-*
 
+# Working notes and mutation-check backups (AGENTS.md: keep them in the
+# workspace, delete them afterwards — they are never part of the tree)
+/.scratch/
+
 # Prototype runtime state: databases, transcripts, workspaces, secrets, audit logs
 /data
 *.sqlite

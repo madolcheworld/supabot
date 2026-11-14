@@ -1687,13 +1687,7 @@ async fn mcp_turn_provider_attaches_servers_for_acp_filters_node_tools_and_drops
         }
 
         async fn probe(&self) -> Result<BackendStatus, LlmError> {
-            Ok(BackendStatus {
-                backend: self.id.clone(),
-                ok: true,
-                detail: "mock acp ok".to_string(),
-                model: None,
-                version: None,
-            })
+            Ok(BackendStatus::report(self.id.clone(), true, "mock acp ok"))
         }
     }
 
@@ -1926,13 +1920,7 @@ async fn mid_turn_steer_on_single_round_and_other_conversation_steer_both_run() 
         }
 
         async fn probe(&self) -> Result<BackendStatus, LlmError> {
-            Ok(BackendStatus {
-                backend: "coord".to_string(),
-                ok: true,
-                detail: "ok".to_string(),
-                model: None,
-                version: None,
-            })
+            Ok(BackendStatus::report("coord", true, "ok"))
         }
     }
 

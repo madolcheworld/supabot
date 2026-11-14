@@ -776,6 +776,27 @@ impl EntryRepo for SqliteStore {
         )
     }
 
+    fn entries_before(
+        &self,
+        conversation: &ConversationId,
+        before_seq: Seq,
+        limit: u32,
+    ) -> Result<Vec<Entry>, DomainError> {
+        let conn = self.conn()?;
+        // `seq < ?2` exclusive, newest-first selection then ascending order: a
+        // page never repeats the row the caller already holds, and the caller can
+        // prepend it without re-sorting.
+        entities(
+            &conn,
+            "SELECT payload FROM (
+                 SELECT payload, seq FROM entries
+                 WHERE conversation_id = ?1 AND seq < ?2
+                 ORDER BY seq DESC LIMIT ?3
+             ) ORDER BY seq ASC",
+            params![conversation.as_str(), before_seq as i64, i64::from(limit)],
+        )
+    }
+
     fn delete_entries(&self, conversation: &ConversationId) -> Result<u64, DomainError> {
         let conn = self.conn()?;
         let deleted = conn

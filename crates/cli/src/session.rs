@@ -30,13 +30,18 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde_json::Value;
+use swarmbot_client::{SecretName, SecretWrite};
 use swarmbot_contracts::bot::Bot;
+use swarmbot_contracts::config::Settings;
 use swarmbot_contracts::conversation::Conversation;
 use swarmbot_contracts::entry::Entry;
-use swarmbot_contracts::id::{BotId, ConversationId, EntryId, RequestId};
+use swarmbot_contracts::id::{
+    BotId, ConversationId, EntryId, NodeId, RequestId, RoutineId, RuleId,
+};
 use swarmbot_contracts::live::LiveEvent;
 use swarmbot_contracts::node::NodeInfo;
-use swarmbot_contracts::request::{Decision, RuntimeRequest};
+use swarmbot_contracts::request::{ApprovalRule, Decision, RuntimeRequest};
+use swarmbot_contracts::routine::{Routine, RoutineRun};
 use swarmbot_contracts::task::Task;
 use swarmbot_contracts::turn::{Turn, UsageReport};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -160,6 +165,190 @@ pub trait Session: Clone + Send + Sync + 'static {
     /// decode). `None` when the stream is fine or ended cleanly.
     fn stream_error(&self) -> Option<String> {
         None
+    }
+
+    // --- the owner's write surface -------------------------------------------
+    //
+    // The first half of this trait is what `run` and `chat` need to *watch* a
+    // brain. This half is what lets the owner *change* one — saved approval
+    // rules, cards raised outside the REPL, settings, routines, nodes, bots.
+    // They live on the same port because both modes have to answer them: a rule
+    // an owner can see with `--brain` but not in embedded mode would be two
+    // products wearing one name.
+    //
+    // Every method here has a default that returns a **typed refusal**, never an
+    // empty list: a session that cannot answer `rules` must not look like a
+    // brain with no rules saved. Only the two real modes override them, and the
+    // test doubles that drive `run`'s endings keep the refusal — which is what
+    // they would do anyway.
+
+    /// Every saved approval rule, in the brain's own order.
+    fn rules(&self) -> Result<Vec<ApprovalRule>> {
+        Err(no_write_surface("list approval rules"))
+    }
+
+    /// Unsave a rule. A brain that has no such rule refuses with its own
+    /// not-found sentence rather than pretending it deleted something.
+    fn delete_rule(&self, _id: &RuleId) -> Result<()> {
+        Err(no_write_surface("delete an approval rule"))
+    }
+
+    /// Every request still waiting for an answer, in **every** conversation.
+    ///
+    /// Deliberately not [`Session::pending_in`]: a routine or a delegated turn
+    /// raises a card in a conversation the owner is not looking at, and a card
+    /// nobody can reach is a bot blocked until the expiry ticker gives up.
+    fn pending(&self) -> Result<Vec<RuntimeRequest>> {
+        Err(no_write_surface("list the requests waiting for an answer"))
+    }
+
+    /// The brain's effective settings.
+    fn settings(&self) -> Result<Settings> {
+        Err(no_write_surface("read the settings"))
+    }
+
+    /// Apply a **partial** settings object: only the keys present change.
+    ///
+    /// The brain validates the merged value, so an unknown key or a budget of
+    /// zero is refused by the same rule that guards its config file — and the
+    /// caller reports that sentence verbatim.
+    fn update_settings(&self, _patch: &Value) -> Result<Settings> {
+        Err(no_write_surface("change the settings"))
+    }
+
+    /// Every routine the brain knows.
+    fn routines(&self) -> Result<Vec<Routine>> {
+        Err(no_write_surface("list routines"))
+    }
+
+    fn pause_routine(&self, _id: &RoutineId) -> Result<Routine> {
+        Err(no_write_surface("pause a routine"))
+    }
+
+    fn resume_routine(&self, _id: &RoutineId) -> Result<Routine> {
+        Err(no_write_surface("resume a routine"))
+    }
+
+    fn delete_routine(&self, _id: &RoutineId) -> Result<()> {
+        Err(no_write_surface("delete a routine"))
+    }
+
+    /// A routine's past runs, newest first, at most `limit`.
+    fn routine_runs(&self, _id: &RoutineId, _limit: u32) -> Result<Vec<RoutineRun>> {
+        Err(no_write_surface("list a routine's runs"))
+    }
+
+    /// Revoke a node's pairing. The local node refuses by its own rule (it runs
+    /// inside the brain), and an unknown id is a not-found.
+    fn revoke_node(&self, _id: &NodeId) -> Result<()> {
+        Err(no_write_surface("revoke a node"))
+    }
+
+    /// Change the editable half of a bot's definition, and answer the bot as the
+    /// brain now holds it.
+    fn edit_bot(&self, _name: &str, _edit: &BotEdit) -> Result<Bot> {
+        Err(no_write_surface("edit a bot"))
+    }
+
+    /// The newest `limit` entries **older than** `before_seq`, ascending — the
+    /// backwards half of a transcript someone is scrolling.
+    fn entries_before(
+        &self,
+        _conversation: &ConversationId,
+        _before_seq: u64,
+        _limit: u32,
+    ) -> Result<Vec<Entry>> {
+        Err(no_write_surface("page a transcript backwards"))
+    }
+
+    /// One conversation's whole transcript as NDJSON: one `Entry` object per
+    /// line, ascending — the format the brain's export endpoint serves, built
+    /// from the same rows in both modes.
+    fn export_transcript(&self, _conversation: &ConversationId) -> Result<String> {
+        Err(no_write_surface("export a transcript"))
+    }
+
+    /// The credential **names** this brain would load: the ones in its
+    /// `secrets.json` and the environment-provided ones its backends name. A
+    /// name, never a value — there is no read-back path in either mode, on
+    /// purpose.
+    fn secrets(&self) -> Result<Vec<SecretName>> {
+        Err(no_write_surface("list the credential names"))
+    }
+
+    /// Write or replace one credential. Both modes answer what the change took
+    /// to become effective (`"restart"` today, for the reason
+    /// [`applies_hint`](crate::admin::applies_hint) gives), never a cheerful
+    /// "applied" a running registry does not honour.
+    fn set_secret(&self, _name: &str, _value: &str) -> Result<SecretWrite> {
+        Err(no_write_surface("write a credential"))
+    }
+
+    /// Remove one credential from the file. A name the brain also gets from its
+    /// own environment is refused rather than reported deleted: a process cannot
+    /// unset its environment.
+    fn delete_secret(&self, _name: &str) -> Result<SecretWrite> {
+        Err(no_write_surface("delete a credential"))
+    }
+
+    /// The counters that only a brain *in this process* can read: turns the
+    /// store still calls running, deliveries waiting in a queue, deliveries
+    /// parked for a runner that does not exist yet, live runners.
+    ///
+    /// `None` is not "zero". A remote `swarmbot status` cannot see inside the
+    /// daemon, and printing `0` there would be a number nobody measured — the
+    /// same reason `usage` prints "no turn ran" instead of zeros.
+    fn live_counts(&self) -> Option<LiveCounts> {
+        None
+    }
+}
+
+/// The in-process counters [`Session::live_counts`] reports, when it can.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LiveCounts {
+    pub turns_running: u64,
+    pub deliveries_queued: u64,
+    pub deliveries_parked: u64,
+    pub runners: u64,
+    /// Whether the brain these counters came from actually started its runners.
+    ///
+    /// `false` is the read-only in-process case: the CLI opened the store
+    /// without booting, so `runners` is `0` because *nothing was started here*,
+    /// not because the team has none. A remote brain always answers `true` —
+    /// its daemon is running by definition, or the call would have failed.
+    pub booted: bool,
+}
+
+/// The refusal a session that does not implement the owner's write surface
+/// answers with. A typed error rather than an empty result: "there are no rules"
+/// and "this session cannot list rules" are different facts, and only one of
+/// them is true for a test double.
+fn no_write_surface(what: &str) -> anyhow::Error {
+    anyhow!("this session cannot {what} (it implements the run/chat surface only)")
+}
+
+/// What `bots edit` may change. One typed shape for both modes so the remote
+/// half cannot invent a field the embedded half refuses, or the other way round.
+///
+/// `None` means "leave it alone"; an empty `model` is the wire's way of saying
+/// "go back to the backend's default", which is the same rule the brain's
+/// `PATCH /api/bots/{id}` documents.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BotEdit {
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    pub enabled: Option<bool>,
+    pub skills: Option<Vec<String>>,
+}
+
+impl BotEdit {
+    /// True when there is nothing to send: a `bots edit` with no flags is a
+    /// no-op that should be refused, not a request the brain quietly accepts.
+    pub fn is_empty(&self) -> bool {
+        self.backend.is_none()
+            && self.model.is_none()
+            && self.enabled.is_none()
+            && self.skills.is_none()
     }
 }
 

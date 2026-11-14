@@ -1,11 +1,18 @@
-//! The command palette (`ctrl-k`): fuzzy-find a bot, conversation or task and
-//! jump to it.
+//! The command palette (`ctrl-k`): fuzzy-find a bot, conversation, task, routine
+//! or screen and jump to it.
 //!
 //! The palette is its own focused overlay with a `"Palette"` key context, so its
 //! arrows/enter navigate the results while the composer keeps its own bindings.
 //! The result list uses [`gpui::uniform_list`] — the rows are single-line and
 //! therefore uniform-height, which is exactly the case `uniform_list` is for.
-//! Matching is a pure subsequence test ([`fuzzy`]) a `#[gpui::test]` asserts on.
+//! Matching is a pure subsequence test ([`fuzzy`]).
+//!
+//! **The results follow the state, not just the keystrokes.** A palette that only
+//! recomputed itself when the query changed would offer a bot that was deleted a
+//! minute ago and hide one that just joined the roster — and since it is the
+//! fastest way to jump anywhere, a stale row is a wrong jump. [`Palette::results_for`]
+//! is a pure function of the state and the query; the entity recomputes it on
+//! every state notification *and* every keystroke.
 
 use std::ops::Range;
 use std::sync::mpsc::Sender;
@@ -59,7 +66,11 @@ pub struct Palette {
     commands: Sender<Command>,
     results: Vec<PaletteItem>,
     selected: usize,
-    _observe: Subscription,
+    /// Recompute on a keystroke.
+    _observe_input: Subscription,
+    /// Recompute on a state change: a bot upsert, a conversation deleted, a
+    /// routine fetched all change what the palette can offer.
+    _observe_state: Subscription,
 }
 
 /// The REST fetch a screen needs when the palette opens it.
@@ -70,6 +81,9 @@ pub struct Palette {
 fn fetch_for(screen: Screen, commands: &Sender<Command>, usage_hours: i64) {
     match screen {
         Screen::Conversation => {}
+        Screen::Rules => {
+            let _ = commands.send(Command::FetchRules);
+        }
         Screen::Routines => {
             let _ = commands.send(Command::FetchRoutines);
         }
@@ -94,12 +108,26 @@ fn fetch_for(screen: Screen, commands: &Sender<Command>, usage_hours: i64) {
 impl Palette {
     pub fn new(state: Entity<AppState>, commands: Sender<Command>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| TextInput::new("Jump to a bot, conversation or task…", cx));
-        let results = Self::compute(state.read(cx), "");
-        let observe = cx.observe(&input, |this, input, cx| {
+        let results = Self::results_for(state.read(cx), "");
+        let observe_input = cx.observe(&input, |this, input, cx| {
             let query = input.read(cx).content().to_string();
             let s = this.state.read(cx);
-            this.results = Self::compute(s, &query);
+            this.results = Self::results_for(s, &query);
             this.selected = 0;
+            cx.notify();
+        });
+        // Live results: every reducer notification re-runs the same pure
+        // function with the query that is currently typed, so a row can appear
+        // or vanish without the owner touching the keyboard.
+        let observe_state = cx.observe(&state, |this, _state, cx| {
+            let query = this.input.read(cx).content().to_string();
+            let s = this.state.read(cx);
+            this.results = Self::results_for(s, &query);
+            // The selection is an index into a list that just moved; keep it in
+            // range rather than pointing at a row that no longer exists.
+            if this.selected >= this.results.len() {
+                this.selected = 0;
+            }
             cx.notify();
         });
         Self {
@@ -108,7 +136,8 @@ impl Palette {
             commands,
             results,
             selected: 0,
-            _observe: observe,
+            _observe_input: observe_input,
+            _observe_state: observe_state,
         }
     }
 
@@ -116,16 +145,21 @@ impl Palette {
         self.input.read(cx).focus(window);
     }
 
-    fn compute(s: &AppState, query: &str) -> Vec<PaletteItem> {
+    /// The palette's rows for one query over one state snapshot.
+    ///
+    /// Pure and public to the crate so a test can assert that a row appears when
+    /// the state gains a bot and disappears when it loses one — the half of
+    /// "live results" that does not need a window.
+    pub(crate) fn results_for(s: &AppState, query: &str) -> Vec<PaletteItem> {
         let mut items = Vec::new();
-        for bot in &s.bots {
+        for bot in s.bots.iter() {
             items.push(PaletteItem {
                 title: bot.label.clone(),
                 subtitle: format!("@{} · bot", bot.name),
                 action: PaletteAction::OpenBot(bot.id.clone()),
             });
         }
-        for conversation in &s.conversations {
+        for conversation in s.conversations.iter() {
             let title = s.conversation_title(conversation);
             let kind = if conversation.is_direct() {
                 "DM"
@@ -149,7 +183,7 @@ impl Palette {
                 action: PaletteAction::OpenTask(task.id.clone(), task.origin.clone()),
             });
         }
-        for routine in &s.routines {
+        for routine in s.routines.iter() {
             let target = s
                 .bot(&routine.bot_id)
                 .map(|b| format!("@{}", b.name))
@@ -181,10 +215,25 @@ impl Palette {
             action: PaletteAction::OpenScreen(Screen::Usage),
         });
         items.push(PaletteItem {
+            title: "Approval rules".to_string(),
+            subtitle: "screen · saved answers that skip the card".to_string(),
+            action: PaletteAction::OpenScreen(Screen::Rules),
+        });
+        items.push(PaletteItem {
             title: "Settings".to_string(),
             subtitle: "screen · brain configuration & backends".to_string(),
             action: PaletteAction::OpenScreen(Screen::Settings),
         });
+        // A rule is a jump target too: the palette is the fastest way to reach a
+        // permission the owner wants to withdraw, and its row names the screen it
+        // lands on.
+        for rule in s.approval_rules.iter() {
+            items.push(PaletteItem {
+                title: crate::view::rules::matcher_title(rule),
+                subtitle: format!("{} · rule", crate::view::rules::effect_label(rule.effect)),
+                action: PaletteAction::OpenScreen(Screen::Rules),
+            });
+        }
         let q = query.trim();
         let mut matched: Vec<PaletteItem> = items
             .into_iter()
@@ -353,5 +402,118 @@ impl gpui::Render for Palette {
                     .text_color(rgb(theme::TEXT_DIM))
                     .child("↑↓ to move · Enter to jump · Esc to close"),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Fetched;
+    use swarmbot_contracts::{Bot, Conversation, ConversationId};
+
+    fn state_with_bots(names: &[&str]) -> AppState {
+        let mut state = AppState::new("http://brain.test");
+        let bots: Vec<Bot> = names
+            .iter()
+            .map(|name| Bot::new(*name, *name, "", "fake", ConversationId::new()))
+            .collect();
+        state.bots = Fetched::Ready(bots);
+        state
+    }
+
+    fn titles(items: &[PaletteItem]) -> Vec<String> {
+        items.iter().map(|item| item.title.clone()).collect()
+    }
+
+    /// The palette's rows are a pure function of the state and the query, which
+    /// is what lets the entity recompute them on a live event and not only on a
+    /// keystroke. Before this, a bot that joined (or left) after the palette was
+    /// built was invisible (or still offered) until the owner typed something.
+    #[test]
+    fn the_rows_follow_the_state_and_not_only_the_query() {
+        let mut state = state_with_bots(&["lead"]);
+        let before = Palette::results_for(&state, "");
+        assert!(titles(&before).contains(&"lead".to_string()));
+
+        // A live `BotUpsert` changes the state; the same query now sees it.
+        state.upsert_bot(Bot::new(
+            "scout",
+            "scout",
+            "",
+            "fake",
+            ConversationId::new(),
+        ));
+        let after = Palette::results_for(&state, "");
+        assert!(
+            titles(&after).contains(&"scout".to_string()),
+            "a bot that joined after the palette was built is offered: {:?}",
+            titles(&after)
+        );
+
+        // …and one that left stops being offered.
+        let gone = state.bots.as_slice()[0].id.clone();
+        state.remove_bot(&gone);
+        let after_delete = Palette::results_for(&state, "");
+        assert!(
+            !titles(&after_delete).contains(&"lead".to_string()),
+            "a deleted bot is no longer a jump target: {:?}",
+            titles(&after_delete)
+        );
+    }
+
+    /// A conversation that arrives while the palette is open is findable by
+    /// title, which is how a group created a second ago becomes reachable.
+    #[test]
+    fn a_new_conversation_is_findable_without_retyping() {
+        let mut state = state_with_bots(&["lead"]);
+        state.conversations = Fetched::Ready(Vec::new());
+        assert!(Palette::results_for(&state, "launch").is_empty());
+
+        let mut group = Conversation::group(
+            "Launch plan",
+            vec![state.bots.as_slice()[0].id.clone(), BotId::new()],
+            state.bots.as_slice()[0].id.clone(),
+        )
+        .expect("group");
+        group.title = Some("Launch plan".into());
+        state.upsert_conversation(group);
+
+        let found = Palette::results_for(&state, "launch");
+        assert!(
+            found.iter().any(|item| item.title == "Launch plan"
+                && matches!(item.action, PaletteAction::OpenConversation(_))),
+            "{:?}",
+            titles(&found)
+        );
+    }
+
+    /// A rule is a jump target: the palette is the fastest route to a saved
+    /// "always allow" the owner wants to see or withdraw.
+    #[test]
+    fn saved_rules_are_offered_as_jump_targets() {
+        let mut state = state_with_bots(&["lead"]);
+        let mut rule = swarmbot_contracts::ApprovalRule::new(
+            swarmbot_contracts::RuleScope::Global,
+            swarmbot_contracts::RuleEffect::Allow,
+        );
+        rule.tool = Some("shell".into());
+        state.approval_rules = Fetched::Ready(vec![rule]);
+
+        let found = Palette::results_for(&state, "shell");
+        assert!(
+            found.iter().any(|item| {
+                item.action == PaletteAction::OpenScreen(Screen::Rules)
+                    && item.title == "tool `shell`"
+                    && item.subtitle.starts_with("allow")
+            }),
+            "{:?}",
+            titles(&found)
+        );
+        // The screen itself is always offered too.
+        assert!(
+            titles(&Palette::results_for(&state, "rules"))
+                .iter()
+                .any(|title| title == "Approval rules")
+        );
     }
 }

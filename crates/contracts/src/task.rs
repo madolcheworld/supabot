@@ -223,8 +223,23 @@ impl Task {
     }
 
     /// Re-run after a restart, if the budget allows it.
+    ///
+    /// The limit is the configured `settings.max_task_restarts` (D9.35), not
+    /// [`MAX_TASK_RESTARTS`]: that constant is only the default a fresh config
+    /// starts from. It used to be the other way round — the setting existed,
+    /// validated, appeared in the UI, and no code ever read it — so an owner who
+    /// lowered it still got the built-in number of restart attempts.
+    pub fn can_restart_with(&self, limit: u8) -> bool {
+        matches!(self.status, TaskStatus::Interrupted) && self.restarts < limit
+    }
+
+    /// [`can_restart_with`](Self::can_restart_with) at the built-in default.
+    ///
+    /// Kept for callers that have no settings in hand (the store's contract
+    /// suite, a task read outside a turn). A caller that *does* have the
+    /// configured value must use `can_restart_with`.
     pub fn can_restart(&self) -> bool {
-        matches!(self.status, TaskStatus::Interrupted) && self.restarts < MAX_TASK_RESTARTS
+        self.can_restart_with(MAX_TASK_RESTARTS)
     }
 
     pub fn bump_restart(&mut self) {

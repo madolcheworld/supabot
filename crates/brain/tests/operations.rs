@@ -652,6 +652,73 @@ async fn backends_are_listed_redacted_and_probed() {
     brain.stop().await;
 }
 
+/// Connect is one backend, in the same row shape `probe` uses, and it answers
+/// even when the answer is "this backend needs no login" — an empty
+/// `auth_methods` is a fact, not a gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connect_one_backend_is_a_handshake_in_the_probe_shape() {
+    let brain = TestBrain::start().await;
+    let client = brain.client();
+
+    // No body at all: the plain handshake, the way a bare `curl -X POST` does it.
+    let response = post_empty(&client, &brain.url("/api/backends/fake/connect")).await;
+    assert_eq!(response.status().as_u16(), 200);
+    let row = body(response).await;
+    // Every key the probe route sends, in the same vocabulary — one serializer
+    // behind both, so a UI renders them with one code path.
+    for key in [
+        "backend",
+        "ok",
+        "detail",
+        "model",
+        "version",
+        "auth_methods",
+        "auth_required",
+        "login_command",
+    ] {
+        assert!(row.get(key).is_some(), "{key} is missing from {row}");
+    }
+    assert_eq!(row["backend"], json!("fake"));
+    assert_eq!(row["ok"], json!(true), "{row}");
+    assert_eq!(row["auth_methods"], json!([]), "{row}");
+    assert_eq!(row["auth_required"], json!(false), "{row}");
+    assert_eq!(row["login_command"], Value::Null, "{row}");
+
+    // An explicit `{"method": null}` is the same request, spelled out.
+    let explicit = post(
+        &client,
+        &brain.url("/api/backends/fake/connect"),
+        &json!({"method": Value::Null}),
+    )
+    .await;
+    assert_eq!(explicit.status().as_u16(), 200);
+    assert_eq!(body(explicit).await["ok"], json!(true));
+
+    // A named login on a backend with no auth surface is refused with a status,
+    // not answered as if it had logged in.
+    let refused = post(
+        &client,
+        &brain.url("/api/backends/fake/connect"),
+        &json!({"method": "claude-login"}),
+    )
+    .await;
+    let row = body(refused).await;
+    assert_eq!(row["ok"], json!(false), "{row}");
+    assert!(
+        row["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no ACP auth")),
+        "{row}"
+    );
+
+    // An unconfigured id is the client's mistake, and says so.
+    let missing = post_empty(&client, &brain.url("/api/backends/nope/connect")).await;
+    let message = expect_error(missing, 502, "backend_unavailable").await;
+    assert!(message.contains("nope"), "{message}");
+
+    brain.stop().await;
+}
+
 // --- shutdown ----------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -791,6 +858,213 @@ async fn routines_are_created_listed_paused_resumed_and_deleted() {
         "not_found",
     )
     .await;
+
+    brain.stop().await;
+}
+
+// --- credentials -------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_is_written_owner_only_listed_by_name_and_never_echoed() {
+    // A durable brain, because the thing under test is a file in the data dir.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let brain = TestBrain::start_durable_in(dir.path()).await;
+    let client = brain.client();
+
+    // Nothing is there yet.
+    let listed = array(get(&client, &brain.url("/api/secrets")).await).await;
+    assert!(listed.is_empty(), "{listed:?}");
+
+    let response = put(
+        &client,
+        &brain.url("/api/secrets"),
+        &json!({"name": "INFERHUB_API_KEY", "value": "sk-live-do-not-print"}),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 200);
+    let value = body(response).await;
+    assert_eq!(value["name"], json!("INFERHUB_API_KEY"));
+    // The honest answer: the registry resolved its keys at boot, so a changed
+    // value reaches the next process. "hot" would be a lie a caller cannot check.
+    assert_eq!(value["applies"], json!("restart"));
+    let rendered = value.to_string();
+    assert!(
+        !rendered.contains("sk-live-do-not-print"),
+        "a response must never carry the value: {rendered}"
+    );
+
+    // The file is what the boot path reads, and only its owner may read it.
+    let path = dir.path().join("secrets.json");
+    let text = std::fs::read_to_string(&path).expect("the file exists");
+    assert!(text.contains("INFERHUB_API_KEY"));
+    assert!(text.contains("sk-live-do-not-print"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode is {:o}", mode & 0o777);
+    }
+
+    // GET lists the name and the backends that ask for it — never a value.
+    let listed = array(get(&client, &brain.url("/api/secrets")).await).await;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["name"], json!("INFERHUB_API_KEY"));
+    assert_eq!(
+        listed[0]["used_by"],
+        json!([]),
+        "no configured backend names this key: {listed:?}"
+    );
+    assert!(
+        !listed[0].to_string().contains("sk-live"),
+        "the list is names only: {listed:?}"
+    );
+
+    // The value is registered with the log scrubber, so a stray line cannot print
+    // it. That is the half that *is* immediate.
+    assert!(
+        !brain
+            .state
+            .secrets
+            .redact("a line mentioning sk-live-do-not-print")
+            .contains("sk-live-do-not-print"),
+        "the new key is watched by the scrubber"
+    );
+
+    // Replacing keeps the other names; deleting removes exactly one.
+    put(
+        &client,
+        &brain.url("/api/secrets"),
+        &json!({"name": "OTHER_KEY", "value": "sk-other-value"}),
+    )
+    .await;
+    let listed = array(get(&client, &brain.url("/api/secrets")).await).await;
+    assert_eq!(listed.len(), 2, "{listed:?}");
+
+    let response = delete(&client, &brain.url("/api/secrets/OTHER_KEY")).await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(body(response).await["name"], json!("OTHER_KEY"));
+    let listed = array(get(&client, &brain.url("/api/secrets")).await).await;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["name"], json!("INFERHUB_API_KEY"));
+    let kept = std::fs::read_to_string(&path).expect("the file exists");
+    assert!(
+        kept.contains("INFERHUB_API_KEY"),
+        "the other key survives: {kept}"
+    );
+    assert!(
+        !kept.contains("OTHER_KEY"),
+        "the deleted key is gone: {kept}"
+    );
+
+    // Deleting a name the brain does not hold is a 404, so a retried delete does
+    // not look like it removed something new.
+    expect_error(
+        delete(&client, &brain.url("/api/secrets/OTHER_KEY")).await,
+        404,
+        "not_found",
+    )
+    .await;
+
+    // Bad input is refused with the envelope, and writes nothing.
+    for bad in [
+        json!({"name": "", "value": "v"}),
+        json!({"name": "2FA_KEY", "value": "v"}),
+        json!({"name": "A_KEY", "value": "   "}),
+        json!({"name": "A_KEY", "value": "v", "hot": true}),
+    ] {
+        expect_error(
+            put(&client, &brain.url("/api/secrets"), &bad).await,
+            400,
+            "invalid_input",
+        )
+        .await;
+    }
+    let listed = array(get(&client, &brain.url("/api/secrets")).await).await;
+    assert_eq!(
+        listed.len(),
+        1,
+        "a refused write changed nothing: {listed:?}"
+    );
+
+    brain.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoking_sessions_logs_the_cookie_out_and_keeps_the_owner_token() {
+    let brain = TestBrain::start_durable().await;
+    let anonymous = TestBrain::client_with("");
+
+    // Log in the way a browser does, and use the cookie on its own.
+    let response = post(
+        &anonymous,
+        &brain.url("/api/session"),
+        &json!({"token": brain.token()}),
+    )
+    .await;
+    let pair = response
+        .headers()
+        .get("set-cookie")
+        .expect("a session cookie")
+        .to_str()
+        .expect("ascii")
+        .split(';')
+        .next()
+        .expect("a pair")
+        .to_string();
+    assert_eq!(body(response).await["ok"], json!(true));
+
+    let cookie_only = |pair: String| {
+        let anonymous = TestBrain::client_with("");
+        let url = brain.url("/api/health");
+        async move {
+            anonymous
+                .get(url)
+                .header("cookie", pair)
+                .send()
+                .await
+                .expect("the request goes out")
+        }
+    };
+    assert_eq!(
+        cookie_only(pair.clone()).await.status().as_u16(),
+        200,
+        "the cookie authenticates before the revoke"
+    );
+
+    // Revoke: every session dies, and the count says how many.
+    let response = post_empty(&brain.client(), &brain.url("/api/auth/revoke-sessions")).await;
+    assert_eq!(response.status().as_u16(), 200);
+    let value = body(response).await;
+    assert_eq!(value["revoked"], json!(1), "{value}");
+
+    // The cookie that worked a moment ago is refused …
+    expect_error(cookie_only(pair.clone()).await, 401, "unauthorized").await;
+    // … and so is the same session id sent as a bearer, which is the second way a
+    // client can carry one.
+    let as_bearer = TestBrain::client_with(pair.split_once('=').expect("name=value").1);
+    expect_error(
+        get(&as_bearer, &brain.url("/api/health")).await,
+        401,
+        "unauthorized",
+    )
+    .await;
+
+    // The owner token still works: revoking sessions is not rotating the token.
+    assert_eq!(
+        get(&brain.client(), &brain.url("/api/health"))
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+
+    // Idempotent: a retried revoke answers 200 with zero, not a conflict.
+    let again = post_empty(&brain.client(), &brain.url("/api/auth/revoke-sessions")).await;
+    assert_eq!(again.status().as_u16(), 200);
+    assert_eq!(body(again).await["revoked"], json!(0));
 
     brain.stop().await;
 }

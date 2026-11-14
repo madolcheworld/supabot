@@ -16,7 +16,7 @@ use gpui::{App, ClipboardItem, Entity, SharedString, div, prelude::*, px, rgb};
 use swarmbot_contracts::{PolicyCeiling, RootMode};
 
 use crate::proto::Command;
-use crate::state::AppState;
+use crate::state::{AppState, Fetched};
 use crate::theme;
 use crate::widgets::bits::{self, Tone};
 
@@ -163,16 +163,29 @@ fn node_list(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
         .gap_2()
         .child(bits::section_label("PAIRED NODES"));
 
-    if s.nodes.is_empty() {
-        return section.child(
-            div()
-                .text_sm()
-                .text_color(rgb(theme::TEXT_DIM))
-                .child("no nodes paired yet"),
-        );
-    }
+    // Three states, three sentences. "no nodes paired yet" is an instruction to
+    // go and pair one, so it may only be printed when a fetch came back and was
+    // empty — not while the list is unknown (the app just opened, the socket is
+    // down) and not after the fetch failed, where the reason is the useful thing.
+    let nodes = match &s.nodes {
+        Fetched::Unknown => {
+            return section.child(unknown_nodes(s, commands));
+        }
+        Fetched::Failed(reason) => {
+            return section.child(failed_nodes(reason, commands));
+        }
+        Fetched::Ready(nodes) if nodes.is_empty() => {
+            return section.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme::TEXT_DIM))
+                    .child("No nodes are paired with this brain yet."),
+            );
+        }
+        Fetched::Ready(nodes) => nodes,
+    };
 
-    for node in &s.nodes {
+    for node in nodes {
         let caps: Vec<String> = node.capabilities().as_slice().to_vec();
         let declared = node.declared.as_slice().len();
         let approved = node.approved.as_slice().len();
@@ -305,6 +318,72 @@ fn node_list(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
         section = section.child(card);
     }
     section
+}
+
+/// Nothing has asked the brain for its node list yet. The connection's own
+/// label is included, because "still connecting" and "connected but never asked"
+/// are both "unknown" and the owner can act on them differently.
+fn unknown_nodes(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
+    let cmds = commands.clone();
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_sm()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(format!(
+                    "The node list has not been read yet ({}).",
+                    s.conn.label()
+                )),
+        )
+        .child(
+            div().child(
+                bits::button("Load nodes", Tone::Ghost)
+                    .id("load-nodes")
+                    .on_click(move |_, _, _: &mut App| {
+                        let _ = cmds.send(Command::FetchNodes);
+                    }),
+            ),
+        )
+}
+
+/// The fetch failed: the reason, verbatim, and a retry.
+fn failed_nodes(reason: &str, commands: &Sender<Command>) -> gpui::Div {
+    let cmds = commands.clone();
+    div()
+        .w_full()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(theme::NOTICE_ERROR_BORDER))
+        .bg(rgb(theme::NOTICE_ERROR_BG))
+        .p_3()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(theme::NOTICE_ERROR_FG))
+                .child("Could not load the node list"),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::NOTICE_ERROR_FG))
+                .child(reason.to_string()),
+        )
+        .child(
+            div().child(
+                bits::button("Retry", Tone::Ghost)
+                    .id("retry-nodes")
+                    .on_click(move |_, _, _: &mut App| {
+                        let _ = cmds.send(Command::FetchNodes);
+                    }),
+            ),
+        )
 }
 
 fn ceiling_label(ceiling: PolicyCeiling) -> &'static str {

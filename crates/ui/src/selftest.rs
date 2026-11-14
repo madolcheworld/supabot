@@ -319,6 +319,7 @@ pub fn screen_configs() -> Vec<ScreenConfig> {
         ScreenConfig::base(Screen::Routines),
         ScreenConfig::base(Screen::Usage),
         ScreenConfig::base(Screen::Settings),
+        ScreenConfig::base(Screen::Rules),
         palette,
         // The two-column provider menu over a DM: both columns, the search
         // box and the footer render on the live compositor.
