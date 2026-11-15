@@ -17,8 +17,8 @@ that routes a bot's tool call to the right machine — and
 `crates/node/tests/real_brain.rs` pins an in-process brain against the **real
 `swarmbot-node` binary**, including a remote tool call proven by a marker file on
 the node and a decoy on the brain ([`node-protocol.md`](node-protocol.md) §11.1).
-The last full `scripts/check.sh` was **1.547 registered / 1.542 passed, 0 failed,
-5 ignored** (418 s, `swarmbot-ui` included); the ignored ones are the live-gateway
+The last full `scripts/check.sh` was **1.590 registered / 1.585 passed, 0 failed,
+5 ignored** (38 s warm, `swarmbot-ui` included); the ignored ones are the live-gateway
 LLM test behind `PROTO_LIVE_LLM`, the live ACP-agent test behind `PROTO_LIVE_ACP`,
 `node`'s `live_two_process` (D9.26), and two doctests in `store/src/threaded.rs`
 that need a runtime a doctest does not have.

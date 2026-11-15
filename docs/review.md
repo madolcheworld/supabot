@@ -790,6 +790,11 @@ clippy `-D warnings` + 1.419 tes terdaftar, 5 `#[ignore]`).
   render path, bukan tata letak. Tidak ada klik nyata di jendela, dan tidak ada
   tes UI yang menyentuh jaringan, jadi `GET /api/rules`, `DELETE /api/rules/{id}`
   dan `entries_before` belum pernah dipanggil dari UI ke brain sungguhan.
+  *(Diperbarui 2026-11-15: pikselnya sudah dilihat pada sesi yang tidak terkunci,
+  dan empat cacat ditemukan lalu diperbaiki — lihat
+  [`ui.md`](ui.md) §10.1. Butir di atas dipertahankan sebagai catatan apa yang
+  benar pada putaran itu; yang masih terbuka hanyalah **klik**, karena sesi itu
+  hanya bisa dikemudikan dari keyboard.)*
 * **`secrets` bukan hot-reload.** `applies: "restart"` adalah fakta, bukan
   pilihan gaya: `BackendRegistry` me-resolve key sekali saat compose.
 

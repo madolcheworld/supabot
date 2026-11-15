@@ -293,6 +293,12 @@ impl ScreenConfig {
 /// compositor — coverage a headless test cannot give here, because GPUI's
 /// `TestAppContext` is behind the `test-support` feature, which pulls in `x11`
 /// and would not link on this machine.
+/// How many windows `--selftest` opens for [`screen_configs`] as it is written
+/// today. Named so the number has one home: the report, the docs and the exit
+/// check all quote this constant instead of a literal that drifts the moment a
+/// screen is added (it has been 10, then 11, then 12).
+pub const WINDOWS: usize = 12;
+
 pub fn screen_configs() -> Vec<ScreenConfig> {
     let mut graph = ScreenConfig::base(Screen::Conversation);
     graph.graph = true;
@@ -328,4 +334,71 @@ pub fn screen_configs() -> Vec<ScreenConfig> {
         create_bot,
         create_group,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// The window count is the one number `--selftest` asks a human to believe,
+    /// so it has to match the list it is counting. This is the test that fails
+    /// when somebody adds a screen and forgets the report — which is exactly how
+    /// 11 became 12 without the note being updated on the first pass.
+    #[test]
+    fn the_declared_window_count_matches_the_screen_list() {
+        assert_eq!(
+            screen_configs().len(),
+            WINDOWS,
+            "`WINDOWS` is what the report and the docs quote; it must equal the \
+             number of screen configurations actually opened"
+        );
+    }
+
+    /// Every entry has to be a distinct window, or the count overstates the
+    /// coverage: two identical configs would open the same screen twice and still
+    /// add one to the total.
+    #[test]
+    fn every_screen_configuration_is_distinct() {
+        let mut seen = HashSet::new();
+        for cfg in screen_configs() {
+            let key = (
+                format!("{:?}", cfg.screen),
+                cfg.graph,
+                cfg.palette,
+                cfg.provider_menu,
+                cfg.plus_menu,
+                cfg.create_bot,
+                cfg.create_group,
+            );
+            assert!(
+                seen.insert(key.clone()),
+                "duplicate screen configuration {key:?}: the window count would \
+                 claim coverage that does not exist"
+            );
+        }
+    }
+
+    /// Each `Screen` variant is exercised at least once, so adding a variant
+    /// without a window is a red test rather than a screen nobody ever rendered.
+    #[test]
+    fn every_screen_is_rendered_by_at_least_one_window() {
+        let covered: HashSet<String> = screen_configs()
+            .iter()
+            .map(|cfg| format!("{:?}", cfg.screen))
+            .collect();
+        for screen in [
+            Screen::Conversation,
+            Screen::Nodes,
+            Screen::Routines,
+            Screen::Usage,
+            Screen::Settings,
+            Screen::Rules,
+        ] {
+            assert!(
+                covered.contains(&format!("{screen:?}")),
+                "screen {screen:?} has no window in `--selftest`"
+            );
+        }
+    }
 }

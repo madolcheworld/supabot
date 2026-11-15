@@ -18,11 +18,11 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, IntoElement, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Rgba,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window, div, fill, point, prelude::*,
-    px, relative, rgb, size,
+    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, Rgba, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window, div,
+    fill, point, prelude::*, px, relative, rgb, size,
 };
 
 use crate::actions::{
@@ -59,6 +59,11 @@ pub struct TextInput {
     last_starts: Vec<usize>,
     last_ranges: Vec<Range<usize>>,
     last_bounds: Option<Bounds<Pixels>>,
+    /// How far the text is scrolled left so the caret stays inside the field.
+    /// Recorded by the last paint for the same reason `last_bounds` is: mouse
+    /// hit-testing has to convert a window point back into a byte offset, and it
+    /// would land on the wrong character if it ignored this.
+    last_scroll_x: Pixels,
 }
 
 impl TextInput {
@@ -81,6 +86,7 @@ impl TextInput {
             last_starts: Vec::new(),
             last_ranges: Vec::new(),
             last_bounds: None,
+            last_scroll_x: px(0.0),
         }
     }
 
@@ -524,7 +530,8 @@ impl TextInput {
         let lh = f32::from(self.line_height).max(1.0);
         let last = self.last_lines.len() as i32 - 1;
         let line = ((dy / lh).floor() as i32).clamp(0, last) as usize;
-        let display = self.last_lines[line].closest_index_for_x(position.x - bounds.left());
+        let display = self.last_lines[line]
+            .closest_index_for_x(position.x - bounds.left() + self.last_scroll_x);
         self.real_offset(
             self.last_ranges[line].start,
             self.last_ranges[line].end,
@@ -664,6 +671,9 @@ struct PrepaintState {
     line_height: Pixels,
     cursor: Option<PaintQuad>,
     selection: Vec<PaintQuad>,
+    /// Horizontal scroll applied to every painted quad, so the caret cannot
+    /// walk out of the field's clip. See [`TextInput::last_scroll_x`].
+    scroll_x: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -748,6 +758,28 @@ impl Element for TextElement {
             starts.push(range.start);
         }
 
+        // How far to scroll the text left so the caret stays inside the field.
+        //
+        // Shaped lines are laid out at their natural width and nothing wraps
+        // them, so a draft wider than the field used to paint straight out of
+        // the field's border and over whatever sat beside it. Clipping alone
+        // would have hidden the spill but also hidden the caret, making a long
+        // draft un-editable; keeping the caret on screen is what makes the clip
+        // honest. Computed from the caret's own x, so it is 0 until the caret
+        // would leave the visible box.
+        let caret_x = if empty || lines.is_empty() {
+            px(0.0)
+        } else {
+            let offset = input.cursor_offset();
+            let (line, local) = TextInput::line_local_at(offset, &ranges);
+            let line = line.min(lines.len() - 1);
+            let line_start = ranges[line].start;
+            lines[line].x_for_index(input.display_offset(line_start, line_start + local))
+        };
+        // A caret width of slack keeps the caret itself visible rather than
+        // exactly on the boundary.
+        let scroll_x = (caret_x + px(2.0) - bounds.size.width).max(px(0.0));
+
         // Selection highlight, one quad per overlapped line.
         let selection_color = Rgba {
             a: 0.45,
@@ -766,8 +798,8 @@ impl Element for TextElement {
                 let y = bounds.top() + line_height * line;
                 selection.push(fill(
                     Bounds::from_corners(
-                        point(bounds.left() + x0, y),
-                        point(bounds.left() + x1, y + line_height),
+                        point(bounds.left() + x0 - scroll_x, y),
+                        point(bounds.left() + x1 - scroll_x, y + line_height),
                     ),
                     selection_color,
                 ));
@@ -785,7 +817,10 @@ impl Element for TextElement {
             let x = lines[line].x_for_index(input.display_offset(line_start, line_start + local));
             let y = bounds.top() + line_height * line;
             Some(fill(
-                Bounds::new(point(bounds.left() + x, y), size(px(2.0), line_height)),
+                Bounds::new(
+                    point(bounds.left() + x - scroll_x, y),
+                    size(px(2.0), line_height),
+                ),
                 rgb(CARET),
             ))
         };
@@ -797,6 +832,7 @@ impl Element for TextElement {
             line_height,
             cursor,
             selection,
+            scroll_x,
         }
     }
 
@@ -820,31 +856,46 @@ impl Element for TextElement {
             );
         }
 
-        for quad in prepaint.selection.drain(..) {
-            window.paint_quad(quad);
-        }
+        // Everything this widget paints — selection, glyphs, caret — is clipped
+        // to the field's own bounds. Without the mask the text simply drew past
+        // the border: a draft longer than the composer's pill painted over its
+        // rounded edge and under the send button, because shaped lines are
+        // painted at their natural width and nothing in the chain clipped them.
+        // The clip lives here rather than on the caller so no screen can forget
+        // it — every text field in the app is built from this element.
+        let mask = ContentMask { bounds };
+        window.with_content_mask(Some(mask), |window| {
+            for quad in prepaint.selection.drain(..) {
+                window.paint_quad(quad);
+            }
 
-        let line_height = prepaint.line_height;
-        for (line, shaped) in prepaint.lines.iter().enumerate() {
-            let origin = point(bounds.left(), bounds.top() + line_height * line);
-            let _ = shaped.paint(origin, line_height, window, cx);
-        }
+            let line_height = prepaint.line_height;
+            for (line, shaped) in prepaint.lines.iter().enumerate() {
+                let origin = point(
+                    bounds.left() - prepaint.scroll_x,
+                    bounds.top() + line_height * line,
+                );
+                let _ = shaped.paint(origin, line_height, window, cx);
+            }
 
-        if !disabled
-            && focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+            if !disabled
+                && focus_handle.is_focused(window)
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
+            }
+        });
 
         let lines = std::mem::take(&mut prepaint.lines);
         let starts = std::mem::take(&mut prepaint.starts);
         let ranges = std::mem::take(&mut prepaint.ranges);
+        let scroll_x = prepaint.scroll_x;
         self.input.update(cx, |input, _| {
             input.last_lines = lines;
             input.last_starts = starts;
             input.last_ranges = ranges;
             input.last_bounds = Some(bounds);
+            input.last_scroll_x = scroll_x;
         });
     }
 }

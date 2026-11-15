@@ -168,10 +168,16 @@ impl CardView {
 
 /// `mm:ss` until `expires_at`, or "expired"/"no expiry".
 fn countdown(expires_at: Option<chrono::DateTime<Utc>>) -> String {
+    countdown_from(Utc::now(), expires_at)
+}
+
+/// [`countdown`] with the clock passed in, so its three states are assertable
+/// without waiting for one to tick over.
+fn countdown_from(now: chrono::DateTime<Utc>, expires_at: Option<chrono::DateTime<Utc>>) -> String {
     let Some(at) = expires_at else {
         return "no expiry".to_string();
     };
-    let remaining = at.signed_duration_since(Utc::now());
+    let remaining = at.signed_duration_since(now);
     let secs = remaining.num_seconds();
     if secs <= 0 {
         return "expired".to_string();
@@ -194,6 +200,23 @@ fn outcome_line(status: RequestStatus, request: &swarmbot_contracts::RuntimeRequ
             _ => "cancelled".to_string(),
         },
         RequestStatus::Pending => String::new(),
+    }
+}
+
+/// The colour the card's outcome sentence is drawn in.
+///
+/// These are `*_TEXT` tokens, not the vivid status hues: an outcome line is a
+/// 14px sentence inside a raised card, and `SUCCESS`/`WARNING` are fills — 2.2:1
+/// and 1.8:1 on that card surface — so "allowed once" in green was the least
+/// readable thing on the card. The hue still carries the meaning through the
+/// darkened twin, and [`tests::an_outcome_line_is_drawn_in_a_readable_token`]
+/// pins it.
+fn outcome_color(status: RequestStatus) -> u32 {
+    match status {
+        RequestStatus::Answered => theme::SUCCESS_TEXT,
+        RequestStatus::Expired => theme::WARNING_TEXT,
+        RequestStatus::Cancelled => theme::TEXT_DIM,
+        RequestStatus::Pending => theme::TEXT_MUTED,
     }
 }
 
@@ -240,10 +263,15 @@ impl gpui::Render for CardView {
                     .items_center()
                     .gap_2()
                     .child(
+                        // The pill may shrink (a bot handle can be long), so it and
+                        // its label both carry `min_w_0`/`truncate`; the title next
+                        // to it takes the remaining width and does the same. The
+                        // card clips at its own rounded edge as a last resort.
                         div()
                             .flex()
                             .items_center()
                             .gap_1()
+                            .min_w_0()
                             .px_2()
                             .py(px(1.0))
                             .rounded_full()
@@ -259,9 +287,11 @@ impl gpui::Render for CardView {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_xs()
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(bot_meta.1)
+                                    .truncate()
                                     .child(bot_meta.0),
                             ),
                     )
@@ -272,6 +302,7 @@ impl gpui::Render for CardView {
                             .text_sm()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgb(theme::TEXT))
+                            .truncate()
                             .child(request.title()),
                     ),
             );
@@ -319,7 +350,7 @@ impl gpui::Render for CardView {
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(theme::WARNING))
+                                .text_color(rgb(theme::WARNING_TEXT))
                                 .child(format!("expires in {}", countdown(request.expires_at))),
                         )
                         .child(
@@ -374,13 +405,12 @@ impl gpui::Render for CardView {
             }
         } else {
             let line = outcome_line(request.status, &request);
-            let color = match request.status {
-                RequestStatus::Answered => theme::SUCCESS,
-                RequestStatus::Expired => theme::WARNING,
-                RequestStatus::Cancelled => theme::TEXT_DIM,
-                RequestStatus::Pending => theme::TEXT_MUTED,
-            };
-            card = card.child(div().text_sm().text_color(rgb(color)).child(line));
+            card = card.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(outcome_color(request.status)))
+                    .child(line),
+            );
         }
 
         card.into_any_element()
@@ -491,4 +521,86 @@ pub fn placeholder(request_id: &RequestId) -> gpui::Div {
         .text_sm()
         .text_color(rgb(theme::TEXT_DIM))
         .child(format!("card {} (waiting for its request)", request_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// WCAG 2.x relative luminance, local to this file: the colour *pair* under
+    /// test (a status token on a card surface) is chosen here, so the assertion
+    /// has to compute the ratio itself rather than trust a shared helper.
+    fn luminance(color: u32) -> f64 {
+        let channel = |shift: u32| {
+            let v = ((color >> shift) & 0xff) as f64 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+    }
+
+    fn contrast(fg: u32, bg: u32) -> f64 {
+        let (a, b) = (luminance(fg), luminance(bg));
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// The defect: a settled card said what happened in the vivid hue —
+    /// `theme::SUCCESS` for "allowed once" (2.4:1 on the card) and
+    /// `theme::WARNING` for "expired" (2.1:1) — so the one sentence a reader
+    /// needs after the fact was the least legible line on the card.
+    #[test]
+    fn an_outcome_line_is_drawn_in_a_readable_token() {
+        for (status, vivid) in [
+            (RequestStatus::Answered, theme::SUCCESS),
+            (RequestStatus::Expired, theme::WARNING),
+        ] {
+            let color = outcome_color(status);
+            assert_ne!(color, vivid, "{status:?} still uses a fill hue as text");
+            let ratio = contrast(color, theme::SURFACE_RAISED);
+            assert!(
+                ratio >= 4.5,
+                "{status:?} on the card surface is {ratio:.2}:1, under the 4.5:1 bar"
+            );
+            // …and the old pairing is what fails that bar, which is why the
+            // token changed rather than the surface.
+            assert!(
+                contrast(vivid, theme::SURFACE_RAISED) < 4.5,
+                "{status:?}'s fill hue passes the text bar; the twin would be dead weight"
+            );
+        }
+        // The two non-status outcomes keep their muted/dim tiers.
+        assert_eq!(
+            outcome_color(RequestStatus::Cancelled),
+            theme::TEXT_DIM,
+            "a cancelled card is quiet, not coloured"
+        );
+    }
+
+    /// `countdown` is the only clock-dependent label on a card; its three states
+    /// are the ones a card can be wedged in, so they are pinned here.
+    #[test]
+    fn a_countdown_names_itself_rather_than_printing_nothing() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 15, 9, 0, 0)
+            .single()
+            .expect("a real UTC time");
+
+        // No expiry is a state, not an empty string.
+        assert_eq!(countdown_from(now, None), "no expiry");
+        // A minute and a half reads as mm:ss.
+        assert_eq!(
+            countdown_from(now, Some(now + chrono::Duration::seconds(90))),
+            "1:30"
+        );
+        // A past expiry says so instead of counting negatively.
+        assert_eq!(
+            countdown_from(now, Some(now - chrono::Duration::seconds(5))),
+            "expired"
+        );
+    }
 }

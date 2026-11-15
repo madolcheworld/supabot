@@ -11,7 +11,7 @@
 
 use std::sync::mpsc::Sender;
 
-use gpui::{Entity, SharedString, div, prelude::*, px, rgb};
+use gpui::{Entity, Pixels, SharedString, div, prelude::*, px, rgb};
 use serde_json::{Map, Value, json};
 use swarmbot_contracts::{BackendKind, PolicyCeiling, Settings};
 
@@ -31,6 +31,71 @@ const TOKEN_CAP_STEP: i64 = 10_000;
 /// value cell nobody can read. A config file may still set a larger cap; the
 /// stepper then leaves it alone rather than shrinking it.
 const TOKEN_CAP_MAX: u64 = 5_000_000;
+
+/// The height of **every** row in the BRAIN SETTINGS stack: the three toggles,
+/// the two steppers, the two token caps and the ceiling row.
+///
+/// The stack used to size each row from its own content (`py_1` around whatever
+/// happened to be inside), and the rows are not the same height: a toggle row
+/// holds a 12px dot and a 12px word (~28px), while a stepper or ceiling row
+/// holds `Tone::Ghost` buttons — `py_1` around a `text_sm` line box (~34px). So
+/// the text baseline stepped up and down by ~6px as the owner scrolled a list
+/// that should read as one column of rows. A row's height is now a property of
+/// the row, not of its contents.
+pub const SETTINGS_ROW_H: Pixels = px(32.0);
+
+/// One settings row's frame: the same height, padding and vertical centring for
+/// every builder in this file, so the next row added to the stack cannot invent
+/// a fourth height.
+fn settings_row() -> gpui::Div {
+    div().flex().items_center().gap_2().px_2().h(SETTINGS_ROW_H)
+}
+
+/// [`SETTINGS_ROW_H`] as a value, for the test that pins it against the tallest
+/// control a row can hold.
+pub fn settings_row_height() -> Pixels {
+    SETTINGS_ROW_H
+}
+
+/// The tallest thing a settings row puts inside itself: a `bits::button` is
+/// `py_1` (4px above and below) around a `text_sm` line box (~20px), and
+/// [`ghost_button`] adds a 1px ring — 30px. A frame shorter than this clips its
+/// own buttons, which is how the old `py_1` rows measured 28px next to a 34px
+/// one.
+pub fn tallest_row_control_height() -> Pixels {
+    px(30.0)
+}
+
+/// The dot that carries an on/off or selected/unselected state.
+///
+/// "Off" used to be `theme::BORDER` (`#e5e7eb`), which is **1.24:1 on white**:
+/// the off state of every toggle and every radio-dot in the provider menu was
+/// invisible, so a control showed a state only when it was on. `TEXT_DIM`
+/// (`#5f6976`) is 5.6:1 on white and 5.1:1 on the card surfaces, so both states
+/// are drawn and the pair reads as a state, not as a presence/absence.
+pub fn state_dot(on: bool) -> u32 {
+    if on { theme::SUCCESS } else { theme::TEXT_DIM }
+}
+
+/// The ring around a `Tone::Ghost` button drawn on a `SURFACE` card.
+///
+/// `Tone::Ghost`'s face is `SURFACE_RAISED` (`#ececee`) and the card behind it is
+/// `SURFACE` (`#f7f7f8`) — **1.09:1**, so the button had no perceivable edge and
+/// read as plain text. `theme::BORDER` (`#e5e7eb`) is 1.15:1 here, still far
+/// under the 3:1 a UI-component boundary owes (WCAG 1.4.11), so the local ring is
+/// `TEXT_DIM`: 5.1:1 on the card. `widgets/bits.rs` is shared with views that are
+/// not mine to change, so the fix is a local builder rather than a change to
+/// `Tone::Ghost`'s palette.
+pub const GHOST_BORDER: u32 = theme::TEXT_DIM;
+
+/// A `Tone::Ghost` button with a boundary you can actually see; see
+/// [`GHOST_BORDER`]. Use this instead of `bits::button(label, Tone::Ghost)` on a
+/// card surface.
+pub(crate) fn ghost_button(label: &str) -> gpui::Div {
+    bits::button(label, Tone::Ghost)
+        .border_1()
+        .border_color(rgb(GHOST_BORDER))
+}
 
 /// The keys Save will PATCH, computed by diffing `saved` against `draft`. Only
 /// changed scalar keys and a changed `safety` map are included; an unchanged
@@ -157,12 +222,31 @@ impl ConnectionState {
         }
     }
 
+    /// The **fill** colour for this state: a 7–9px status dot, a ring. The vivid
+    /// hues are right at that size and unreadable as text (`SUCCESS` is 2.4:1 on
+    /// white), so a word next to the dot uses [`Self::text_tone`], not this.
     pub fn tone(self) -> u32 {
         match self {
             Self::NotChecked => theme::TEXT_DIM,
             Self::Connected => theme::SUCCESS,
             Self::NeedsLogin => theme::WARNING,
             Self::Failed => theme::DANGER,
+        }
+    }
+
+    /// The same state as **text**: the `*_TEXT` twins, which clear 4.5:1 on the
+    /// card a backend row is drawn on.
+    ///
+    /// Two functions instead of one because the row shows both at once — a dot
+    /// and the word "connected" — and one colour cannot serve a 9px dot and a
+    /// 12px word. The badge used to take [`Self::tone`] as its foreground, so the
+    /// app's own health readout was green-on-light at 2.4:1.
+    pub fn text_tone(self) -> u32 {
+        match self {
+            Self::NotChecked => theme::TEXT_DIM,
+            Self::Connected => theme::SUCCESS_TEXT,
+            Self::NeedsLogin => theme::WARNING_TEXT,
+            Self::Failed => theme::DANGER_TEXT,
         }
     }
 }
@@ -218,15 +302,11 @@ pub fn render(
         .size_full()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .px_4()
-                .py_2()
-                .text_lg()
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(rgb(theme::TEXT))
-                .child("Settings"),
-        )
+        // One title row for every non-conversation screen (`HEADER_H`, with the
+        // divider this screen used to be missing). The hand-built `px_4 py_2`
+        // row was ~39px, so moving between Settings and the conversation shifted
+        // every row below the title by 17px.
+        .child(bits::screen_header("Settings", None, div()))
         .child(
             div()
                 .id("settings-scroll")
@@ -254,13 +334,11 @@ fn backends_section(
             .flex()
             .items_center()
             .child(div().flex_1().child(bits::section_label("BACKENDS")))
-            .child(
-                bits::button("Probe", Tone::Ghost)
-                    .id("probe-backends")
-                    .on_click(move |_, _, _: &mut gpui::App| {
-                        let _ = commands_probe.send(Command::ProbeBackends);
-                    }),
-            ),
+            .child(ghost_button("Probe").id("probe-backends").on_click(
+                move |_, _, _: &mut gpui::App| {
+                    let _ = commands_probe.send(Command::ProbeBackends);
+                },
+            )),
     );
 
     let has_real = s
@@ -324,7 +402,9 @@ fn backends_section(
                     .child(bits::badge(
                         connection.label(),
                         theme::SURFACE_RAISED,
-                        connection.tone(),
+                        // The word, not the dot: `tone()` is a fill hue and green
+                        // text on this pill is 2.1:1.
+                        connection.text_tone(),
                     ))
                     .children(connect_button(
                         &backend_id,
@@ -367,7 +447,8 @@ fn backends_section(
         }
 
         if let Some(probe) = probe {
-            let color = connection.tone();
+            // `text_xs` at 12px: the readable twin, not the fill hue.
+            let color = connection.text_tone();
             card = card.child(
                 div()
                     .flex()
@@ -549,7 +630,7 @@ fn login_panel(
                     )
                     .into_any_element()
             } else {
-                bits::button("Log in", Tone::Ghost)
+                ghost_button("Log in")
                     .id(SharedString::from(format!("connect-{backend}-{method_id}")))
                     .on_click(move |_, _, cx: &mut gpui::App| {
                         let mut send = false;
@@ -571,7 +652,7 @@ fn login_panel(
         if let Some(command) = &command {
             let copy = command.clone();
             row = row.child(
-                bits::button("Copy login command", Tone::Ghost)
+                ghost_button("Copy login command")
                     .id(SharedString::from(format!(
                         "copy-login-{backend}-{method_id}"
                     )))
@@ -759,7 +840,7 @@ fn roster_skills_section(
 
         if !editing {
             skills_row = skills_row.child(
-                bits::button("Edit", Tone::Ghost)
+                ghost_button("Edit")
                     .id(SharedString::from(format!(
                         "edit-skills-{}",
                         bot.id.as_str()
@@ -810,7 +891,7 @@ fn roster_skills_section(
                             .justify_end()
                             .gap_2()
                             .child(
-                                bits::button("Cancel", Tone::Ghost)
+                                ghost_button("Cancel")
                                     .id(SharedString::from(format!(
                                         "cancel-skills-{}",
                                         bot.id.as_str()
@@ -950,13 +1031,11 @@ fn settings_section(
                     .text_color(rgb(theme::TEXT_DIM))
                     .child("settings not loaded"),
             )
-            .child(
-                bits::button("Load settings", Tone::Ghost)
-                    .id("load-settings")
-                    .on_click(move |_, _, _: &mut gpui::App| {
-                        let _ = commands_fetch.send(Command::FetchSettings);
-                    }),
-            );
+            .child(ghost_button("Load settings").id("load-settings").on_click(
+                move |_, _, _: &mut gpui::App| {
+                    let _ = commands_fetch.send(Command::FetchSettings);
+                },
+            ));
     };
 
     let mut section = div()
@@ -1053,19 +1132,11 @@ where
     F: Fn(&mut Settings) + 'static,
 {
     let state_h = state.clone();
-    div()
+    settings_row()
         .id(SharedString::from(format!("toggle-{label}")))
-        .flex()
-        .items_center()
-        .gap_2()
-        .px_2()
-        .py_1()
         .rounded_md()
         .cursor_pointer()
-        .child(bits::dot(
-            if value { theme::SUCCESS } else { theme::BORDER },
-            px(12.0),
-        ))
+        .child(bits::dot(state_dot(value), px(12.0)))
         .child(
             div()
                 .flex_1()
@@ -1123,12 +1194,7 @@ where
     let state_inc = state.clone();
     let setter_dec = setter.clone();
     let setter_inc = setter;
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .px_2()
-        .py_1()
+    settings_row()
         .child(
             div()
                 .flex_1()
@@ -1137,7 +1203,7 @@ where
                 .child(label.to_string()),
         )
         .child(
-            bits::button("−", Tone::Ghost)
+            ghost_button("−")
                 .id(SharedString::from(format!("dec-{label}")))
                 .on_click(move |_, _, cx: &mut gpui::App| {
                     state_dec.update(cx, |s, cx| {
@@ -1157,7 +1223,7 @@ where
                 .child(shown),
         )
         .child(
-            bits::button("+", Tone::Ghost)
+            ghost_button("+")
                 .id(SharedString::from(format!("inc-{label}")))
                 .on_click(move |_, _, cx: &mut gpui::App| {
                     state_inc.update(cx, |s, cx| {
@@ -1171,7 +1237,7 @@ where
 }
 
 fn ceiling_row(current: PolicyCeiling, state: &Entity<AppState>) -> gpui::Div {
-    let mut row = div().flex().items_center().gap_2().px_2().py_1().child(
+    let mut row = settings_row().child(
         div()
             .flex_1()
             .text_sm()
@@ -1185,23 +1251,27 @@ fn ceiling_row(current: PolicyCeiling, state: &Entity<AppState>) -> gpui::Div {
     ] {
         let active = ceiling == current;
         let state_h = state.clone();
+        // The unselected ceilings are `Ghost` buttons on the white pane: the
+        // ringed variant, so three choices read as three controls.
+        let button = if active {
+            bits::button(ceiling_label(ceiling), Tone::Primary)
+        } else {
+            ghost_button(ceiling_label(ceiling))
+        };
         row = row.child(
-            bits::button(
-                ceiling_label(ceiling),
-                if active { Tone::Primary } else { Tone::Ghost },
-            )
-            .id(SharedString::from(format!(
-                "ceiling-{}",
-                ceiling_label(ceiling)
-            )))
-            .on_click(move |_, _, cx: &mut gpui::App| {
-                state_h.update(cx, |s, cx| {
-                    if let Some(draft) = &mut s.settings_draft {
-                        draft.safety.default = ceiling;
-                    }
-                    cx.notify();
-                });
-            }),
+            button
+                .id(SharedString::from(format!(
+                    "ceiling-{}",
+                    ceiling_label(ceiling)
+                )))
+                .on_click(move |_, _, cx: &mut gpui::App| {
+                    state_h.update(cx, |s, cx| {
+                        if let Some(draft) = &mut s.settings_draft {
+                            draft.safety.default = ceiling;
+                        }
+                        cx.notify();
+                    });
+                }),
         );
     }
     row
@@ -1229,6 +1299,27 @@ mod tests {
     use super::*;
     use swarmbot_client::{BackendAuthMethod, BackendProbe};
     use swarmbot_contracts::PolicyCeiling;
+
+    /// WCAG 2.x contrast ratio for two `0xrrggbb` colours. Recomputed here rather
+    /// than shared with `theme`'s own test module: the palette test proves the
+    /// tokens are legible, this one proves *these views* picked the legible one.
+    fn contrast(fg: u32, bg: u32) -> f64 {
+        let luminance = |color: u32| {
+            let channel = |shift: u32| {
+                let v = ((color >> shift) & 0xff) as f64 / 255.0;
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let (r, g, b) = (channel(16), channel(8), channel(0));
+            0.2126 * r + 0.7152 * g + 0.0722 * b
+        };
+        let (a, b) = (luminance(fg), luminance(bg));
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
 
     fn probe(ok: bool, auth_required: bool, methods: Vec<BackendAuthMethod>) -> BackendProbe {
         BackendProbe {
@@ -1577,5 +1668,109 @@ mod tests {
             "the patch carries the parsed list: {}",
             call.detail
         );
+    }
+
+    /// The BRAIN SETTINGS stack is one column of rows, so its rows are one
+    /// height. The defect: every row sized itself from its own content (`py_1`
+    /// around a 12px dot gives ~28px, around a `Tone::Ghost` button ~34px), so
+    /// the text baseline stepped in and out by ~6px as the list scrolled.
+    #[test]
+    fn every_settings_row_is_one_height_whatever_it_holds() {
+        assert_eq!(settings_row_height(), px(32.0), "the one shared row height");
+        // `Pixels` has no ordering, so the comparison is the ratio it divides to.
+        assert!(
+            settings_row_height() / tallest_row_control_height() >= 1.0,
+            "a row shorter than the tallest control ({:?}) clips it",
+            tallest_row_control_height()
+        );
+        // The two row kinds that used to disagree: a dot row and a button row,
+        // both with `py_1`'s 8px of vertical padding.
+        let old_dot_row = px(12.0) + px(8.0);
+        let old_button_row = tallest_row_control_height() + px(8.0);
+        assert_ne!(
+            old_dot_row, old_button_row,
+            "the stair-step: content-sized rows are not the same height"
+        );
+        // Both kinds now take the same row height, which is the fix.
+        assert_eq!(settings_row_height(), px(32.0));
+    }
+
+    /// A connection badge is 12px text on a light pill, so it takes the readable
+    /// twin of the status hue: `SUCCESS` on `SURFACE_RAISED` is 2.1:1, which made
+    /// the app's own health readout its least legible text. The dot beside it
+    /// keeps the vivid fill, which is what a fill is for.
+    #[test]
+    fn a_connection_badge_is_text_and_takes_the_readable_twin() {
+        for state in [
+            ConnectionState::NotChecked,
+            ConnectionState::Connected,
+            ConnectionState::NeedsLogin,
+            ConnectionState::Failed,
+        ] {
+            let ratio = contrast(state.text_tone(), theme::SURFACE_RAISED);
+            assert!(
+                ratio >= 4.5,
+                "{state:?} badge text is {ratio:.2}:1 on the pill, under the 4.5:1 bar"
+            );
+        }
+        assert_eq!(ConnectionState::Connected.text_tone(), theme::SUCCESS_TEXT);
+        assert_eq!(ConnectionState::NeedsLogin.text_tone(), theme::WARNING_TEXT);
+        assert_eq!(ConnectionState::Failed.text_tone(), theme::DANGER_TEXT);
+        // …and the fill hue stays the dot's colour, deliberately below the text
+        // bar: a 9px dot you can see and a 12px word you can read are two values.
+        assert_eq!(ConnectionState::Connected.tone(), theme::SUCCESS);
+        assert!(
+            contrast(ConnectionState::Connected.tone(), theme::SURFACE_RAISED) < 4.5,
+            "the fill hue is not body text; that is why the twins exist"
+        );
+    }
+
+    /// "Off" is a state, not the absence of one. It used to be `BORDER`
+    /// (`#e5e7eb`) — 1.24:1 on white, 1.09:1 on the card — so the off state of
+    /// every toggle was invisible and a control showed only its "on".
+    #[test]
+    fn the_off_dot_is_visible_rather_than_the_border_colour() {
+        assert_eq!(state_dot(true), theme::SUCCESS);
+        assert_eq!(state_dot(false), theme::TEXT_DIM);
+        assert_ne!(
+            state_dot(false),
+            theme::BORDER,
+            "BORDER is the invisible colour this replaced"
+        );
+        for surface in [theme::BACKGROUND, theme::SURFACE, theme::SURFACE_RAISED] {
+            let ratio = contrast(state_dot(false), surface);
+            assert!(
+                ratio >= 3.0,
+                "off dot on {surface:#x} is {ratio:.2}:1 — under the 3:1 a UI component owes"
+            );
+        }
+        assert!(
+            contrast(theme::BORDER, theme::BACKGROUND) < 3.0,
+            "the old colour, for the record"
+        );
+    }
+
+    /// A `Ghost` button on a card needs an edge of its own. Its face
+    /// (`SURFACE_RAISED`) is 1.09:1 against the `SURFACE` card it sits on, and
+    /// `BORDER` only reaches 1.15:1 — both under the 3:1 a component boundary
+    /// owes, so the button read as plain text with no shape.
+    #[test]
+    fn a_ghost_button_gets_a_boundary_you_can_see() {
+        assert!(
+            contrast(theme::SURFACE_RAISED, theme::SURFACE) < 3.0,
+            "the fill alone is not a boundary"
+        );
+        assert!(
+            contrast(theme::BORDER, theme::SURFACE) < 3.0,
+            "a BORDER-coloured ring would still be invisible here"
+        );
+        assert_eq!(GHOST_BORDER, theme::TEXT_DIM);
+        for surface in [theme::BACKGROUND, theme::SURFACE, theme::SURFACE_RAISED] {
+            let ratio = contrast(GHOST_BORDER, surface);
+            assert!(
+                ratio >= 3.0,
+                "the ring on {surface:#x} is {ratio:.2}:1, under the 3:1 bar"
+            );
+        }
     }
 }

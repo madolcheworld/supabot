@@ -33,42 +33,17 @@ pub fn render(s: &AppState, _state: &Entity<AppState>, commands: &Sender<Command
         .size_full()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .px_4()
-                .py_2()
-                .flex()
-                .items_center()
-                .justify_between()
-                .border_b_1()
-                .border_color(rgb(theme::BORDER))
-                .child(
-                    div()
-                        .flex()
-                        .items_baseline()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_lg()
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(theme::TEXT))
-                                .child("Approval rules"),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(theme::TEXT_MUTED))
-                                .child("saved answers that skip the card"),
-                        ),
-                )
-                .child(
-                    bits::button("Refresh", Tone::Ghost)
-                        .id("refresh-rules")
-                        .on_click(move |_, _, _: &mut App| {
-                            let _ = commands_refresh.send(Command::FetchRules);
-                        }),
-                ),
-        )
+        .child(bits::screen_header(
+            "Approval rules",
+            Some("saved answers that skip the card"),
+            div().flex().items_center().gap_2().child(
+                bits::button("Refresh", Tone::Ghost)
+                    .id("refresh-rules")
+                    .on_click(move |_, _, _: &mut App| {
+                        let _ = commands_refresh.send(Command::FetchRules);
+                    }),
+            ),
+        ))
         .child(
             div()
                 .id("rules-scroll")
@@ -191,19 +166,43 @@ pub fn effect_label(effect: RuleEffect) -> &'static str {
     }
 }
 
-fn effect_tone(effect: RuleEffect) -> u32 {
-    match effect {
-        RuleEffect::Allow => theme::SUCCESS,
-        RuleEffect::Ask => theme::WARNING,
-        RuleEffect::Deny => theme::DANGER,
-    }
+/// The two colours of an effect pill: a pale tint of the status hue as the
+/// **fill**, and that hue's readable twin as the **word**.
+///
+/// The pill used to be `SURFACE_RAISED` grey with the word drawn in the raw
+/// status hue, and those hues are fills, not text: at 12px the word measured
+/// 1.8:1 for `ask`, 2.2:1 for `allow` and 3.2:1 for `deny` on that grey — the
+/// three states this screen exists to tell apart were its three least legible
+/// words. Tinting the fill keeps the at-a-glance colour coding, and the `*_TEXT`
+/// twin keeps the word above the 4.5:1 body-text bar;
+/// [`tests::every_effect_pill_is_a_readable_pair`] computes both ratios from
+/// these values, so the pairing cannot drift back.
+fn effect_colors(effect: RuleEffect) -> (u32, u32) {
+    let (hue, text) = match effect {
+        RuleEffect::Allow => (theme::SUCCESS, theme::SUCCESS_TEXT),
+        RuleEffect::Ask => (theme::WARNING, theme::WARNING_TEXT),
+        RuleEffect::Deny => (theme::DANGER, theme::DANGER_TEXT),
+    };
+    (tint(hue, 0.12), text)
+}
+
+/// Blend a colour toward white by `amount` (0..1), clamped: the pale pill face a
+/// status hue wears when it is a background rather than a 9px dot.
+fn tint(color: u32, amount: f32) -> u32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let toward_white = 255.0 * (1.0 - amount);
+    let channel = |shift: u32| {
+        let value = (((color >> shift) & 0xff) as f32 * amount + toward_white).round();
+        (value as u32).min(255) << shift
+    };
+    channel(16) | channel(8) | channel(0)
 }
 
 fn rule_card(rule: &ApprovalRule, commands: &Sender<Command>) -> gpui::Div {
     let cmds = commands.clone();
     let id = rule.id.clone();
     let effect = effect_label(rule.effect);
-    let tone = effect_tone(rule.effect);
+    let (effect_bg, effect_fg) = effect_colors(rule.effect);
 
     let scope = match &rule.scope {
         RuleScope::Global => "every bot".to_string(),
@@ -220,35 +219,43 @@ fn rule_card(rule: &ApprovalRule, commands: &Sender<Command>) -> gpui::Div {
         .flex()
         .flex_col()
         .gap_1()
+        // A fixed rounded surface: a long matcher title must not paint over the
+        // corner radius or out past the border.
+        .overflow_hidden()
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(bits::badge(effect, theme::SURFACE_RAISED, tone))
+                .child(bits::badge(effect, effect_bg, effect_fg))
                 .child(
                     div()
+                        .min_w_0()
                         .text_sm()
                         .font_weight(gpui::FontWeight::BOLD)
                         .text_color(rgb(theme::TEXT))
+                        .truncate()
                         .child(matcher_title(rule)),
                 )
                 .child(div().flex_1())
                 .child(
                     div()
+                        .flex_none()
                         .text_xs()
                         .text_color(rgb(theme::TEXT_DIM))
                         .child(time::day_label_here(rule.created_at)),
                 )
                 .child(
-                    bits::button("Delete", Tone::Danger)
-                        .id(gpui::SharedString::from(format!(
-                            "delete-rule-{}",
-                            rule.id.as_str()
-                        )))
-                        .on_click(move |_, _, _: &mut App| {
-                            let _ = cmds.send(Command::DeleteRule(id.clone()));
-                        }),
+                    div().flex_none().child(
+                        bits::button("Delete", Tone::Danger)
+                            .id(gpui::SharedString::from(format!(
+                                "delete-rule-{}",
+                                rule.id.as_str()
+                            )))
+                            .on_click(move |_, _, _: &mut App| {
+                                let _ = cmds.send(Command::DeleteRule(id.clone()));
+                            }),
+                    ),
                 ),
         )
         .child(bits::kv("scope", scope))
@@ -273,7 +280,7 @@ fn rule_card(rule: &ApprovalRule, commands: &Sender<Command>) -> gpui::Div {
         card = card.child(
             div()
                 .text_xs()
-                .text_color(rgb(theme::DANGER))
+                .text_color(rgb(theme::DANGER_TEXT))
                 .child("no matcher: this rule decides every request in its scope"),
         );
     }
@@ -324,6 +331,77 @@ mod tests {
             command_prefix: None,
             effect,
             created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// WCAG 2.x relative luminance for an `0xrrggbb` colour. Duplicated from
+    /// `theme`'s own test on purpose: this file asserts a *pair* of colours it
+    /// chooses (a tinted pill and the word on it), which the theme cannot know
+    /// about, and a test that trusted a helper it also tests proves nothing.
+    fn luminance(color: u32) -> f64 {
+        let channel = |shift: u32| {
+            let v = ((color >> shift) & 0xff) as f64 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+    }
+
+    fn contrast(fg: u32, bg: u32) -> f64 {
+        let (a, b) = (luminance(fg), luminance(bg));
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// The defect: "allow", "ask" and "deny" were drawn in the raw status hues on
+    /// a `SURFACE_RAISED` pill — 2.1:1, ~2.0:1 and 3.5:1 at 12px, i.e. the three
+    /// words the screen exists to distinguish were its three least readable. The
+    /// pill keeps the hue as a fill; the word must clear 4.5:1 on it.
+    #[test]
+    fn every_effect_pill_is_a_readable_pair() {
+        for (effect, vivid, twin) in [
+            (RuleEffect::Allow, theme::SUCCESS, theme::SUCCESS_TEXT),
+            (RuleEffect::Ask, theme::WARNING, theme::WARNING_TEXT),
+            (RuleEffect::Deny, theme::DANGER, theme::DANGER_TEXT),
+        ] {
+            let (fill, word) = effect_colors(effect);
+            assert_eq!(
+                word, twin,
+                "{:?} must be drawn in its readable twin, not the fill hue",
+                effect
+            );
+            assert_ne!(word, vivid, "{:?} still uses the fill hue as text", effect);
+
+            let on_pill = contrast(word, fill);
+            assert!(
+                on_pill >= 4.5,
+                "{:?}: '{}' on its pill is {on_pill:.2}:1, under the 4.5:1 body-text bar",
+                effect,
+                effect_label(effect)
+            );
+
+            // The old pairing is what fails the bar, which is why the pill changed
+            // rather than the type size.
+            let old = contrast(vivid, theme::SURFACE_RAISED);
+            assert!(
+                old < 4.5,
+                "{:?} as text on the old grey pill is {old:.2}:1 — that is the defect",
+                effect
+            );
+
+            // The pill is a *tint of the hue*, so it still reads as allow/ask/deny
+            // at a glance — a grey pill with a dark word would pass the ratio and
+            // lose the whole point of the colour.
+            assert_ne!(fill, theme::SURFACE_RAISED, "{:?} lost its hue", effect);
+            assert_ne!(fill, vivid, "{:?} pill is the raw fill, not a tint", effect);
+            assert!(
+                luminance(fill) > luminance(vivid),
+                "{:?} pill must be paler than the hue it tints",
+                effect
+            );
         }
     }
 

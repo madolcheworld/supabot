@@ -43,6 +43,25 @@ pub fn moment_label_here(at: DateTime<Utc>) -> String {
     moment_label(Local::now().fixed_offset(), at)
 }
 
+/// Just the clock, in the viewer's zone: `8:41 AM`.
+///
+/// The bubble header used to call `entry.created_at.format("%H:%M")` on a
+/// `DateTime<Utc>`, so one row could read "Today 8:41 AM" in the separator above
+/// it and "01:41" in the header — two different numbers for one instant, one of
+/// them in a zone the reader never chose. A transcript that misstates the hour is
+/// the same class of bug [`moment_label`] exists to prevent, so the header goes
+/// through this function instead of formatting the UTC value directly.
+pub fn clock_label(now: DateTime<FixedOffset>, at: DateTime<Utc>) -> String {
+    at.with_timezone(&now.timezone())
+        .format("%-I:%M %p")
+        .to_string()
+}
+
+/// [`clock_label`] against this machine's clock.
+pub fn clock_label_here(at: DateTime<Utc>) -> String {
+    clock_label(Local::now().fixed_offset(), at)
+}
+
 /// Just the day, for a row whose time of day is noise (`Nov 3`,
 /// `Nov 3, 2025`).
 pub fn day_label(now: DateTime<FixedOffset>, at: DateTime<Utc>) -> String {
@@ -146,5 +165,23 @@ mod tests {
         assert_eq!(day_label(now, utc(2026, 11, 13, 1, 0)), "Yesterday");
         assert_eq!(day_label(now, utc(2026, 3, 2, 1, 0)), "Mar 2");
         assert_eq!(day_label(now, utc(2024, 3, 2, 1, 0)), "Mar 2, 2024");
+    }
+
+    /// The bug: a bubble header printed the UTC hour ("01:41") under a separator
+    /// that printed the local one ("Today 8:41 AM"). Both label the same instant,
+    /// so they must agree — in the viewer's zone, with an AM/PM the transcript's
+    /// other labels already use.
+    #[test]
+    fn a_bubble_clock_matches_the_separator_above_it_in_the_viewers_zone() {
+        let now = now(2026, 11, 15, 8, 45);
+        let at = utc(2026, 11, 15, 1, 41);
+        assert_eq!(clock_label(now, at), "8:41 AM");
+        // …and it is the same hour the day separator states for that instant,
+        // which is the property a reader actually relies on.
+        assert_eq!(moment_label(now, at), "Today 8:41 AM");
+        assert!(
+            moment_label(now, at).ends_with(&clock_label(now, at)),
+            "the separator's tail and the bubble's clock are one string"
+        );
     }
 }

@@ -26,22 +26,55 @@ pub const SURFACE: u32 = 0xf7f7f8;
 pub const SURFACE_RAISED: u32 = 0xececee;
 /// Separators and hairline borders (`#e5e7eb`).
 pub const BORDER: u32 = 0xe5e7eb;
-/// Primary text (`#111827`).
+/// Primary text (`#111827`). 16.0:1 on `BACKGROUND`.
 pub const TEXT: u32 = 0x111827;
-/// Secondary text and labels (`#6b7280`).
-pub const TEXT_MUTED: u32 = 0x6b7280;
-/// Status text, timestamps (`#9ca3af`).
-pub const TEXT_DIM: u32 = 0x9ca3af;
-/// Primary action / accent (`#2563eb`).
-pub const ACCENT: u32 = 0x2563eb;
-/// Accent hover, a little darker.
-pub const ACCENT_HOVER: u32 = 0x1d4ed8;
-/// Destructive / error / denied (`#ef4444`).
+/// Secondary text and labels (`#4b5563`). 7.6:1 on `BACKGROUND`.
+///
+/// Darker than it used to be (`#6b7280`), not for taste: the *third* tier below
+/// was `#9ca3af`, which is **2.5:1** on white — under WCAG AA's 4.5:1 for body
+/// text, and it was the colour of every timestamp, section heading, preview line
+/// and helper sentence in the app. Meeting 4.5:1 needs `#6b7280`, so that value
+/// moved down a tier and this one moved darker to keep three readable levels
+/// instead of two-and-a-half. [`tests::every_text_token_is_legible_on_its_surface`]
+/// computes the ratios from these constants, so the palette cannot quietly drift
+/// back under the line.
+pub const TEXT_MUTED: u32 = 0x4b5563;
+/// The faintest text tier: timestamps, metadata, section labels (`#5f6976`).
+/// 5.57:1 on `BACKGROUND`, 4.72:1 on the darkest surface it is drawn on
+/// (`SURFACE_RAISED`) — that last number is the one that sets the value, because
+/// timestamps sit inside raised cards as well as on white.
+pub const TEXT_DIM: u32 = 0x5f6976;
+/// Primary action / accent (`#1d4ed8`).
+///
+/// One step darker than the `#2563eb` this used to be, because the accent is
+/// used as *text* as well as a fill ("sent · addressed" in the top bar) and
+/// `#2563eb` is 4.38:1 on `SURFACE_RAISED` — under the bar by a hair. At
+/// `#1d4ed8` it is 5.68:1 there and 6.70:1 on white, and white-on-accent (the
+/// primary button) improves from 5.17:1 to 6.70:1 in the same move.
+pub const ACCENT: u32 = 0x1d4ed8;
+/// Accent hover, a little darker (`#1e3a8a`).
+pub const ACCENT_HOVER: u32 = 0x1e3a8a;
+/// Destructive / error / denied (`#ef4444`). A **fill** colour: 3.5:1 on white,
+/// which is fine for a dot, a border or a button face and not enough for text.
 pub const DANGER: u32 = 0xef4444;
-/// Success / online / allow (`#10b981`).
+/// Success / online / allow (`#10b981`). A fill colour (2.4:1 on white).
 pub const SUCCESS: u32 = 0x10b981;
-/// Warning / queued / expiry soon (`#f59e0b`).
+/// Warning / queued / expiry soon (`#f59e0b`). A fill colour (2.1:1 on white).
 pub const WARNING: u32 = 0xf59e0b;
+/// The same three hues as **text**, darkened until each clears 4.5:1 on the light
+/// surfaces they are drawn on (5.5:1, 7.1:1 and 5.9:1 respectively).
+///
+/// The vivid values above are right for a 9px status dot and wrong for the word
+/// next to it: "connected" in `#10b981` is 2.4:1, so the app's own health
+/// indicator was the least legible text on the row. Two tokens instead of one is
+/// the honest split — a hue you can see at 9px and a hue you can read at 12px are
+/// different colours, and pretending otherwise is how a palette ends up with
+/// text nobody can read.
+pub const DANGER_TEXT: u32 = 0xb91c1c;
+/// See [`DANGER_TEXT`].
+pub const SUCCESS_TEXT: u32 = 0x047857;
+/// See [`DANGER_TEXT`].
+pub const WARNING_TEXT: u32 = 0x92400e;
 /// Owner bubble background (solid black `#000000` like in the screenshot).
 pub const OWNER_BUBBLE: u32 = 0x000000;
 /// Bot bubble background (a clean soft grey `#f3f4f6`).
@@ -142,4 +175,108 @@ pub mod space {
     pub const GRAPH_W: Pixels = px(320.0);
     pub const AVATAR: Pixels = px(32.0);
     pub const HEADER_H: Pixels = px(56.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG 2.x relative luminance for an `0xrrggbb` colour: sRGB channels are
+    /// linearised, then weighted 0.2126/0.7152/0.0722.
+    fn luminance(color: u32) -> f64 {
+        let channel = |shift: u32| {
+            let v = ((color >> shift) & 0xff) as f64 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let (r, g, b) = (channel(16), channel(8), channel(0));
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    fn contrast(fg: u32, bg: u32) -> f64 {
+        let (a, b) = (luminance(fg), luminance(bg));
+        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// The table is the promise: every token the views use for **text** must
+    /// clear the 4.5:1 body-text bar on every surface it is drawn on. It did
+    /// not — `TEXT_DIM` was `#9ca3af`, which is 2.5:1 on white and was the
+    /// colour of every timestamp, preview line and section heading in the app.
+    /// A reader who cannot read a timestamp is as blocked as one who cannot
+    /// read the message, so this is a defect with a number attached, not taste.
+    #[test]
+    fn every_text_token_is_legible_on_its_surface() {
+        let surfaces = [
+            ("BACKGROUND", BACKGROUND),
+            ("SURFACE", SURFACE),
+            ("SURFACE_RAISED", SURFACE_RAISED),
+            ("BOT_BUBBLE", BOT_BUBBLE),
+        ];
+        let tokens = [
+            ("TEXT", TEXT),
+            ("TEXT_MUTED", TEXT_MUTED),
+            ("TEXT_DIM", TEXT_DIM),
+            ("ACCENT", ACCENT),
+            ("ACCENT_HOVER", ACCENT_HOVER),
+            ("DANGER_TEXT", DANGER_TEXT),
+            ("SUCCESS_TEXT", SUCCESS_TEXT),
+            ("WARNING_TEXT", WARNING_TEXT),
+        ];
+        for (token_name, token) in tokens {
+            for (surface_name, surface) in surfaces {
+                let ratio = contrast(token, surface);
+                assert!(
+                    ratio >= 4.5,
+                    "{token_name} on {surface_name} is {ratio:.2}:1, under the 4.5:1 body-text bar"
+                );
+            }
+        }
+    }
+
+    /// The vivid status hues are fills (a 9px dot, a button face), not text: they
+    /// are *allowed* to fail the text bar, and this test says so out loud so
+    /// nobody "fixes" the split by darkening the dot until it disappears. What it
+    /// does require is that each fill hue is distinguishable from its own surface —
+    /// a status dot that cannot be seen is not a status.
+    #[test]
+    fn status_fills_are_visible_even_though_they_are_not_body_text() {
+        for (name, fill) in [
+            ("DANGER", DANGER),
+            ("SUCCESS", SUCCESS),
+            ("WARNING", WARNING),
+        ] {
+            let ratio = contrast(fill, BACKGROUND);
+            assert!(
+                ratio >= 1.8,
+                "{name} fill on BACKGROUND is {ratio:.2}:1 — invisible as a dot"
+            );
+            // …and each fill has a readable text twin for the word next to it.
+            assert!(
+                contrast(fill, BACKGROUND) < 4.5,
+                "{name} passes the text bar on its own; the *_TEXT twin would be dead weight"
+            );
+        }
+    }
+
+    /// Three text tiers that are actually different: a palette whose "muted" and
+    /// "dim" are the same value is a palette with two tiers pretending to have
+    /// three, which is how a hierarchy quietly disappears.
+    #[test]
+    fn the_three_text_tiers_are_ordered_and_distinct() {
+        let text = luminance(TEXT);
+        let muted = luminance(TEXT_MUTED);
+        let dim = luminance(TEXT_DIM);
+        assert!(text < muted, "TEXT must be darker than TEXT_MUTED");
+        assert!(muted < dim, "TEXT_MUTED must be darker than TEXT_DIM");
+        assert!(
+            dim - muted > 0.02,
+            "TEXT_MUTED and TEXT_DIM are within {:.3} luminance of each other; \
+             they have to be distinguishable or one of them is a lie",
+            dim - muted
+        );
+    }
 }

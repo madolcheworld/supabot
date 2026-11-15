@@ -32,57 +32,42 @@ pub fn render(
         .size_full()
         .flex()
         .flex_col()
-        .child(
+        .child(bits::screen_header(
+            "Routines",
+            None,
             div()
-                .px_4()
-                .py_2()
                 .flex()
                 .items_center()
-                .justify_between()
-                .border_b_1()
-                .border_color(rgb(theme::BORDER))
+                .gap_2()
                 .child(
-                    div()
-                        .text_lg()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(rgb(theme::TEXT))
-                        .child("Routines"),
+                    bits::button(
+                        if s.routine_creator_open {
+                            "Close creator"
+                        } else {
+                            "New Routine"
+                        },
+                        if s.routine_creator_open {
+                            Tone::Ghost
+                        } else {
+                            Tone::Primary
+                        },
+                    )
+                    .id("toggle-routine-creator")
+                    .on_click(move |_, _, cx: &mut App| {
+                        state_toggle.update(cx, |st, cx| {
+                            st.routine_creator_open = !st.routine_creator_open;
+                            cx.notify();
+                        });
+                    }),
                 )
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            bits::button(
-                                if s.routine_creator_open {
-                                    "Close creator"
-                                } else {
-                                    "New Routine"
-                                },
-                                if s.routine_creator_open {
-                                    Tone::Ghost
-                                } else {
-                                    Tone::Primary
-                                },
-                            )
-                            .id("toggle-routine-creator")
-                            .on_click(move |_, _, cx: &mut App| {
-                                state_toggle.update(cx, |st, cx| {
-                                    st.routine_creator_open = !st.routine_creator_open;
-                                    cx.notify();
-                                });
-                            }),
-                        )
-                        .child(
-                            bits::button("Refresh", Tone::Ghost)
-                                .id("refresh-routines")
-                                .on_click(move |_, _, _: &mut App| {
-                                    let _ = commands_fetch.send(Command::FetchRoutines);
-                                }),
-                        ),
+                    bits::button("Refresh", Tone::Ghost)
+                        .id("refresh-routines")
+                        .on_click(move |_, _, _: &mut App| {
+                            let _ = commands_fetch.send(Command::FetchRoutines);
+                        }),
                 ),
-        )
+        ))
         .child(
             div()
                 .id("routines-scroll")
@@ -493,17 +478,28 @@ fn routine_card(
         .flex()
         .flex_col()
         .gap_2()
-        // Top row: Avatar + Name + Bot + Status badge
+        // A fixed rounded surface: without this a long routine name paints over
+        // the corner radius and out past the border.
+        .overflow_hidden()
+        // Top row: Avatar + Name + Bot + Status badge.
+        //
+        // The row is `justify_between`, so the badge is pinned right and the name
+        // in the middle is the child that must give way: `min_w_0` lets it shrink
+        // below its intrinsic width and `truncate` ends it with an ellipsis
+        // instead of running under the badge.
         .child(
             div()
                 .flex()
                 .items_center()
                 .justify_between()
+                .gap_2()
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap_2()
+                        .flex_1()
+                        .min_w_0()
                         .children(target_bot.map(|b| {
                             bits::avatar(
                                 theme::bot_color(b),
@@ -513,19 +509,28 @@ fn routine_card(
                         }))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w_0()
                                 .text_base()
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(rgb(theme::TEXT))
+                                .truncate()
                                 .child(routine.name.clone()),
                         )
                         .child(
                             div()
+                                .min_w_0()
                                 .text_xs()
                                 .text_color(rgb(theme::TEXT_MUTED))
+                                .truncate()
                                 .child(format!("for @{}", bot_label)),
                         ),
                 )
-                .child(bits::badge(status_label, status_bg, status_fg)),
+                .child(
+                    div()
+                        .flex_none()
+                        .child(bits::badge(status_label, status_bg, status_fg)),
+                ),
         )
         // Schedule + Runs info
         .child(
@@ -733,7 +738,7 @@ fn run_row(run: &RoutineRun) -> gpui::Div {
         .children(run.error.as_ref().map(|err| {
             div()
                 .text_xs()
-                .text_color(rgb(theme::DANGER))
+                .text_color(rgb(theme::DANGER_TEXT))
                 .child(format!("Error: {err}"))
         }))
 }

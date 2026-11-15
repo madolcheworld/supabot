@@ -71,6 +71,20 @@ pub struct Root {
     /// Interior mutability so the transcript can reset its item count from a
     /// `&self` render pass (a `ListState::reset` is itself `&self`).
     transcript_count: Cell<usize>,
+    /// What the last render had on screen, so the next render can notice that
+    /// the *surface* changed and re-seat the keyboard focus.
+    ///
+    /// GPUI dispatches a keystroke only to the focused element, resolved
+    /// against the frame that is actually rendered. When a palette jump or a
+    /// sidebar click swaps the surface, the element that had focus (the
+    /// palette's search field, or the composer) is gone from the tree, so
+    /// `focus_node_id_in_rendered_frame` finds nothing and **every** later
+    /// keystroke is dropped — `ctrl-k` included. The window then looks frozen
+    /// to the keyboard while it is still painting, which is exactly what this
+    /// app looked like before this field existed: measured on 2026-11-15 by
+    /// driving the real window with `wtype` (ctrl-k → "usage" → Enter locked
+    /// the keyboard out for the rest of the run).
+    focus_seat: Cell<(Screen, bool, bool)>,
     focus_handle: FocusHandle,
     /// Held, not read: dropping the root must stop the worker threads.
     _worker: Option<Worker>,
@@ -99,6 +113,11 @@ impl Root {
         let skills_input =
             cx.new(|cx| TextInput::new("skill names, comma separated (e.g. research, review)", cx));
         let focus_handle = cx.focus_handle();
+        let seat = (
+            state.read(cx).screen,
+            state.read(cx).palette_open,
+            state.read(cx).needs_login,
+        );
         let observations = vec![
             cx.observe(&state, |this, state, cx| {
                 if let Some(seed) = state.read(cx).edit_group_title_seed.clone() {
@@ -138,6 +157,7 @@ impl Root {
             surfaced_cards: HashMap::new(),
             transcript,
             transcript_count: Cell::new(0),
+            focus_seat: Cell::new(seat),
             focus_handle,
             _worker: worker,
             _observations: observations,
@@ -228,6 +248,46 @@ impl Root {
         self.composer.read(cx).focus_input(window, cx);
     }
 
+    /// Put the keyboard focus on an element that the *current* screen actually
+    /// renders: the composer on the conversation screen, the token field when
+    /// the login prompt is up, and the root itself everywhere else.
+    ///
+    /// Focusing the composer while a screen without a composer is open would
+    /// leave focus on an element that is not in the frame — the same dead-
+    /// keyboard failure [`Root::focus_seat`] exists to prevent, just moved one
+    /// step later.
+    fn focus_surface(&mut self, window: &mut Window, cx: &mut App) {
+        let (screen, _, needs_login) = self.focus_seat.get();
+        if needs_login {
+            self.login_input.read(cx).focus(window);
+        } else if screen == Screen::Conversation {
+            self.composer.read(cx).focus_input(window, cx);
+        } else {
+            window.focus(&self.focus_handle);
+        }
+    }
+
+    /// Re-seat the keyboard focus whenever the rendered surface changed since
+    /// the last frame (a palette jump, a sidebar switch, the login prompt
+    /// appearing or going away). Called from `render` because that is the one
+    /// place inside this type that holds a `Window`, and because the check is
+    /// about *what was rendered*, which is exactly what `render` decides.
+    fn reseat_focus(&mut self, window: &mut Window, cx: &mut App) {
+        let s = self.state.read(cx);
+        let now = (s.screen, s.palette_open, s.needs_login);
+        let previous = self.focus_seat.get();
+        if now == previous {
+            return;
+        }
+        self.focus_seat.set(now);
+        // While an overlay owns the keyboard (the palette focuses its own
+        // search field when it opens), a screen change must not steal it back.
+        if now.1 {
+            return;
+        }
+        self.focus_surface(window, cx);
+    }
+
     fn toggle_graph(&mut self, cx: &mut Context<Self>) {
         self.state.update(cx, |s, cx| {
             s.graph_open = !s.graph_open;
@@ -245,6 +305,8 @@ impl Root {
             cx.notify();
         });
         if opening {
+            // Every open starts from a clean query: see [`Palette::reset`].
+            self.palette.update(cx, |palette, cx| palette.reset(cx));
             self.palette.read(cx).focus_input(window, cx);
         } else {
             self.composer.read(cx).focus_input(window, cx);
@@ -1647,8 +1709,12 @@ impl Focusable for Root {
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         RENDERS.fetch_add(1, Ordering::SeqCst);
+        // Before anything is read out of the state: if the surface changed since
+        // the previous frame, the element that held focus is no longer in the
+        // tree and every keystroke would be dropped (see [`Root::focus_seat`]).
+        self.reseat_focus(window, cx);
         let now = Instant::now();
         let s = self.state.read(cx);
 
@@ -1883,7 +1949,12 @@ const RESYNC_LABEL_TTL: Duration = Duration::from_secs(4);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TopBarStatus {
     pub label: String,
+    /// The hue of the 9px dot: a vivid fill, chosen to be seen at that size.
     pub color: u32,
+    /// The hue of the word beside it. A separate token because a colour you can
+    /// see at 9px (`#10b981`, 2.4:1 on white) is not a colour you can read at
+    /// 12px; see [`theme::SUCCESS_TEXT`].
+    pub text: u32,
 }
 
 /// What the top bar would draw, derived from state and the current time alone.
@@ -1916,20 +1987,28 @@ pub fn top_bar_model(s: &AppState, now: Instant) -> Option<TopBarModel> {
     if toast.is_none() && s.conn.is_online() && !resynced {
         return None;
     }
-    let (label, color) = if resynced {
-        ("resynced".to_string(), theme::SUCCESS)
+    let (label, color, text) = if resynced {
+        ("resynced".to_string(), theme::SUCCESS, theme::SUCCESS_TEXT)
     } else {
         match &s.conn {
-            ConnectionState::Connected => ("connected".to_string(), theme::SUCCESS),
-            ConnectionState::Connecting => ("connecting…".to_string(), theme::WARNING),
-            ConnectionState::Reconnecting { attempt } => {
-                (format!("reconnecting (attempt {attempt})"), theme::WARNING)
+            ConnectionState::Connected => {
+                ("connected".to_string(), theme::SUCCESS, theme::SUCCESS_TEXT)
             }
-            ConnectionState::Offline { .. } => (s.conn.label(), theme::DANGER),
+            ConnectionState::Connecting => (
+                "connecting…".to_string(),
+                theme::WARNING,
+                theme::WARNING_TEXT,
+            ),
+            ConnectionState::Reconnecting { attempt } => (
+                format!("reconnecting (attempt {attempt})"),
+                theme::WARNING,
+                theme::WARNING_TEXT,
+            ),
+            ConnectionState::Offline { .. } => (s.conn.label(), theme::DANGER, theme::DANGER_TEXT),
         }
     };
     Some(TopBarModel {
-        status: TopBarStatus { label, color },
+        status: TopBarStatus { label, color, text },
         toast,
         brain_url: s.brain_url.clone(),
     })
@@ -1965,7 +2044,7 @@ fn render_top_bar(
         .child(
             div()
                 .text_xs()
-                .text_color(rgb(model.status.color))
+                .text_color(rgb(model.status.text))
                 .child(model.status.label.clone()),
         )
         .child(
@@ -2085,6 +2164,43 @@ mod tests {
             assert_eq!(model.status.label, label, "{conn:?}");
             assert_eq!(model.status.color, color, "{conn:?}");
             assert_eq!(model.toast, None, "{conn:?} has no toast to show");
+        }
+    }
+
+    /// The dot is a fill and the word is text, so they are different tokens: the
+    /// vivid hue the owner recognises at 9px is 2.1–3.5:1 on the bar's surface,
+    /// which is not a colour a 12px word can be drawn in. This test pins the pair
+    /// together so a future edit cannot make the label inherit the dot's hue.
+    #[test]
+    fn the_status_word_is_drawn_in_a_readable_hue_not_the_dot_fill() {
+        let now = Instant::now();
+        let cases = [
+            (
+                ConnectionState::Connecting,
+                theme::WARNING,
+                theme::WARNING_TEXT,
+            ),
+            (
+                ConnectionState::Offline {
+                    reason: "socket closed".to_string(),
+                },
+                theme::DANGER,
+                theme::DANGER_TEXT,
+            ),
+        ];
+        for (conn, fill, text) in cases {
+            let mut state = AppState::new("http://brain.test");
+            state.conn = conn.clone();
+            let model = top_bar_model(&state, now).expect("a disconnected bar is visible");
+            assert_eq!(model.status.color, fill, "{conn:?} dot keeps the vivid hue");
+            assert_eq!(
+                model.status.text, text,
+                "{conn:?} word uses the readable twin"
+            );
+            assert_ne!(
+                model.status.text, model.status.color,
+                "{conn:?}: one token for both roles regresses legibility"
+            );
         }
     }
 

@@ -66,6 +66,18 @@ pub fn layout(tasks: &[Task]) -> Vec<LayoutNode> {
     out
 }
 
+/// The colour of the `└` connector that draws the tree's depth. `BORDER`
+/// (`#e5e7eb`) is 1.15:1 on the panel's `SURFACE`, so the connector was drawn and
+/// invisible; `TEXT_DIM` is 5.1:1 there. It is a glyph, not a border, and it is
+/// carrying information (this row is a child of the one above).
+pub fn connector_color() -> u32 {
+    theme::TEXT_DIM
+}
+
+/// **Fill** colours for the status dot, which is 9px and has to be visible as a
+/// hue rather than read as text. The word beside it is body text at 12px and uses
+/// [`TEXT_DIM`] like the rest of the metadata line, so a status hue is never
+/// asked to do both jobs.
 fn status_color(status: TaskStatus) -> u32 {
     match status {
         TaskStatus::Queued => theme::TEXT_DIM,
@@ -157,7 +169,7 @@ pub fn render_section(
                 d.child(
                     div()
                         .flex_none()
-                        .text_color(rgb(theme::BORDER))
+                        .text_color(rgb(connector_color()))
                         .text_xs()
                         .child("└"),
                 )
@@ -194,7 +206,7 @@ pub fn render_section(
                             div()
                                 .w_full()
                                 .text_xs()
-                                .text_color(rgb(theme::WARNING))
+                                .text_color(rgb(theme::WARNING_TEXT))
                                 .child(format!("restarted {}", task.restarts)),
                         )
                     })
@@ -371,5 +383,39 @@ mod tests {
         // must return rather than spin forever.
         let flat = layout(&[task("a", Some("b")), task("b", Some("a"))]);
         assert!(flat.is_empty());
+    }
+
+    /// The tree connector is information (this row is a child), so it cannot be
+    /// drawn in `BORDER`: 1.15:1 on the panel surface is invisible.
+    #[test]
+    fn the_tree_connector_is_visible_rather_than_the_border_colour() {
+        assert_eq!(connector_color(), theme::TEXT_DIM);
+        assert_ne!(connector_color(), theme::BORDER);
+    }
+
+    /// [`status_color`] feeds the 9px dot, so it keeps the vivid fill hues, and
+    /// the metadata line beside it stays `TEXT_DIM` body text. The word is never
+    /// painted with a fill token: `SUCCESS` on `SURFACE` is 2.1:1, and the twin
+    /// (`SUCCESS_TEXT`) exists for exactly this.
+    #[test]
+    fn a_status_hue_is_a_fill_and_never_the_text_token() {
+        for status in [
+            TaskStatus::Queued,
+            TaskStatus::Running,
+            TaskStatus::Succeeded,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+            TaskStatus::Interrupted,
+        ] {
+            let fill = status_color(status);
+            for text_token in [theme::SUCCESS_TEXT, theme::DANGER_TEXT, theme::WARNING_TEXT] {
+                assert_ne!(
+                    fill, text_token,
+                    "{status:?} drew text token {text_token:#x}"
+                );
+            }
+        }
+        // The one warning word in a row ("restarted N") is text: the twin.
+        assert_ne!(theme::WARNING_TEXT, theme::WARNING);
     }
 }

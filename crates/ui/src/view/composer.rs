@@ -22,6 +22,15 @@ use crate::theme;
 use crate::widgets::bits;
 use crate::widgets::text_input::TextInput;
 
+/// The Stop button's blush background (`#fee2e2`).
+///
+/// A named constant because the label's colour is chosen *against it*:
+/// `theme::DANGER_TEXT` is picked to clear 4.5:1 on this fill while
+/// `theme::DANGER` does not, and [`tests::the_stop_label_is_readable_on_its_own_fill`]
+/// measures the pair. A bare literal here would make that test unverifiable the
+/// next time somebody changes the fill.
+const STOP_BG: u32 = 0xfee2e2;
+
 /// The `@token` currently being typed, if the caret sits in one. Returns the byte
 /// range to replace (the whole `@query`) and the query text after the `@`.
 ///
@@ -689,14 +698,17 @@ impl gpui::Render for Composer {
                     .py_1()
                     .flex_none()
                     .rounded_full()
-                    .bg(rgb(0xfee2e2))
+                    .bg(rgb(STOP_BG))
                     .border_1()
                     .border_color(rgb(theme::DANGER))
                     .cursor_pointer()
                     .hover(|h| h.bg(rgb(0xfecaca)))
                     .text_xs()
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(theme::DANGER))
+                    // `DANGER` is a *fill* (3.5:1 on white): right for the
+                    // button's border above, wrong for this word, which sits on
+                    // the blush `STOP_BG` and needs the readable twin.
+                    .text_color(rgb(theme::DANGER_TEXT))
                     .child("Stop")
                     .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, _| {
                         let _ = this.commands.send(Command::Interrupt(conv_id.clone()));
@@ -837,6 +849,45 @@ mod tests {
         s.upsert_conversation(group);
         s.open(gid);
         assert_eq!(composer_placeholder(&s), "Message #Launch Team");
+    }
+
+    /// WCAG 2.x relative luminance for an `0xrrggbb` colour, and the contrast
+    /// ratio of two of them. Mirrors `theme`'s own helper because the pair being
+    /// measured here is a view-local fill against a theme token.
+    fn contrast(a: u32, b: u32) -> f64 {
+        let channel = |shift: u32, color: u32| {
+            let v = ((color >> shift) & 0xff) as f64 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = |color: u32| {
+            0.2126 * channel(16, color) + 0.7152 * channel(8, color) + 0.0722 * channel(0, color)
+        };
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// The Stop button's word is **text on a blush fill**, so it needs the
+    /// readable twin: `theme::DANGER` is 3.5:1 on white and 2.8:1 on this fill,
+    /// under the 4.5:1 body-text bar, while `theme::DANGER_TEXT` clears it. This
+    /// is the defect stated as a number, so the next edit that "simplifies" the
+    /// two tokens back into one fails here instead of on somebody's screen.
+    #[test]
+    fn the_stop_label_is_readable_on_its_own_fill() {
+        let readable = contrast(theme::DANGER_TEXT, STOP_BG);
+        assert!(
+            readable >= 4.5,
+            "the Stop label is {readable:.2}:1 on its fill, under the body-text bar"
+        );
+        let vivid = contrast(theme::DANGER, STOP_BG);
+        assert!(
+            vivid < 4.5,
+            "the fill hue would pass the text bar ({vivid:.2}:1) — the readable twin would be dead weight"
+        );
     }
 
     #[test]

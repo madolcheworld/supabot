@@ -205,6 +205,11 @@ pub fn run() -> i32 {
     let selftest = args.selftest;
     let report_window = report.clone();
 
+    // A shared `Cell` rather than a channel: the closure runs on this thread, so
+    // the value only has to survive the `Application::run` call. An `Arc` because
+    // `run` takes a closure that outlives this borrow.
+    let selftest_ok = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let selftest_ok_slot = Arc::clone(&selftest_ok);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Application::new().run(move |cx: &mut App| {
             actions::bind_keys(cx);
@@ -220,7 +225,8 @@ pub fn run() -> i32 {
             cx.on_action(|_: &actions::Quit, cx: &mut App| cx.quit());
 
             if selftest {
-                run_selftest(cx, brain_url, report_window);
+                let drew = run_selftest(cx, brain_url, report_window);
+                selftest_ok_slot.store(drew, Ordering::SeqCst);
             } else {
                 run_app(cx, brain_url, data_dir, brain, login_token, report_window);
             }
@@ -228,7 +234,10 @@ pub fn run() -> i32 {
     }));
 
     let renders = RENDERS.load(Ordering::SeqCst);
-    let ok = result.is_ok() && (renders > 0 || !args.selftest);
+    // Three ways to fail, all of them real: the app panicked, nothing painted
+    // during a self-test, or a screen reported that it did not draw.
+    let ok =
+        result.is_ok() && (renders > 0 || !args.selftest) && selftest_ok.load(Ordering::SeqCst);
     report.note(format!(
         "exit: renders={renders} selftest={} ok={ok}",
         args.selftest
@@ -289,11 +298,26 @@ fn run_app(
 /// per-screen coverage on the live compositor, which a headless test cannot give
 /// here (GPUI's `TestAppContext` is behind `test-support`, which pulls in `x11`
 /// and would not link on this machine).
-fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) {
+///
+/// Returns whether every screen it was asked to draw actually drew. That value
+/// is what the process exit code is made of: before this, a window that failed to
+/// open printed `WINDOW FAILED` and the run still exited 0 as long as *some*
+/// window had painted, which is the one outcome a self-test must never have.
+fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) -> bool {
     let configs = selftest::screen_configs();
     let windows = configs.len();
     let mut applied = 0usize;
     let mut failed = false;
+    // The count is the number a human is asked to believe, so it is checked
+    // against the list it is counting rather than quietly reported.
+    if windows != selftest::WINDOWS {
+        report.note(format!(
+            "SELFTEST FAILED: {windows} screen configuration(s) but `selftest::WINDOWS` says {}",
+            selftest::WINDOWS
+        ));
+        failed = true;
+    }
+    let mut painted = 0usize;
     for (index, cfg) in configs.into_iter().enumerate() {
         let state = cx.new(|_| AppState::new(brain_url.to_string()));
         applied = selftest::drive(cx, &state);
@@ -443,6 +467,12 @@ fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) {
         let (tx, rx) = std::sync::mpsc::channel();
         drop(rx);
         let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
+        // `open_window` draws synchronously, so a window that opened but did not
+        // paint shows up as no increment here. Counting *renders per window* is
+        // what makes this "each screen was painted" rather than "a window object
+        // was created" — a screen whose render panics or is skipped would
+        // otherwise pass on the strength of its neighbours.
+        let renders_before = RENDERS.load(Ordering::SeqCst);
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -452,16 +482,30 @@ fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) {
             |_window, cx| cx.new(|cx| view::Root::new(state.clone(), tx.clone(), None, cx)),
         );
         match opened {
-            Ok(_) => report.note(format!(
-                "selftest: window {index} drew screen={:?} graph={} palette={} provider_menu={} plus_menu={} create_bot={} create_group={}",
-                cfg.screen,
-                cfg.graph,
-                cfg.palette,
-                cfg.provider_menu,
-                cfg.plus_menu,
-                cfg.create_bot,
-                cfg.create_group
-            )),
+            Ok(_) => {
+                let drew = RENDERS
+                    .load(Ordering::SeqCst)
+                    .saturating_sub(renders_before);
+                if drew == 0 {
+                    report.note(format!(
+                        "WINDOW FAILED (screen {index}, {:?}): the window opened but its root view never rendered",
+                        cfg.screen
+                    ));
+                    failed = true;
+                } else {
+                    painted += 1;
+                }
+                report.note(format!(
+                    "selftest: window {index} drew screen={:?} graph={} palette={} provider_menu={} plus_menu={} create_bot={} create_group={} renders={drew}",
+                    cfg.screen,
+                    cfg.graph,
+                    cfg.palette,
+                    cfg.provider_menu,
+                    cfg.plus_menu,
+                    cfg.create_bot,
+                    cfg.create_group
+                ));
+            }
             Err(err) => {
                 report.note(format!("WINDOW FAILED (screen {index}): {err}"));
                 failed = true;
@@ -469,8 +513,16 @@ fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) {
         }
     }
     report.note(format!(
-        "selftest: applied {applied} fabricated live event(s) through the reducer; opened {windows} window(s)"
+        "selftest: applied {applied} fabricated live event(s) through the reducer; opened {windows} window(s), {painted} of them painted"
     ));
+    if painted != windows {
+        // Every window that did not paint already reported itself; this line is
+        // the summary a caller greps for.
+        report.note(format!(
+            "SELFTEST FAILED: only {painted} of {windows} window(s) painted a root view"
+        ));
+        failed = true;
+    }
 
     let report_quit = report.clone();
     cx.spawn(async move |cx| {
@@ -486,11 +538,12 @@ fn run_selftest(cx: &mut App, brain_url: SharedString, report: Report) {
     })
     .detach();
     if failed {
-        // A window that failed to open is a hard failure; leave now so the exit
-        // code reflects it rather than waiting out the timer.
+        // A window that failed is a hard failure; leave now rather than waiting
+        // out the timer. The summary line above is already in the report.
         cx.quit();
     }
     cx.activate(true);
+    !failed
 }
 
 /// How hard to look for `<data-dir>/owner-token`. A single read is right for a

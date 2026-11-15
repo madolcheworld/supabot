@@ -746,10 +746,18 @@ pub fn entry_row(
     .into_any_element()
 }
 
-/// Avatar column width (24px avatar + 8px gap): bot bubbles start here, and
-/// reasoning/tool rows indent to the same line so the transcript has one left
-/// edge.
-const AVATAR_COL: f32 = 32.0;
+/// The avatar drawn beside an ungrouped bot message, and the gap after it. Named
+/// so the indent below can be *computed* from them: they used to be written twice
+/// (28 + gap_2 in the row, a bare `32.0` in the indent constant) and disagreed by
+/// 4px, so every tool card and reasoning block sat 4px left of the bubbles it
+/// belongs to. One left edge is the whole point of the indent.
+const ROW_AVATAR_PX: f32 = 28.0;
+/// The gap GPUI's `gap_2` puts between the avatar and the content column.
+const ROW_GAP_PX: f32 = 8.0;
+/// Avatar column width: bot bubbles start here, and reasoning/tool rows indent
+/// to the same line so the transcript has one left edge. `const` arithmetic over
+/// the two numbers the row actually uses, so the two cannot drift apart again.
+const AVATAR_COL: f32 = ROW_AVATAR_PX + ROW_GAP_PX;
 
 /// True when `entry` continues `prev`: both plain messages, same author, less
 /// than five minutes apart. Grouped messages drop the repeated header — the
@@ -882,18 +890,29 @@ fn message_row(
                 .items_center()
                 .gap_2()
                 .mb_1()
+                // The name is *text*, so it uses a text token, not the bot's
+                // hue. A roster colour is picked to be seen as a 28px tile, and
+                // several of the shipped ones are 1.5–2.6:1 on the bubble's
+                // grey — `#fbbf24` "Sentinel", `#34d399` "Dev" and `#599ce7`
+                // "Lead" are all under 3:1, so the author's name was the least
+                // legible thing in the row that says who is speaking. The tile
+                // on the left still carries the colour, so nothing is lost.
                 .child(
                     div()
                         .text_xs()
                         .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(color)
+                        .text_color(rgb(theme::TEXT))
                         .child(label.clone()),
                 )
+                .child(div().size(px(6.0)).flex_none().rounded_full().bg(color))
                 .child(
                     div()
                         .text_xs()
                         .text_color(rgb(theme::TEXT_DIM))
-                        .child(entry.created_at.format("%H:%M").to_string()),
+                        // The viewer's clock, not UTC: the separator above says
+                        // "Today 8:41 AM", so this row must not say "01:41" for
+                        // the same instant (see `time::clock_label`).
+                        .child(crate::time::clock_label_here(entry.created_at)),
                 )
                 .when(message.post == PostState::Queued, |d| {
                     d.child(bits::badge("queued", theme::WARNING, 0x1a1400))
@@ -985,9 +1004,9 @@ fn message_row(
         row = row.justify_end().child(content_col);
     } else {
         let gutter = if grouped {
-            div().w(px(28.0)).h(px(1.0)).flex_none()
+            div().w(px(ROW_AVATAR_PX)).h(px(1.0)).flex_none()
         } else {
-            bits::avatar(color, bits::initial(&label), px(28.0))
+            bits::avatar(color, bits::initial(&label), px(ROW_AVATAR_PX))
         };
         row = row.child(gutter).child(content_col);
     }
@@ -1089,10 +1108,18 @@ fn tool_row(
     let state_h = state.clone();
     let toggle_id = SharedString::from(format!("tool-{}", entry.id));
 
+    // The meta row is one line of tool name, status, duration, node id and
+    // origin inside a card that clips (`overflow_hidden` below). Without a
+    // shrinkable middle the row is cut mid-glyph at the card's rounded edge — a
+    // long node id or `mcp__…` tool name produced text sliced through a letter.
+    // The status keeps its natural width; everything else may shrink and ends in
+    // an ellipsis.
     let mut meta = div()
         .flex()
         .items_center()
         .gap_2()
+        .min_w_0()
+        .overflow_hidden()
         .text_xs()
         .text_color(rgb(theme::TEXT_DIM));
     if let Some((handle, bot_color)) = author_badge {
@@ -1117,19 +1144,25 @@ fn tool_row(
         );
     }
     meta = meta
-        .child(call.tool.clone())
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(call.tool.clone()),
+        )
         .child(bits::dot(accent, px(7.0)))
-        .child(call.status.status_label());
+        .child(div().flex_none().child(call.status.status_label()));
     if let Some(ms) = call.duration_ms {
-        meta = meta.child(format!("· {ms} ms"));
+        meta = meta.child(div().flex_none().child(format!("· {ms} ms")));
     }
     if let Some(node) = &call.node_id {
-        meta = meta.child(format!("· {}", node));
+        meta = meta.child(div().min_w_0().truncate().child(format!("· {}", node)));
     }
     // An agent's own tool call (ACP) ran in the agent's sandbox, not on one of
     // our nodes; it must not read as "where unknown" (D9.31).
     if call.origin == swarmbot_contracts::entry::ToolCallOrigin::Agent {
-        meta = meta.child("· agent's own tool");
+        meta = meta.child(div().flex_none().child("· agent's own tool"));
     }
 
     let mut card = div()
@@ -1317,7 +1350,12 @@ pub fn render_bot_failed_banner(
         .flex()
         .items_start()
         .gap_3()
-        .child(div().text_base().text_color(rgb(theme::DANGER)).child("⚠️"))
+        .child(
+            div()
+                .text_base()
+                .text_color(rgb(theme::DANGER_TEXT))
+                .child("⚠️"),
+        )
         .child(
             div()
                 .flex_1()

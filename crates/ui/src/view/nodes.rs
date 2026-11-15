@@ -12,12 +12,14 @@
 
 use std::sync::mpsc::Sender;
 
+use chrono::{DateTime, FixedOffset, Local, Utc};
 use gpui::{App, ClipboardItem, Entity, SharedString, div, prelude::*, px, rgb};
 use swarmbot_contracts::{PolicyCeiling, RootMode};
 
 use crate::proto::Command;
 use crate::state::{AppState, Fetched};
 use crate::theme;
+use crate::time;
 use crate::widgets::bits::{self, Tone};
 
 pub fn render(s: &AppState, _state: &Entity<AppState>, commands: &Sender<Command>) -> gpui::Div {
@@ -25,15 +27,7 @@ pub fn render(s: &AppState, _state: &Entity<AppState>, commands: &Sender<Command
         .size_full()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .px_4()
-                .py_2()
-                .text_lg()
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(rgb(theme::TEXT))
-                .child("Nodes"),
-        )
+        .child(bits::screen_header("Nodes", None, div()))
         .child(
             div()
                 .id("nodes-scroll")
@@ -50,6 +44,32 @@ pub fn render(s: &AppState, _state: &Entity<AppState>, commands: &Sender<Command
                     "The audit log lives on the node; the public API does not expose it yet.",
                 )),
         )
+}
+
+/// When the pairing code stops working, as the transcript's own human label
+/// (`Today 9:51 AM`, `Nov 15, 9:51 AM`).
+///
+/// The line used to be `format!("expires {}", pairing.expires_at)`, and
+/// `PairingCode::expires_at` is RFC 3339 **text** — so the screen printed
+/// `2026-11-15T08:51:56.123456789Z` in the middle of an app whose other
+/// timestamps all go through [`crate::time`]. A raw wire value is not a label:
+/// its nanoseconds are noise and its `Z` states a zone the reader never chose.
+/// `now` is a parameter so the day boundary and the already-gone case are
+/// assertable without waiting for a clock, and an unparseable value is shown
+/// verbatim rather than silently replaced with an invented instant.
+fn expiry_line(now: DateTime<FixedOffset>, expires_at: &str) -> String {
+    let Ok(at) = DateTime::parse_from_rfc3339(expires_at.trim()) else {
+        return format!("expires {expires_at}");
+    };
+    let at = at.with_timezone(&Utc);
+    let when = time::moment_label(now, at);
+    if at <= now.with_timezone(&Utc) {
+        // A code past its expiry is still in the state until the brain drops it,
+        // so the line says which it is rather than looking live.
+        format!("expires {when} — already expired")
+    } else {
+        format!("expires {when}")
+    }
 }
 
 fn pairing_section(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
@@ -95,8 +115,11 @@ fn pairing_section(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(theme::WARNING))
-                        .child(format!("expires {}", pairing.expires_at)),
+                        .text_color(rgb(theme::WARNING_TEXT))
+                        .child(expiry_line(
+                            Local::now().fixed_offset(),
+                            &pairing.expires_at,
+                        )),
                 )
                 .child(
                     div()
@@ -105,8 +128,17 @@ fn pairing_section(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
                         .items_center()
                         .gap_2()
                         .child(
+                            // `flex_1` alone does not bound a child: a long brain
+                            // URL used to lay the command string out at its
+                            // intrinsic width, so it spilled out of this rounded
+                            // box and under the neighbouring button. `min_w_0`
+                            // lets the box shrink, `overflow_hidden` clips it, and
+                            // the text truncates with an ellipsis so the clip
+                            // reads as "there is more", not as a rendering bug.
                             div()
                                 .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
                                 .rounded_md()
                                 .bg(rgb(theme::CODE_BG))
                                 .px_2()
@@ -114,7 +146,7 @@ fn pairing_section(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
                                 .font_family("DejaVu Sans Mono")
                                 .text_size(px(12.0))
                                 .text_color(rgb(theme::TEXT))
-                                .child(command_clone.clone()),
+                                .child(div().truncate().child(command_clone.clone())),
                         )
                         .child(
                             bits::button("Copy command", Tone::Ghost)
@@ -223,6 +255,9 @@ fn node_list(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
             .flex()
             .flex_col()
             .gap_1()
+            // The card is a fixed rounded surface: a long label must not be able
+            // to paint over the corner radius or past the border.
+            .overflow_hidden()
             .child(
                 div()
                     .flex()
@@ -238,15 +273,19 @@ fn node_list(s: &AppState, commands: &Sender<Command>) -> gpui::Div {
                     ))
                     .child(
                         div()
+                            .min_w_0()
                             .text_sm()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgb(theme::TEXT))
+                            .truncate()
                             .child(node.label.clone()),
                     )
                     .child(
                         div()
+                            .min_w_0()
                             .text_xs()
                             .text_color(rgb(theme::TEXT_DIM))
+                            .truncate()
                             .child(format!(
                                 "{} · {}/{}",
                                 node.hostname, node.platform, node.arch
@@ -391,5 +430,78 @@ fn ceiling_label(ceiling: PolicyCeiling) -> &'static str {
         PolicyCeiling::Never => "never",
         PolicyCeiling::Ask => "ask",
         PolicyCeiling::Always => "always",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fixed +07:00 zone — the owner's — written out so the assertions do not
+    /// depend on the machine's `TZ`.
+    fn zone() -> FixedOffset {
+        FixedOffset::east_opt(7 * 3600).expect("+07:00 is a valid offset")
+    }
+
+    fn now(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<FixedOffset> {
+        use chrono::TimeZone;
+        zone()
+            .with_ymd_and_hms(y, m, d, h, min, 0)
+            .single()
+            .expect("a real local time")
+    }
+
+    /// The defect: `PairingCode::expires_at` is RFC 3339 text and it was printed
+    /// as-is — `2026-11-15T08:51:56.123456789Z` — in a screen whose other
+    /// timestamps all go through [`crate::time`]. The label must read like them:
+    /// local, no sub-second noise, no `Z`, and it still has to say *when*.
+    #[test]
+    fn the_pairing_expiry_reads_as_a_human_label() {
+        let now = now(2026, 11, 15, 9, 0);
+
+        // Later today, in this zone (08:51Z is 15:51 here).
+        assert_eq!(
+            expiry_line(now, "2026-11-15T08:51:56.123456789Z"),
+            "expires Today 3:51 PM"
+        );
+
+        let line = expiry_line(now, "2026-11-15T08:51:56.123456789Z");
+        assert!(
+            !line.contains('Z') && !line.contains('.'),
+            "a wire timestamp is not a label: {line}"
+        );
+        assert!(
+            !line.contains("08:51"),
+            "the label must be in the reader's zone, not the wire's UTC clock: {line}"
+        );
+
+        // A code that outlives today names its day instead of saying "Today".
+        assert_eq!(
+            expiry_line(now, "2026-11-16T03:00:00Z"),
+            "expires Nov 16, 10:00 AM"
+        );
+    }
+
+    /// A code the brain has not dropped yet but whose time has gone says so — it
+    /// used to print a past timestamp with no hint that it was past.
+    #[test]
+    fn an_already_expired_code_says_so() {
+        let now = now(2026, 11, 15, 9, 0);
+        assert_eq!(
+            expiry_line(now, "2026-11-15T01:00:00Z"),
+            "expires Today 8:00 AM — already expired"
+        );
+    }
+
+    /// A value that is not RFC 3339 is shown as it arrived: inventing a time for
+    /// text nobody could parse would be worse than admitting it is text.
+    #[test]
+    fn an_unparseable_expiry_is_shown_verbatim() {
+        let now = now(2026, 11, 15, 9, 0);
+        assert_eq!(
+            expiry_line(now, "soon-ish"),
+            "expires soon-ish",
+            "the raw value is kept, not replaced with a made-up instant"
+        );
     }
 }

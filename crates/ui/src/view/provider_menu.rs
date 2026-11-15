@@ -30,9 +30,56 @@ use crate::proto::Command;
 use crate::state::AppState;
 use crate::theme;
 use crate::view::conversation::dm_bot;
-use crate::view::settings::{backend_kind_label, connection_state, handshake_only_note};
+use crate::view::settings::{
+    backend_kind_label, connection_state, ghost_button, handshake_only_note, state_dot,
+};
 use crate::widgets::bits::{self, Tone};
 use crate::widgets::text_input::TextInput;
+
+/// Width of the provider column (the left one).
+///
+/// It was 130px, and a provider row spends that on `px_2` × 2 (16px) + a 7px
+/// handshake dot + two `gap_2`s (16px) + the kind badge, whose text alone is
+/// "openai-compat" (~81px at 12px) — 120px before the id gets a single
+/// character. The id is the one thing this column exists to show, so the column
+/// is 180px and the id cell truncates rather than being squeezed to "o…".
+pub const PROVIDER_COL_W: f32 = 180.0;
+
+/// The ring around the row of the bot's **current** backend.
+///
+/// A 1px line against a light pill is a UI boundary, and the vivid `SUCCESS`
+/// fill is 2.4:1 there — the same invisibility the model dots had with `BORDER`.
+/// The readable twin is 5.5:1 and still reads as the success hue.
+pub fn current_ring() -> u32 {
+    theme::SUCCESS_TEXT
+}
+
+/// The chrome a provider row puts around its id, so the id's remaining width can
+/// be stated (and tested) instead of guessed: `px_2` padding (8 + 8), the 7px
+/// handshake dot, and the one `gap_2` left between the dot and the id.
+pub fn provider_row_chrome_px() -> f32 {
+    16.0 + 7.0 + 8.0
+}
+
+/// The width the provider id keeps in a row.
+///
+/// The kind badge ("openai-compat" is ~81px of 12px text before its own padding)
+/// used to sit *in this row*, and no honest column width fits a badge that wide,
+/// a dot and an id inside a 430px card: at 180px the id kept 55px — about six
+/// characters — so the badge moved to the models header, where it describes the
+/// same backend and takes no width from the thing the column exists to show.
+pub fn provider_id_width_px() -> f32 {
+    PROVIDER_COL_W - provider_row_chrome_px()
+}
+
+/// Rough width of a 12px badge: ~0.55em per glyph plus `bits::badge`'s `px_1`
+/// (4 + 4). An estimate, in the same spirit as `usage::numeric_text_width`: it
+/// only has to be conservative, and [`tests`] uses it to show *why* the badge
+/// could not stay in the row.
+pub fn kind_badge_width_px(label: &str) -> f32 {
+    const EM: f32 = 12.0;
+    label.chars().count() as f32 * 0.55 * EM + 8.0
+}
 
 /// Case-insensitive substring filter over model ids and labels; an empty
 /// query lists everything. Pure so a test can pin the search behaviour.
@@ -102,15 +149,16 @@ pub fn render(
                 let search_h = search.clone();
                 let commands_h = commands.clone();
 
-                let pill_tone = if is_active_bot {
-                    Tone::Primary
-                } else {
-                    Tone::Ghost
-                };
                 let pill_label = format!("@{}", member_bot.name);
+                // An inactive member's pill is `Ghost` on a white card; the
+                // ringed variant, so the switcher reads as a row of choices.
+                let pill = if is_active_bot {
+                    bits::button(&pill_label, Tone::Primary)
+                } else {
+                    ghost_button(&pill_label)
+                };
                 row = row.child(
-                    bits::button(&pill_label, pill_tone)
-                        .id(SharedString::from(format!("bot-switch-{}", member_bot.id)))
+                    pill.id(SharedString::from(format!("bot-switch-{}", member_bot.id)))
                         .on_click(move |_, _, cx: &mut gpui::App| {
                             cx.stop_propagation();
                             let mut fetch: Option<String> = None;
@@ -144,7 +192,13 @@ pub fn render(
     }
 
     // --- left column: providers -------------------------------------------
-    let mut providers = div().w(px(130.0)).flex_none().flex().flex_col().gap_1();
+    let mut providers = div()
+        .w(px(PROVIDER_COL_W))
+        .flex_none()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1();
     let has_real = s
         .backends
         .iter()
@@ -210,7 +264,7 @@ pub fn render(
                     px(7.0),
                 ))
                 .when(is_current, |d| {
-                    d.border_1().border_color(rgb(theme::SUCCESS))
+                    d.border_1().border_color(rgb(current_ring()))
                 })
                 .child(
                     div()
@@ -224,20 +278,7 @@ pub fn render(
                             gpui::FontWeight::NORMAL
                         })
                         .child(backend.id.clone()),
-                )
-                .child(bits::badge(
-                    backend_kind_label(backend.kind),
-                    if is_selected {
-                        0xddd6fe
-                    } else {
-                        theme::SURFACE_RAISED
-                    },
-                    if is_selected {
-                        0x5b21b6
-                    } else {
-                        theme::TEXT_MUTED
-                    },
-                )),
+                ),
         );
     }
 
@@ -268,7 +309,9 @@ pub fn render(
                 .child(bits::badge(
                     selected_state.label(),
                     theme::SURFACE_RAISED,
-                    selected_state.tone(),
+                    // The word is 12px text on a light pill: the readable twin,
+                    // not the fill hue (green there is 2.1:1).
+                    selected_state.text_tone(),
                 ))
                 .child(div().flex_1())
                 .child(if selected_connecting {
@@ -354,7 +397,7 @@ pub fn render(
                             .child("…")
                             .into_any_element()
                     } else {
-                        bits::button("Log in", Tone::Ghost)
+                        ghost_button("Log in")
                             .id(SharedString::from(format!("provider-login-{}", method.id)))
                             .on_click(move |_, _, cx: &mut gpui::App| {
                                 cx.stop_propagation();
@@ -384,6 +427,11 @@ pub fn render(
     }
 
     // --- right column: models of the selected provider ---------------------
+    let selected_backend_kind = s
+        .backends
+        .iter()
+        .find(|backend| backend.id == selected_backend)
+        .map(|backend| backend.kind);
     let query = search.read(cx).content().trim().to_string();
     let effective_model = if !query.is_empty() {
         Some(query.clone())
@@ -401,8 +449,23 @@ pub fn render(
             div()
                 .flex()
                 .items_center()
-                .justify_between()
-                .child(bits::section_label(&format!("MODELS · {selected_backend}"))),
+                .gap_2()
+                .min_w_0()
+                // The selected backend's kind lives here now, not in the left
+                // column: "openai-compat" is 81px of badge and was squeezing the
+                // id it sat next to down to a couple of characters.
+                .child(
+                    bits::section_label(&format!("MODELS · {selected_backend}"))
+                        .min_w_0()
+                        .truncate(),
+                )
+                .children(selected_backend_kind.map(|kind| {
+                    bits::badge(
+                        backend_kind_label(kind),
+                        theme::SURFACE_RAISED,
+                        theme::TEXT_MUTED,
+                    )
+                })),
         )
         .child(search.clone());
 
@@ -462,14 +525,7 @@ pub fn render(
                     cx.notify();
                 });
             })
-            .child(bits::dot(
-                if is_default_picked {
-                    theme::SUCCESS
-                } else {
-                    theme::BORDER
-                },
-                px(7.0),
-            ))
+            .child(bits::dot(state_dot(is_default_picked), px(7.0)))
             .child(
                 div()
                     .flex_1()
@@ -508,11 +564,11 @@ pub fn render(
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(theme::DANGER))
+                            .text_color(rgb(theme::DANGER_TEXT))
                             .child(format!("Could not load models: {reason}")),
                     )
                     .child(
-                        bits::button("Retry", Tone::Ghost)
+                        ghost_button("Retry")
                             .id(SharedString::from(format!(
                                 "provider-retry-{backend_retry}"
                             )))
@@ -592,14 +648,7 @@ pub fn render(
                                     cx.notify();
                                 });
                             })
-                            .child(bits::dot(
-                                if is_picked {
-                                    theme::SUCCESS
-                                } else {
-                                    theme::BORDER
-                                },
-                                px(7.0),
-                            ))
+                            .child(bits::dot(state_dot(is_picked), px(7.0)))
                             .child(
                                 div()
                                     .flex_1()
@@ -763,7 +812,7 @@ pub fn render(
                         d.child(
                             div()
                                 .text_xs()
-                                .text_color(rgb(theme::WARNING))
+                                .text_color(rgb(theme::WARNING_TEXT))
                                 .child("Note: model selection is informational on this ACP agent."),
                         )
                     })
@@ -790,9 +839,8 @@ pub fn render(
                                     .items_center()
                                     .gap_2()
                                     .child(
-                                        bits::button("Reset", Tone::Ghost)
-                                            .id("provider-clear-model")
-                                            .on_click(move |_, _, cx: &mut gpui::App| {
+                                        ghost_button("Reset").id("provider-clear-model").on_click(
+                                            move |_, _, cx: &mut gpui::App| {
                                                 cx.stop_propagation();
                                                 search_clear
                                                     .update(cx, |input, cx| input.clear(cx));
@@ -800,7 +848,8 @@ pub fn render(
                                                     s.menu_model = None;
                                                     cx.notify();
                                                 });
-                                            }),
+                                            },
+                                        ),
                                     )
                                     .child(
                                         bits::button("Apply", Tone::Primary)
@@ -871,5 +920,51 @@ mod tests {
             .collect();
         assert_eq!(by_label, vec!["o4-mini".to_string()]);
         assert!(filter_models("nope", &models).is_empty());
+    }
+
+    /// The provider column exists to show the provider's id, and at 130px with
+    /// the kind badge inside the row it showed two characters of it: the badge
+    /// text alone is "openai-compat", ~81px before its padding.
+    #[test]
+    fn the_provider_column_leaves_room_for_the_backend_id() {
+        let room = provider_id_width_px();
+        assert!(
+            room >= 140.0,
+            "the id keeps only {room:.1}px of the {PROVIDER_COL_W}px column"
+        );
+        // The bug, reproduced: this is the space the id had *before*, with the
+        // badge still in the row. Widening the column alone would not have been
+        // enough, which is why the badge moved to the models header.
+        let widest_badge = [swarmbot_contracts::BackendKind::OpenAiCompat]
+            .into_iter()
+            .map(|kind| kind_badge_width_px(backend_kind_label(kind)))
+            .fold(0.0f32, f32::max);
+        assert!(
+            widest_badge > 80.0,
+            "the widest kind badge is {widest_badge:.1}px, not the ~81px the audit measured"
+        );
+        let room_with_badge_in_row = PROVIDER_COL_W - provider_row_chrome_px() - widest_badge;
+        assert!(
+            room_with_badge_in_row < 60.0,
+            "even at {PROVIDER_COL_W}px, a row that still held the badge leaves the id \
+             {room_with_badge_in_row:.1}px"
+        );
+        let old_130 = 130.0 - provider_row_chrome_px() - widest_badge;
+        assert!(old_130 < room_with_badge_in_row);
+        assert!(old_130 < 20.0, "the old row left the id {old_130:.1}px");
+    }
+
+    /// An unselected model is a state, not a gap: the dot used to be `BORDER`
+    /// (`#e5e7eb`), which is 1.24:1 on white, so an unselected row had no mark at
+    /// all and only the selected one showed a dot.
+    #[test]
+    fn an_unselected_row_still_draws_its_state_dot() {
+        assert_eq!(state_dot(true), theme::SUCCESS);
+        assert_eq!(state_dot(false), theme::TEXT_DIM);
+        assert_ne!(state_dot(false), theme::BORDER);
+        // The "current backend" ring is a 1px boundary, so it takes the readable
+        // twin rather than the 2.4:1 fill hue.
+        assert_eq!(current_ring(), theme::SUCCESS_TEXT);
+        assert_ne!(current_ring(), theme::SUCCESS);
     }
 }

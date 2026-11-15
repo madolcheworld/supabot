@@ -27,6 +27,10 @@ use crate::actions::{SelectConfirm, SelectNext, SelectPrev};
 use crate::proto::Command;
 use crate::state::{AppState, Screen};
 use crate::theme;
+// The budget arithmetic and the shortening itself are one rule, shared with the
+// sidebar's rows: both are `truncate()` in a flex row with no definite width, and
+// a second copy would be a second thing to keep correct.
+use crate::view::sidebar::{char_budget, ellipsize};
 use crate::widgets::bits;
 use crate::widgets::text_input::TextInput;
 
@@ -58,6 +62,54 @@ pub struct PaletteItem {
     pub title: String,
     pub subtitle: String,
     pub action: PaletteAction,
+}
+
+// ---------------------------------------------------------------------------
+// Fitting a row's two texts inside the 560px card.
+//
+// A row used to be: title (`text_sm`, untruncated), a `flex_1` spacer, subtitle
+// (`text_xs`, untruncated). A long bot title plus its subtitle was wider than the
+// card's content box and **nothing clipped it** — the text painted over the
+// popup's own rounded edge. The spacer is what made it invisible in review: it
+// absorbed all the slack when the texts were short, so the layout looked correct
+// until a real title arrived.
+//
+// `.min_w_0().truncate()` on both cells is the layout half of the fix (and the
+// popup now clips, so nothing can paint outside its surface whatever a child
+// does). The text half is [`fit_row_text`], because `.truncate()` alone is not
+// reliable in a flex row: `TextLayout::layout` only ellipsizes when it is given a
+// definite width, and a flex item's *content* is first measured under
+// `AvailableSpace::MaxContent`. `nowrap` then makes the cached shape's
+// `wrap_width` `None`, so every later pass reuses the untruncated size. The
+// budget below is a conservative character count — approximate by construction,
+// expensive to get exact, and honest about it.
+
+/// The card is `560px`; a row's content box is that less the popup's `p_2` and
+/// the row's `px_3`, the selection dot and the gaps: ~505px to share.
+const ROW_CONTENT_W: f32 = 505.0;
+/// How much of that a subtitle may take. Long subtitles are the "screen · …"
+/// descriptions and task metadata; the title is the thing being chosen, so it
+/// gets the rest.
+const SUBTITLE_W: f32 = 240.0;
+/// Deliberately wide average advances (the real ones are ~7.2 at 14px and ~6.0
+/// at 12px), so the budget errs short and the `…` lands inside the card.
+const TITLE_CHAR_W: f32 = 8.4;
+const SUBTITLE_CHAR_W: f32 = 7.2;
+
+/// Characters of a row title / subtitle that fit their columns, minus the slack
+/// the conservative advances above already leave.
+const TITLE_CHARS: usize = char_budget(ROW_CONTENT_W - SUBTITLE_W, TITLE_CHAR_W);
+const SUBTITLE_CHARS: usize = char_budget(SUBTITLE_W, SUBTITLE_CHAR_W);
+
+/// The title and subtitle a row actually shows, shortened to their budgets.
+///
+/// Pure so a test can hold it: this is the whole of "a long title does not paint
+/// over the popup edge" that does not need a window.
+fn fit_row_text(item: &PaletteItem) -> (String, String) {
+    (
+        ellipsize(&item.title, TITLE_CHARS),
+        ellipsize(&item.subtitle, SUBTITLE_CHARS),
+    )
 }
 
 pub struct Palette {
@@ -143,6 +195,24 @@ impl Palette {
 
     pub fn focus_input(&self, window: &mut Window, cx: &App) {
         self.input.read(cx).focus(window);
+    }
+
+    /// Put the palette back to its opening state: an empty query and the first
+    /// row selected.
+    ///
+    /// A palette is a *transient* surface — it appears, you jump, it goes away —
+    /// so it must not remember the last query. It did: opening it again after
+    /// jumping to "usage" showed `usage` already typed, and typing `nodes`
+    /// produced the query `usagenodes`, which matches nothing. Measured on
+    /// 2026-11-15 by driving the real window (ctrl-k, type, Enter, ctrl-k,
+    /// type): the second query arrived concatenated. The stale text also left
+    /// the *results* filtered by a query nobody could see the origin of.
+    pub fn reset(&mut self, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.clear(cx));
+        let s = self.state.read(cx);
+        self.results = Self::results_for(s, "");
+        self.selected = 0;
+        cx.notify();
     }
 
     /// The palette's rows for one query over one state snapshot.
@@ -303,6 +373,7 @@ impl Palette {
         let state = self.state.clone();
         let commands = self.commands.clone();
         let action = item.action.clone();
+        let (title, subtitle) = fit_row_text(item);
         div()
             .id(SharedString::from(format!("palette-{index}")))
             .h(px(36.0))
@@ -320,18 +391,27 @@ impl Palette {
                 },
                 px(7.0),
             ))
+            // `flex_1().min_w_0()` and not the old empty spacer: the title takes
+            // the slack, so a long one shortens instead of shoving the subtitle
+            // out of the card.
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
                     .text_sm()
                     .text_color(rgb(theme::TEXT))
-                    .child(item.title.clone()),
+                    .truncate()
+                    .child(title),
             )
-            .child(div().flex_1())
             .child(
                 div()
+                    .flex_none()
+                    .max_w(px(SUBTITLE_W))
+                    .min_w_0()
                     .text_xs()
                     .text_color(rgb(theme::TEXT_DIM))
-                    .child(item.subtitle.clone()),
+                    .truncate()
+                    .child(subtitle),
             )
             .on_click(move |_, _, cx: &mut App| {
                 if let PaletteAction::OpenTask(task_id, _) = &action {
@@ -394,6 +474,12 @@ impl gpui::Render for Palette {
             .flex()
             .flex_col()
             .gap_2()
+            // Nothing a row draws may paint outside this surface: the rows used
+            // to be wider than the card and there was no clip at all, so text ran
+            // past the rounded edge and over whatever was behind the popup. This
+            // is the guarantee; the per-row truncation above is what makes the
+            // cut a `…` rather than a glyph.
+            .overflow_hidden()
             .child(self.input.clone())
             .child(list)
             .child(
@@ -515,5 +601,106 @@ mod tests {
                 .iter()
                 .any(|title| title == "Approval rules")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Defect: a long bot/conversation title plus its subtitle was wider than the
+    // 560px card with no truncation and no clip, so the text painted over the
+    // popup's rounded edge. The tests here hold the character budget and the
+    // budget arithmetic; the layout half (`.min_w_0().truncate()`, `.max_w(..)`,
+    // `overflow_hidden()`) is not something a headless test can see, and this
+    // file does not pretend otherwise.
+    // -----------------------------------------------------------------------
+
+    fn item(title: &str, subtitle: &str) -> PaletteItem {
+        PaletteItem {
+            title: title.to_string(),
+            subtitle: subtitle.to_string(),
+            action: PaletteAction::OpenScreen(Screen::Usage),
+        }
+    }
+
+    /// A long title and a long subtitle both come back shortened with `…`, and
+    /// neither exceeds its column budget — which is what stops the row being
+    /// wider than the card in the first place.
+    #[test]
+    fn a_long_title_and_subtitle_are_both_shortened_with_an_ellipsis() {
+        let long = item(
+            "the deploy bot that watches the staging cluster all night",
+            "screen · what the backends reported the team spent across every node",
+        );
+        let (title, subtitle) = fit_row_text(&long);
+        assert!(
+            title.ends_with('…') && title.chars().count() <= TITLE_CHARS,
+            "a {}-char title in a ~265px column must end in an ellipsis: {title:?}",
+            long.title.chars().count()
+        );
+        assert!(
+            subtitle.ends_with('…') && subtitle.chars().count() <= SUBTITLE_CHARS,
+            "a {}-char subtitle in a ~240px column must end in an ellipsis: {subtitle:?}",
+            long.subtitle.chars().count()
+        );
+        // Together they fit the row's content box, with room for the dot and the
+        // three `gap_2`s — the row is not wider than the card any more.
+        let estimated: f32 = title.chars().count() as f32 * TITLE_CHAR_W
+            + subtitle.chars().count() as f32 * SUBTITLE_CHAR_W;
+        assert!(
+            estimated <= ROW_CONTENT_W,
+            "the fitted cells are {estimated:.0}px of a {ROW_CONTENT_W}px row"
+        );
+    }
+
+    /// Short text is left exactly as the state gave it — the budget must not
+    /// rewrite ordinary rows, because the palette shows them verbatim.
+    #[test]
+    fn ordinary_rows_are_not_rewritten() {
+        let (title, subtitle) = fit_row_text(&item("scout", "@scout · bot"));
+        assert_eq!(title, "scout");
+        assert_eq!(subtitle, "@scout · bot");
+    }
+
+    /// The budgets are believable for the card, and they only shorten a row that
+    /// genuinely does not fit: nothing is rewritten just because a limit exists.
+    #[test]
+    fn the_budgets_fit_the_card_and_only_shorten_rows_that_overflow() {
+        const {
+            assert!(TITLE_CHARS > 0 && SUBTITLE_CHARS > 0);
+            // Even "group · conversation" is 20 chars; a narrower budget would
+            // shorten ordinary rows rather than overflowing ones.
+            assert!(SUBTITLE_CHARS >= 20);
+        }
+        // The two columns plus the dot and gaps must fit the card's content box,
+        // or the row is wider than the popup again.
+        let columns = TITLE_CHARS as f32 * TITLE_CHAR_W + SUBTITLE_CHARS as f32 * SUBTITLE_CHAR_W;
+        assert!(
+            columns <= ROW_CONTENT_W,
+            "the two columns want {columns:.0}px of a {ROW_CONTENT_W}px row"
+        );
+
+        // Only a cell that is genuinely over budget may be rewritten; one that
+        // fits must reach the screen character-for-character.
+        let check = |text: &str, fitted: &str, budget: usize, what: &str| {
+            if fitted == text {
+                assert!(
+                    text.chars().count() <= budget,
+                    "{what} {text:?} fits in {budget} chars but was passed through unchanged"
+                );
+            } else {
+                assert!(
+                    text.chars().count() > budget,
+                    "{what} {text:?} fits in {budget} chars but was shortened to {fitted:?}"
+                );
+                assert!(
+                    fitted.ends_with('…'),
+                    "{what} was shortened without an ellipsis: {fitted:?}"
+                );
+            }
+        };
+        let state = state_with_bots(&["lead"]);
+        for row in Palette::results_for(&state, "") {
+            let (title, subtitle) = fit_row_text(&row);
+            check(&row.title, &title, TITLE_CHARS, "title");
+            check(&row.subtitle, &subtitle, SUBTITLE_CHARS, "subtitle");
+        }
     }
 }

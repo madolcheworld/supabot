@@ -4,12 +4,17 @@
 cooperate: the roster, the transcripts, the delegation graph, and the cards that
 need a human.
 
-**Current state: the app is built.** 18,162 lines across 32 source files, **123
+**Current state: the app is built.** 18,162 lines across 32 source files, **163
 tests**, one window with a sidebar, a transcript, a composer, a delegation-graph
 panel, cards, a nodes screen, a routines screen, a usage screen, a settings screen,
 an **approval-rules** screen and a command palette. It is a pure client of the brain's REST + `/ws/live` API, so
 it needs a brain to talk to — and `--offline --spawn-brain` starts one with the
-scripted `fake` backend, which is a genuine zero-credential demo (§5, §7).
+scripted `fake` backend, which is a genuine zero-credential demo (§5, §7). **The
+`fake` backend has no model in it**: with nothing scripted, every reply is the
+literal string `[fake] no scripted turn left`. A real conversation needs
+`--brain <url>` pointed at a `swarmbot-brain` whose config names a real backend —
+§10.2 records one such pass, done through the CLI because the desktop session
+locked before a message could be typed into this window.
 
 Several modules cite this document by section number (`view/cards.rs` → §3,
 `widgets/*` → §4, `brain.rs` → §6, `reducer.rs` → §3). Those numbers are
@@ -68,7 +73,7 @@ Rules that follow from the split:
 | `pkg-config xkbcommon-x11` missing, `libxkbcommon-x11.so.0` present | `scripts/env.sh` creates `.cargo-home/link-shim/libxkbcommon-x11.so` → the runtime `.so.0` and exports `LIBRARY_PATH`. `LIBRARY_PATH` (unlike `RUSTFLAGS`) does not invalidate the cargo cache, so only the final link is redone. The clean fix is `sudo dnf install libxkbcommon-x11-devel` |
 | `gpui`'s build script runs `bindgen`; `libclang.so.22.1` exists without an unversioned `libclang.so` | `scripts/env.sh` exports `LIBCLANG_PATH=/usr/lib64` |
 | `gpui → gpui_http_client → zed-async-tar → xattr 0.2`, and `xattr 0.2.3` no longer compiles against modern `libc` (`ENOATTR` is `ENODATA` on Linux); it is an optional dep enabled by a default feature a downstream workspace cannot turn off | `vendor/xattr` is the crate with a one-line patch, wired in by `[patch.crates-io]` in the root `Cargo.toml`. See [`../vendor/xattr/VENDORED.md`](../vendor/xattr/VENDORED.md) |
-| **A session with no GPU at all still renders (2026-11-15).** This session had no `/dev/nvidia0`, no `/dev/dri` and an `nvidia-smi` that could not reach the driver; `scripts/env.sh` exported the staged lavapipe ICD, and `./target/debug/swarmbot-ui --selftest` opened **12 windows**, `ok=true`, exit 0, with `vulkan/renderer: icd=…/.tmp-ui-gpu/lvp_local.json` | The D9.34 fallback, exercised for real rather than in a namespace. It proves the CPU path works end to end and says nothing about the hardware |
+| **A session with no GPU at all still renders (2026-11-15).** Twice in one day — at ~08:24 and again at ~09:36 — this box had no `/dev/nvidia0`, no `/dev/dri` and an `nvidia-smi` that could not reach the driver, with the GPU *present* in between; `scripts/env.sh` exported the staged lavapipe ICD, and `./target/debug/swarmbot-ui --selftest` opened **12 windows**, `ok=true`, exit 0, with `vulkan/renderer: icd=…/.tmp-ui-gpu/lvp_local.json`. The whole 2026-11-15 pixel pass (§10.1) ran on this path | The D9.34 fallback, exercised for real rather than in a namespace. It proves the CPU path works end to end and says nothing about the hardware — and the twice-in-one-session flip is why the sibling row needs a date |
 | **The GPU works (re-checked 2026-11-14).** `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-modeset`, `/dev/nvidia-uvm`, `/dev/dri/card1` and `/dev/dri/renderD128` all exist; `nvidia-smi` reports a GTX 1660 SUPER on driver 615.78.08; `nvidia_icd.json` is the ICD in use | `./target/debug/swarmbot-ui --selftest` **opens 12 windows and exits 0**, with `vulkan/renderer: icd=/usr/share/vulkan/icd.d/nvidia_icd.json` (11 before the Rules screen existed; the count moves with the screens). The *render total* it prints is not stable — 22, 54, 55, 57 and 58 across five runs of one binary — so assert on the 11 windows and on `ok=true`, never on a render count. The 2026-11-13 entry here said the opposite (`NoSupportedDeviceFound` panic, no usable ICD) and that was true then; it is not true now. `scripts/env.sh` still prefers llvmpipe *when that ICD exists* and still warns on stderr when none does — a headless-box fallback, not a statement about this machine |
 | **A session can also see no GPU at all** — a sandbox whose `/dev` has only `null`/`zero`/`tty`, CI, a headless box. There is no render node and no system llvmpipe, so GPUI's own init panics (`Unable to init GPU context: NoSupportedDeviceFound`). Note the weaker check that looks right and is not: `test -e /dev/dri` answers **yes** for an empty bind-mounted directory, and a zero-length `/dev/nvidia0` is a placeholder — both measured on 2026-11-14 | `scripts/software-vulkan.sh` stages Mesa lavapipe **inside the checkout** (`.tmp-ui-gpu/`, gitignored) with no root: it downloads the distro package with `pacman -Sp` + `curl`, extracts it with `bsdtar`, and writes `.tmp-ui-gpu/lvp_local.json` naming the library by **absolute** path (so no `LD_LIBRARY_PATH`). `scripts/env.sh` then exports `VK_ICD_FILENAMES` to it, and `--selftest` **opens the same windows and exits 0** through the CPU renderer — proven twice: in a mount namespace with a blanked `/dev` on 2026-11-14 (`opened 11 window(s)`), and again on 2026-11-15 in a session whose host genuinely had no GPU (`opened 12 window(s)` after the Rules screen was added). Both report `vulkan/renderer: icd=…/.tmp-ui-gpu/lvp_local.json` and `ok=true` |
 | `pkg-config vulkan` missing, `libvulkan.so.1` present | enough: blade loads the Vulkan library at runtime |
@@ -167,19 +172,51 @@ Theme tokens live in `theme.rs`. **The app ships a light theme now** — the dar
 palette below is what the original spike used and what this table used to claim
 long after the code moved on (D9.35). The table lists the values in the source:
 
-| Token | Value | Used for |
-| --- | --- | --- |
-| `BACKGROUND` | `#ffffff` | main pane |
-| `SURFACE` / `SURFACE_RAISED` | `#f7f7f8` / `#ececee` | sidebar, raised panels |
-| `BORDER` | `#e5e7eb` | separators |
-| `TEXT` / `TEXT_MUTED` / `TEXT_DIM` | `#111827` / `#6b7280` / `#9ca3af` | primary / secondary / status |
-| `ACCENT` / `ACCENT_HOVER` | `#2563eb` / `#1d4ed8` | primary button |
-| `DANGER` / `SUCCESS` / `WARNING` | `#ef4444` / `#10b981` / `#f59e0b` | deny, allow, pending |
-| `OWNER_BUBBLE` / `BOT_BUBBLE` | `#000000` / `#f3f4f6` | transcript bubbles |
-| `CODE_BG` | `#f3f4f6` | fenced code |
-| notice | `#fef2f2` bg / `#fecdd3` border / `#991b1b` fg | error banner |
-| spacing | `XS 4`, `SM 8`, `MD 12`, `LG 16` | gaps and padding |
-| metrics | `SIDEBAR_W 280`, `GRAPH_W 320`, `AVATAR 32`, `HEADER_H 56` | layout |
+| Token | Value | Contrast | Used for |
+| --- | --- | --- | --- |
+| `BACKGROUND` | `#ffffff` | — | main pane |
+| `SURFACE` / `SURFACE_RAISED` | `#f7f7f8` / `#ececee` | — | sidebar, raised panels |
+| `BORDER` | `#e5e7eb` | — | separators |
+| `TEXT` | `#111827` | 16.0:1 | primary text |
+| `TEXT_MUTED` | `#4b5563` | 7.6:1 | secondary text |
+| `TEXT_DIM` | `#5f6976` | 5.6:1 (4.7:1 on a raised card) | timestamps, metadata, section labels |
+| `ACCENT` / `ACCENT_HOVER` | `#1d4ed8` / `#1e3a8a` | 6.7:1 | primary button, links |
+| `DANGER` / `SUCCESS` / `WARNING` | `#ef4444` / `#10b981` / `#f59e0b` | fill only | status dots, button faces |
+| `DANGER_TEXT` / `SUCCESS_TEXT` / `WARNING_TEXT` | `#b91c1c` / `#047857` / `#92400e` | 5.5:1 / 7.1:1 / 5.9:1 | the word beside the dot |
+| `OWNER_BUBBLE` / `BOT_BUBBLE` | `#000000` / `#f3f4f6` | — | transcript bubbles |
+| `CODE_BG` | `#f3f4f6` | — | fenced code |
+| notice | `#fef2f2` bg / `#fecdd3` border / `#991b1b` fg | — | error banner |
+| spacing | `XS 4`, `SM 8`, `MD 12`, `LG 16` | — | gaps and padding |
+| metrics | `SIDEBAR_W 280`, `GRAPH_W 320`, `AVATAR 32`, `HEADER_H 56` | — | layout |
+
+**Every text token is a measured 4.5:1, and the test is what keeps it there.**
+The row above used to read `TEXT / TEXT_MUTED / TEXT_DIM = #111827 / #6b7280 /
+#9ca3af`, and that last value is **2.5:1 on white** — the colour of every
+timestamp, preview line and section heading in the app. WCAG AA wants 4.5:1 for
+body text, so the three tiers were re-cut: `#6b7280` became the *faintest* tier
+and had to darken to `#5f6976` to clear 4.5:1 on the darkest surface it is drawn
+on, and the secondary tier moved to `#4b5563` to stay visibly darker than it.
+`theme::tests::every_text_token_is_legible_on_its_surface` recomputes every
+ratio from the constants on every `cargo test`, so a future palette edit that
+drops under the bar is a red test rather than a screenshot nobody takes.
+
+**The status hues are split in two, on purpose.** A hue you can see as a 9px dot
+and a hue you can read as a 12px word are different colours: green `#10b981` is
+2.1:1 on white, amber `#f59e0b` is 1.8:1. So `DANGER`/`SUCCESS`/`WARNING` are
+*fill* tokens and the `*_TEXT` twins are the text ones, and
+`status_fills_are_visible_even_though_they_are_not_body_text` asserts both halves
+of that split — including that the fill has *not* been darkened into its twin.
+The same rule retired one more pattern: a bot's name is no longer drawn in its
+roster colour (the shipped colours are 1.5–2.6:1 on the bubble's grey), it is
+`TEXT` with a small colour dot beside it and the avatar tile still carrying the
+hue.
+
+**Rows are sized by shared builders, not by literals.** `bits::screen_header`
+draws the one title row every non-conversation screen wears, at `HEADER_H`, with
+the same padding and divider — those five screens had grown to ~39px while the
+conversation header was 56px, so switching screens shifted the whole page by 17px.
+`bits::kv` gives its label column one width (`KV_LABEL_W`) for the same reason:
+120px was narrower than the labels the app actually uses.
 
 The module header of `theme.rs` said "dark-first (the only variant the app ships)"
 while every token was light. That comment is the thing that was wrong, not the
@@ -249,7 +286,9 @@ and a child counts as started only once `/api/health` answers `ok`.
 
 ## 6. Testing
 
-123 tests, none of which needs a compositor, a brain, a model or a network:
+163 tests, none of which needs a compositor, a brain, a model or a network — the
+number grew by 40 when the 2026-11-15 pixel pass added a test to every defect it
+fixed (§10.1):
 
 * the **reducer** is a pure function (`LiveEvent` + `AppState` → `AppState`), so
   snapshot → upserts → resync, card answers, task-tree edges and connection state
@@ -364,15 +403,173 @@ needs them has a client method waiting.
 
 ## 10. What is not verified
 
-* **What the pixels look like.** The windowing half is verified: on 2026-11-14,
-  `--selftest` opened **12 windows**, rendered every screen, and exited 0 (§2) —
-  on the NVIDIA ICD in the 2026-11-14 session, and on the staged lavapipe ICD in
-  a session that had no GPU at all on 2026-11-15. The number of render calls it reports differs per run (frames
-  are timing-dependent), so it is evidence that painting happened, not a figure
-  to quote. What that does **not** prove is that any of it
-  looks right — and on 2026-11-14 the desktop session was locked, so a screenshot
-  captured the lock screen rather than the app. Read `selftest: window N drew
-  screen=…` as "a root view rendered", never as "this screen is correct".
+* **Clicking and dragging.** The pixels were looked at on 2026-11-15 (see §10.1
+  for how, and what was found), but every interaction in that pass was **driven
+  from the keyboard**: `wtype` sends keys and `grim` captures, and neither can
+  press a button at a coordinate. Every `.on_click` handler, every hover state,
+  the delegation graph's layout and the `@`-mention picker's mouse behaviour are
+  still unexercised on a real compositor. A screen can look right and still have
+  a click target in the wrong place.
+* **Frame rate.** Nobody has measured frames per second, on this GPU or under a
+  software rasterizer, with a long transcript on screen.
+
+### 10.1 The 2026-11-15 pixel pass, and what it changed
+
+The debt this section used to record ("nobody has looked at the pixels") was paid
+by looking. The method is repeatable and needs no root, no extra package and no
+test-only feature:
+
+```bash
+source scripts/env.sh
+./target/debug/swarmbot-ui --offline --spawn-brain &   # a real brain, a real window
+sleep 8
+hyprctl clients -j | grep -o '0x[0-9a-f]*'            # find the window's address
+grim -g "12,38 1896x1030" shot.png                    # capture it, pixel for pixel
+wtype -M ctrl -k k -m ctrl ; wtype "usage" ; wtype -k Return   # drive it
+```
+
+`--offline --spawn-brain` is what makes this honest: the screen under review is
+fed by the real client and a real brain, not by `--selftest`'s fixtures. The
+fixtures are still useful for a screen no brain state provides, but a review that
+only ever saw them would not know what the app looks like when it is running.
+
+Four defects were found by *looking*, and none of them were reachable from
+`--selftest` — every one of them passed `window N drew screen=…`:
+
+1. **The keyboard died after every palette jump.** `ctrl-k`, type, `Enter` moved
+   to the screen and then no keystroke ever arrived again — `ctrl-k` included, so
+   the app looked frozen while it kept painting. Cause: GPUI resolves a keystroke
+   against the *rendered* frame, and the element that had focus (the palette's
+   search field, or the composer) is not in a screen that does not draw it. The
+   fix is [`Root::focus_seat`](../crates/ui/src/view/mod.rs): a render-time check
+   of `(screen, palette_open, needs_login)` that re-seats focus on an element the
+   new surface actually renders.
+2. **The palette reopened with the previous query still typed.** A second
+   `ctrl-k` + typing produced `usagenodes` and an empty result list — a search box
+   with text in it that nobody had typed this time. [`Palette::reset`] clears it
+   on every open.
+3. **Two clocks in one transcript row.** The separator above a message said
+   `Today 8:41 AM` and the bubble's own header said `01:41` for the same instant,
+   because the header formatted the UTC value directly. Both now go through
+   [`crate::time`]; `time::clock_label` and a test pin the agreement.
+4. **Text was unreadable, and a static audit put numbers on it.** `TEXT_DIM`
+   (`#9ca3af`) was 2.5:1 on white and was the colour of every timestamp, section
+   heading and preview line; the vivid status hues were used as *text* (green at
+   2.1:1, amber at 1.8:1); the author's name was drawn in the bot's roster colour
+   (`#fbbf24` is 1.5:1 on the bubble). §4 records the tokens that replaced them,
+   and `theme::tests::every_text_token_is_legible_on_its_surface` computes every
+   ratio from the constants, so the palette cannot drift back under 4.5:1.
+
+`--selftest` itself got stricter in the same pass, because "a window opened" was
+never the same claim as "the screen painted": it now counts renders **per
+window** and fails the run if one opened without drawing, and it compares the
+window count against `selftest::WINDOWS` instead of reporting whatever it opened.
+A failing screen now makes the process exit non-zero; before, a `WINDOW FAILED`
+line was printed and the run still exited 0 as long as some other window painted.
+The report line reads `opened 12 window(s), 12 of them painted`, and that
+distinction is the point: the number is now a count of *screens that drew*, not of
+windows that exist.
+
+**The fixes were re-captured, not just tested.** The four defects above were found
+by looking at the app, and after the fix pass the same eight screens were captured
+again on an unlocked session (`--offline --spawn-brain`, one window, `grim` on the
+window's own geometry). Four of them are visible in those captures and are worth
+naming, because each one *was* wrong in the before-shot:
+
+* **the sidebar preview now ends in `…`** — `Group created with @wayp…`, where the
+  before-shot cut it at `…@waypoint, @` with no ellipsis at all;
+* **one clock per instant** — the separator reads `Today 9:27 AM` and the bot
+  bubble's own header reads `9:27 AM`, where it used to read `02:27` (UTC) under a
+  local separator;
+* **the author's name is `TEXT` with a 6px colour dot beside it**, where it used to
+  be drawn in the roster hue at 1.5–2.6:1;
+* **the palette reopens empty** — `Jump to a bot, conversation or task…` with the
+  full unfiltered list, where the before-shot showed the previous query still in
+  the box.
+
+The session locked at ~09:17 during the first attempt and unlocked again at ~09:22;
+the timeout on `grim` was the symptom (it blocks rather than failing when DPMS is
+off), which is worth knowing: **`grim` hanging is a sign the screen is asleep, not
+a broken capture**.
+
+The captures for this pass are committed under [`pixel-pass/`](pixel-pass/):
+[transcript](pixel-pass/2026-11-15-transcript.png),
+[nodes](pixel-pass/2026-11-15-nodes.png),
+[usage](pixel-pass/2026-11-15-usage.png),
+[settings](pixel-pass/2026-11-15-settings.png),
+[rules](pixel-pass/2026-11-15-rules.png) and
+[palette](pixel-pass/2026-11-15-palette.png). They are evidence for a dated
+build, not a style guide: a later screenshot that disagrees with them is newer,
+not wrong. Delete them without ceremony once a pass re-captures the set.
+
+The eight captures cover: Conversation (DM, and a group), Usage, Nodes, Routines,
+Settings, Rules, the delegation-graph panel, and the palette overlay over a
+transcript. Two of them are worth reading as a pair — the Nodes screen shows
+`declared / approved` sitting under `capabilities` on a shared 150px label column
+with no collision, and Settings/Usage/Routines/Rules all open at the same 56px
+title row, which is what `bits::screen_header` was for.
+
+Still not proved by a screenshot, and stated so rather than implied:
+`EntryKind::Reasoning`/`Notice` collapse states, the `@`-mention picker, the
+create-bot / create-group modals (they exist in `--selftest`'s window set but not
+in the committed captures), a long tool-call card with a real node id, the
+provider menu's two columns with a real backend row, and **every width but one** —
+the whole pass ran in a tiled 1896×1030 window, so nothing here says how the
+three-column layout behaves at 900px or how the sidebar behaves at 600.
+
+### 10.2 A real chat pass (2026-11-15), and the defect it found
+
+The chat path was exercised end to end against a **real brain process and a real
+ACP agent**, not the scripted `fake`:
+
+```bash
+# a real brain: shipped config (opencode as default_backend), a throwaway data dir
+swarmbot-brain --config .scratch/real/config.toml --team config/team.waypoint.toml
+# a real turn, through the CLI against that brain
+swarmbot chat waypoint --brain http://127.0.0.1:8787 --data-dir .scratch/real/data
+```
+
+Four turns completed: a direct DM to `@waypoint`, a DM to `@alfred` that used
+`read`/`glob`/`grep` in its own workspace (and said plainly that `MEMORY.md` was
+empty rather than inventing a schedule), a group message that woke `@alfred` by
+mention, and a `handoff_task` from `@waypoint` to `@parcel` that really created
+`tsk_…` and really delivered its result back. Afterwards `turns_running` was 0 and
+no delivery was left queued — the bookkeeping matches the work.
+
+**The defect it found: a task settled `succeeded` with `result: ""`.** The
+`@parcel` handoff needed `shell`, the node's permission boundary refused it
+(`ACP permission decided … decision=select(reject: Reject)` in the brain log), the
+agent ended its own turn having written no answer — and the task closed as
+**succeeded with an empty result**. The requester could not tell "finished, nothing
+to report" from "produced nothing", so `@waypoint` spent a whole extra turn asking
+*"your result for the task … reached me empty"*, and `@parcel` spent another turn
+re-reading its workspace. One blank string cost two model turns.
+
+The fix is `core::runners::task_result`: the status stays `succeeded` (the turn
+really did end normally, and calling it a failure would be its own lie), but the
+result now names what happened — "the bot finished its turn without writing a
+result — it may have only used tools, or the tool it needed was refused", or the
+`NO_REPLY` case in its own words. Three tests pin it, including one that the
+pass-through of a real answer and a real error did *not* change. Re-running the
+same handoff against the fixed brain produced exactly that sentence in
+`GET /api/tasks`.
+
+**Also measured, and left alone on purpose**: `usage.tool_calls` counted `3`
+across seven turns where the transcripts show far more agent tool activity. That
+is by design — `runners.rs` counts the tool calls the runner executed or the
+*team* tools an agent invoked through our MCP gateway; an ACP agent's own
+``read``/``grep``/``execute`` run in the agent's sandbox and are transcribed as
+`origin: Agent`, so counting them as our tool calls would overstate what SwarmBot
+did. The UI and `swarmbot usage` both say "tool calls", which is now the one
+sentence that should be tightened if the owner wants that number to mean "all
+activity".
+
+**Not tested here**: the UI doing this (§10, the session locked), token usage (an
+ACP agent reports no per-turn tokens, so `input_tokens`/`output_tokens` are 0 —
+D9.28's known limit), and the `@`-mention picker or clicking a card, which need a
+mouse.
+
+
 * **Frame rate.** Nobody has measured frames per second, on this GPU or under a
   software rasterizer, with a long transcript on screen.
 * **A real brain round trip from this app.** The tests use the scripted `Brain`
@@ -380,6 +577,12 @@ needs them has a client method waiting.
   but only by hand. It does work: a 2026-11-14 run printed `brain reachable and
   authenticated (version 0.1.0, epoch 1)` and `GET /api/bots` served the
   `config/team.waypoint.toml` roster through it.
+  **A real *chat turn* was driven on 2026-11-15, but through the CLI, not this
+  window** (§10.2): the window was launched against a real brain with a real ACP
+  agent and rendered, `exit: renders=1119 ... ok=true`, and then the desktop
+  session locked before a message could be typed into it. So "the UI can complete
+  a turn with a real model" is still unproven; "the client and brain underneath it
+  can" is now proven with four real turns, one of them a bot-to-bot handoff.
 * **The tty token prompt** (the CLI's, not this app's) needs a real terminal; the
   UI has no prompt at all — it reads the four sources in §7 and says so when none
   produced a token.

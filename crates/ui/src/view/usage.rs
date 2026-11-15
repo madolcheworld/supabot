@@ -25,11 +25,43 @@ use swarmbot_contracts::turn::{BotUsage, UsageReport};
 use crate::proto::Command;
 use crate::state::AppState;
 use crate::theme;
+use crate::view::settings::ghost_button;
 use crate::widgets::bits::{self, Tone};
 
 /// The windows offered, in hours. `24` is the brain's own default, so the first
 /// fetch asks exactly what a bare `GET /api/usage` would.
 pub const WINDOWS: [(i64, &str); 3] = [(24, "24h"), (168, "7d"), (720, "30d")];
+
+/// Width of the bot-name cell in a BY BOT row, and in the header above it.
+///
+/// The cell **truncates** (`min_w_0().truncate()`): it used to be a fixed
+/// `w(220px).flex_none()` with no ellipsis, so a long `@name` ran straight over
+/// the first numeric column and the two texts drew on top of each other.
+pub const BOT_LABEL_W: f32 = 220.0;
+
+/// Width of one numeric column in a BY BOT row.
+///
+/// [`thousands`] can emit `12,345,678`, which is ~76px at the row's 14px size —
+/// so the old fixed 72px column was narrower than a value it has to show and a
+/// seven-figure count spilled over the column edge. 88px holds nine digits with
+/// separators, and every row (and the header) uses this one width, right-aligned,
+/// so the digits line up instead of jittering left-to-right by magnitude.
+pub const NUMERIC_COL_W: f32 = 88.0;
+
+/// Rough advance width of a numeric cell: ~0.6em per digit and ~0.3em per
+/// thousands separator, in the row's 14px size.
+///
+/// An estimate, not a measurement — the real advance needs a text system, and
+/// the column only has to be wide enough rather than exact. It is a pure
+/// function so [`tests::a_numeric_column_is_wide_enough_for_what_it_shows`] can
+/// pin the column against the widest value the screen can produce.
+pub fn numeric_text_width(value: &str) -> f32 {
+    const EM: f32 = 14.0;
+    value
+        .chars()
+        .map(|ch| if ch == ',' { 0.3 * EM } else { 0.6 * EM })
+        .sum()
+}
 
 /// The `since` instant for a window, as the RFC 3339 text the route parses.
 ///
@@ -113,65 +145,48 @@ pub fn render(s: &AppState, state: &Entity<AppState>, commands: &Sender<Command>
         let state_c = state.clone();
         let cmds = commands.clone();
         let active = hours == s.usage_hours;
-        window_row = window_row.child(
-            bits::button(label, if active { Tone::Primary } else { Tone::Ghost })
-                .id(("usage-window", hours as u64))
-                .on_click(move |_, _, cx: &mut App| {
-                    state_c.update(cx, |st, cx| {
-                        st.usage_hours = hours;
-                        cx.notify();
-                    });
-                    let _ = cmds.send(Command::FetchUsage {
-                        since: Some(since_for(hours, Utc::now())),
-                    });
-                }),
-        );
+        // The inactive windows are `Ghost` buttons on white; the ringed variant,
+        // or the range control has no visible button face at all.
+        let button = if active {
+            bits::button(label, Tone::Primary)
+        } else {
+            ghost_button(label)
+        };
+        window_row = window_row.child(button.id(("usage-window", hours as u64)).on_click(
+            move |_, _, cx: &mut App| {
+                state_c.update(cx, |st, cx| {
+                    st.usage_hours = hours;
+                    cx.notify();
+                });
+                let _ = cmds.send(Command::FetchUsage {
+                    since: Some(since_for(hours, Utc::now())),
+                });
+            },
+        ));
     }
 
+    let window_caption = window_label(s.usage_hours);
     div()
         .size_full()
         .flex()
         .flex_col()
-        .child(
-            div()
-                .px_4()
-                .py_2()
-                .flex()
-                .items_center()
-                .justify_between()
-                .border_b_1()
-                .border_color(rgb(theme::BORDER))
-                .child(
-                    div()
-                        .flex()
-                        .items_baseline()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_lg()
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(theme::TEXT))
-                                .child("Usage"),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(theme::TEXT_MUTED))
-                                .child(window_label(s.usage_hours)),
-                        ),
-                )
-                .child(
-                    div().flex().items_center().gap_2().child(window_row).child(
-                        bits::button("Refresh", Tone::Ghost)
-                            .id("refresh-usage")
-                            .on_click(move |_, _, _: &mut App| {
-                                let _ = commands_refresh.send(Command::FetchUsage {
-                                    since: Some(since_for(since, Utc::now())),
-                                });
-                            }),
-                    ),
-                ),
-        )
+        // One title row for every non-conversation screen (`HEADER_H`, with the
+        // divider this screen shares with Rules/Routines). The hand-built
+        // `px_4 py_2` row was ~39px, so switching screens moved every row below
+        // the title down by 17px.
+        .child(bits::screen_header(
+            "Usage",
+            Some(&window_caption),
+            div().flex().items_center().gap_2().child(window_row).child(
+                ghost_button("Refresh")
+                    .id("refresh-usage")
+                    .on_click(move |_, _, _: &mut App| {
+                        let _ = commands_refresh.send(Command::FetchUsage {
+                            since: Some(since_for(since, Utc::now())),
+                        });
+                    }),
+            ),
+        ))
         .child(
             div()
                 .id("usage-scroll")
@@ -226,15 +241,13 @@ fn failed(reason: &str, commands: &Sender<Command>, hours: i64) -> gpui::Div {
                 .child(reason.to_string()),
         )
         .child(
-            div().child(
-                bits::button("Retry", Tone::Ghost)
-                    .id("retry-usage")
-                    .on_click(move |_, _, _: &mut App| {
-                        let _ = cmds.send(Command::FetchUsage {
-                            since: Some(since_for(hours, Utc::now())),
-                        });
-                    }),
-            ),
+            div().child(ghost_button("Retry").id("retry-usage").on_click(
+                move |_, _, _: &mut App| {
+                    let _ = cmds.send(Command::FetchUsage {
+                        since: Some(since_for(hours, Utc::now())),
+                    });
+                },
+            )),
         )
 }
 
@@ -267,14 +280,17 @@ fn window_section(report: &UsageReport) -> gpui::Div {
         .flex_col()
         .gap_1()
         .child(bits::section_label("WINDOW"))
+        // Human labels, not the wire format. This screen used to print
+        // `2026-11-14T01:53:02Z` — the RFC 3339 string the brain was *asked*
+        // with — next to a transcript that says "Today 8:41 AM" for the same
+        // kind of instant. A raw timestamp is not wrong, but it is a second
+        // clock convention in one window, and the reader has to do the
+        // arithmetic in a zone they did not pick.
         .child(bits::kv(
             "from",
-            report.since.to_rfc3339_opts(SecondsFormat::Secs, true),
+            crate::time::moment_label_here(report.since),
         ))
-        .child(bits::kv(
-            "to",
-            report.until.to_rfc3339_opts(SecondsFormat::Secs, true),
-        ))
+        .child(bits::kv("to", crate::time::moment_label_here(report.until)))
         // The denominator behind every zero below.
         .child(bits::kv("turns", report.turns.to_string()))
 }
@@ -334,9 +350,13 @@ fn by_bot_section(report: &UsageReport) -> gpui::Div {
                     px(20.0),
                 ))
                 .child(
+                    // Truncating, not fixed and free: a long `@name` used to run
+                    // into the first numeric column with no ellipsis to stop it.
                     div()
-                        .w(px(220.0))
+                        .w(px(BOT_LABEL_W))
                         .flex_none()
+                        .min_w_0()
+                        .truncate()
                         .text_sm()
                         .text_color(rgb(theme::TEXT))
                         .child(bot_label(row)),
@@ -359,7 +379,14 @@ fn header_row() -> gpui::Div {
         .text_color(rgb(theme::TEXT_DIM))
         // Aligns with the avatar + label columns above.
         .child(div().w(px(28.0)).flex_none())
-        .child(div().w(px(220.0)).flex_none().child("bot"))
+        .child(
+            div()
+                .w(px(BOT_LABEL_W))
+                .flex_none()
+                .min_w_0()
+                .truncate()
+                .child("bot"),
+        )
         .child(heading_cell("in"))
         .child(heading_cell("out"))
         .child(heading_cell("model"))
@@ -368,8 +395,9 @@ fn header_row() -> gpui::Div {
 
 fn heading_cell(label: &str) -> gpui::Div {
     div()
-        .w(px(72.0))
+        .w(px(NUMERIC_COL_W))
         .flex_none()
+        .text_right()
         .text_xs()
         .text_color(rgb(theme::TEXT_DIM))
         .child(label.to_string())
@@ -377,8 +405,12 @@ fn heading_cell(label: &str) -> gpui::Div {
 
 fn cell(value: String) -> gpui::Div {
     div()
-        .w(px(72.0))
+        .w(px(NUMERIC_COL_W))
         .flex_none()
+        // Right-aligned like its heading: a left-aligned fixed column makes a
+        // 4-digit count and a 7-digit one start at the same x, so the digits
+        // move under each other from row to row.
+        .text_right()
         .text_sm()
         .text_color(rgb(theme::TEXT_MUTED))
         .child(value)
@@ -464,5 +496,58 @@ mod tests {
             usage: Default::default(),
         };
         assert_eq!(bot_label(&named), "@lead");
+    }
+
+    /// A numeric column has to be wide enough for the widest value it can show.
+    /// It was 72px and left-aligned, while [`thousands`] emits `12,345,678`
+    /// (~76px at the row's 14px) — so a seven-figure count was wider than its own
+    /// column and the numbers did not hold a line.
+    #[test]
+    fn a_numeric_column_is_wide_enough_for_what_it_shows() {
+        let widest_realistic = thousands(12_345_678);
+        assert_eq!(widest_realistic, "12,345,678");
+        assert!(
+            numeric_text_width(&widest_realistic) > 72.0,
+            "the old 72px column was narrower than {}: it never fit",
+            widest_realistic
+        );
+        assert!(
+            numeric_text_width(&widest_realistic) <= NUMERIC_COL_W,
+            "{} needs {:.1}px but the column is {NUMERIC_COL_W}px",
+            widest_realistic,
+            numeric_text_width(&widest_realistic)
+        );
+        // Every value the screen can render up to nine digits, commas included.
+        for value in [0u64, 7, 999, 1_000, 12_345, 1_288_000, 999_999_999] {
+            let cell = thousands(value);
+            assert!(
+                numeric_text_width(&cell) <= NUMERIC_COL_W,
+                "{cell} does not fit in a {NUMERIC_COL_W}px column"
+            );
+        }
+    }
+
+    /// The heading row and the data rows take their widths from the same
+    /// constants, so a heading cannot drift off the column it names. The label
+    /// cell is the truncating one: it is the only cell whose content is arbitrary
+    /// text rather than a formatted number.
+    #[test]
+    fn the_heading_row_and_the_data_rows_share_their_column_widths() {
+        assert_eq!(BOT_LABEL_W, 220.0);
+        assert_eq!(
+            NUMERIC_COL_W, 88.0,
+            "wide enough for `12,345,678` and then some"
+        );
+        // A value that overflows the label cell is truncated, never pushed into
+        // the numbers: the cell's width is fixed and it has an ellipsis.
+        let long = bot_label(&BotUsage {
+            bot_id: BotId::from_suffix("a-very-long-bot-identifier-that-will-not-fit"),
+            bot_name: Some("a-very-long-bot-name-that-will-not-fit-in-220-pixels".into()),
+            usage: Default::default(),
+        });
+        assert!(
+            numeric_text_width(&long) > BOT_LABEL_W,
+            "the case the cell must survive"
+        );
     }
 }

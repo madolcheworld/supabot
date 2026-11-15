@@ -570,6 +570,44 @@ impl RunnerHooks for NoHooks {
     fn settle_task(&self, _task_id: &TaskId, _result: &str, _failed: bool) {}
 }
 
+/// The `(result, failed)` a task is settled with, from the turn that ran it.
+///
+/// Three outcomes, and the difference between the last two is the point:
+///
+/// * **stopped** — the owner interrupted the turn. The task is a *failure*: the
+///   work did not finish, and a requester told "succeeded" would build on
+///   nothing.
+/// * **errored** — infrastructure broke. Also a failure, carrying the reason.
+/// * **ended with text** — the bot's answer becomes the result, as it should.
+/// * **ended with no text** — the turn completed but produced no written
+///   answer at all. That used to settle the task as `succeeded` with
+///   `result: ""`, so the requester's only evidence was a blank string it could
+///   not tell apart from "finished, nothing to report". Observed on a live run
+///   on 2026-11-15: a handoff whose bot needed `shell`, had it refused by the
+///   permission boundary, and ended its turn with only reasoning — the requester
+///   then spent a whole extra turn asking "your result reached me empty", which
+///   is a round trip the result itself could have prevented. The status stays
+///   `succeeded` (the turn really did end normally, and inventing a failure is
+///   its own lie), but the *result* says what happened instead of being empty.
+fn task_result(outcome: &Result<(TurnOutcome, Turn), DomainError>) -> (String, bool) {
+    match outcome {
+        Ok((done, turn)) if done.aborted || turn.status == TurnStatus::Aborted => {
+            ("the turn running this task was stopped".to_string(), true)
+        }
+        Ok((done, _)) if done.text.trim().is_empty() => {
+            let reason = if done.silent {
+                "the bot answered NO_REPLY, so it had nothing to report"
+            } else {
+                "the bot finished its turn without writing a result — it may have \
+                 only used tools, or the tool it needed was refused"
+            };
+            (reason.to_string(), false)
+        }
+        Ok((done, _)) => (done.text.clone(), false),
+        Err(err) => (err.to_string(), true),
+    }
+}
+
 /// What one turn produced.
 #[derive(Clone, Debug, Default)]
 pub struct TurnOutcome {
@@ -1194,16 +1232,8 @@ async fn run_turn(
     }
 
     // A task's result goes back to whoever asked, not into this transcript.
-    // A turn the owner stopped is a failure of the task, not an empty success:
-    // the requester has to know the work did not finish.
     if let Some(task) = task {
-        let (text, failed) = match &outcome {
-            Ok((done, turn)) if done.aborted || turn.status == TurnStatus::Aborted => {
-                ("the turn running this task was stopped".to_string(), true)
-            }
-            Ok((done, _)) => (done.text.clone(), false),
-            Err(err) => (err.to_string(), true),
-        };
+        let (text, failed) = task_result(&outcome);
         env.hooks.settle_task(&task.id, &text, failed);
     }
 
@@ -2529,6 +2559,95 @@ mod tests {
     use swarmbot_contracts::config::{BackendSpec, BrainConfig};
     use swarmbot_contracts::delivery::CausalChain;
     use swarmbot_contracts::id::DeliveryId;
+
+    /// A turn that ends normally but writes nothing must not settle its task
+    /// with an empty result. Observed on a live run on 2026-11-15: a handoff
+    /// whose bot needed `shell`, had it refused by the permission boundary, and
+    /// ended the turn with only reasoning — the task closed `succeeded` with
+    /// `result: ""`, and the requester spent a whole extra turn asking "your
+    /// result reached me empty". The status stays `succeeded` (the turn did end
+    /// normally); what must change is that the result *says* something.
+    #[test]
+    fn a_task_whose_turn_wrote_nothing_does_not_settle_with_an_empty_result() {
+        let empty = TurnOutcome {
+            text: "   \n".to_string(),
+            ..TurnOutcome::default()
+        };
+        let turn = Turn::start(
+            BotId::from_suffix("bot"),
+            ConversationId::from_suffix("conv"),
+            TurnInitiator::Bot {
+                bot_id: BotId::from_suffix("other"),
+            },
+            None,
+            None,
+        );
+        let (text, failed) = task_result(&Ok((empty, turn)));
+        assert!(!failed, "an empty turn is not an infrastructure failure");
+        assert!(
+            !text.trim().is_empty(),
+            "a succeeded task with an empty result is a result that reads as a lie"
+        );
+        assert!(
+            text.contains("without writing a result"),
+            "the result says what happened: {text}"
+        );
+    }
+
+    /// A `NO_REPLY` ending is a *deliberate* silence, so the result names that
+    /// instead of the generic "wrote nothing" sentence: the two mean different
+    /// things to a requester deciding whether to ask again.
+    #[test]
+    fn a_task_that_ended_in_no_reply_says_so_instead_of_going_blank() {
+        let quiet = TurnOutcome {
+            silent: true,
+            ..TurnOutcome::default()
+        };
+        let turn = Turn::start(
+            BotId::from_suffix("bot"),
+            ConversationId::from_suffix("conv"),
+            TurnInitiator::Owner,
+            None,
+            None,
+        );
+        let (text, failed) = task_result(&Ok((quiet, turn)));
+        assert!(!failed);
+        assert!(
+            text.contains("NO_REPLY"),
+            "names the deliberate silence: {text}"
+        );
+    }
+
+    /// The two cases that already worked must keep working, so this fix cannot
+    /// quietly turn a real answer or a real failure into a placeholder.
+    #[test]
+    fn a_real_answer_and_a_real_failure_are_passed_through_unchanged() {
+        let answered = TurnOutcome {
+            text: "3 issues found".to_string(),
+            ..TurnOutcome::default()
+        };
+        let turn = Turn::start(
+            BotId::from_suffix("bot"),
+            ConversationId::from_suffix("conv"),
+            TurnInitiator::Owner,
+            None,
+            None,
+        );
+        assert_eq!(
+            task_result(&Ok((answered, turn))),
+            ("3 issues found".to_string(), false)
+        );
+
+        let (text, failed) = task_result(&Err(DomainError::BackendUnavailable {
+            backend: "opencode".to_string(),
+            reason: "the agent refused the session".to_string(),
+        }));
+        assert!(failed, "an error is a failure");
+        assert!(
+            text.contains("refused the session"),
+            "carries the reason: {text}"
+        );
+    }
 
     fn test_swarm() -> (Arc<crate::swarm::Swarm>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp dir");

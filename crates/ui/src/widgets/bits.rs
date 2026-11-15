@@ -24,12 +24,20 @@ pub enum Tone {
 }
 
 impl Tone {
+    /// `(fill, label)` for a tone.
+    ///
+    /// Every pair here has to clear 4.5:1 between `fill` and `label`, because a
+    /// button's whole job is to be read. Two of them did not: white on
+    /// `#ef4444` is 3.76:1 (every destructive button in the app), and the
+    /// ghost fill `#ececee` on the `#f7f7f8` sidebar is 1.09:1 — the button had
+    /// no perceptible edge at all, which is why the sidebar's nav row read as
+    /// loose words rather than as buttons.
     fn colors(self) -> (u32, u32) {
         match self {
             Tone::Primary => (theme::ACCENT, 0xffffff),
             Tone::Ghost => (theme::SURFACE_RAISED, theme::TEXT),
-            Tone::Danger => (theme::DANGER, 0xffffff),
-            Tone::Success => (theme::SUCCESS, 0x0b1410),
+            Tone::Danger => (theme::DANGER_TEXT, 0xffffff),
+            Tone::Success => (theme::SUCCESS_TEXT, 0xffffff),
         }
     }
 }
@@ -49,6 +57,11 @@ pub fn button(label: &str, tone: Tone) -> Div {
         .text_color(rgb(fg))
         .text_sm()
         .cursor_pointer()
+        // A ghost fill is barely darker than the surface it sits on, so the
+        // boundary has to come from a border or the button is only words.
+        .when(tone == Tone::Ghost, |d| {
+            d.border_1().border_color(rgb(theme::BORDER))
+        })
         .child(label.to_string())
 }
 
@@ -218,6 +231,14 @@ pub fn section_label(text: &str) -> Div {
         .child(text.to_string())
 }
 
+/// The width of a [`kv`] label column.
+///
+/// 120px was too narrow for the labels this app actually uses: "declared /
+/// approved" and "target starts with" are both wider than that at 14px, so they
+/// ran into the value column and the row read as one run-on string. 150px holds
+/// them, and both cells now truncate, so a future label cannot collide again.
+pub const KV_LABEL_W: Pixels = px(150.0);
+
 /// A `label: value` row for the nodes/settings panels.
 pub fn kv(label: &str, value: impl Into<SharedString>) -> Div {
     div()
@@ -227,14 +248,18 @@ pub fn kv(label: &str, value: impl Into<SharedString>) -> Div {
         .text_sm()
         .child(
             div()
-                .w(px(120.0))
+                .w(KV_LABEL_W)
                 .flex_none()
+                .min_w_0()
+                .truncate()
                 .text_color(rgb(theme::TEXT_MUTED))
                 .child(label.to_string()),
         )
         .child(
             div()
                 .flex_1()
+                .min_w_0()
+                .truncate()
                 .text_color(rgb(theme::TEXT))
                 .child(value.into()),
         )
@@ -249,4 +274,59 @@ pub fn initial(label: &str) -> char {
         .next()
         .map(|c| c.to_uppercase().next().unwrap_or(c))
         .unwrap_or('?')
+}
+
+/// The title row every non-conversation screen wears: one height, one padding,
+/// one divider.
+///
+/// The five screens each open-coded this row and disagreed: the conversation
+/// header and the side panel are `HEADER_H` (56px) with a bottom border, while
+/// Nodes/Settings/Routines/Rules/Usage grew to whatever `px_4 py_2` plus a
+/// `text_lg` line came to (~39px) and two of them drew no divider at all. Moving
+/// between screens therefore shifted every row below the title up or down by 17px
+/// and sometimes removed a separator — the kind of thing that reads as "the app
+/// jumped" rather than as a style choice. One builder, so the next screen cannot
+/// invent a sixth height.
+pub fn screen_header(title: &str, subtitle: Option<&str>, actions: Div) -> Div {
+    div()
+        .h(theme::space::HEADER_H)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .px_4()
+        .border_b_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap_2()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(theme::TEXT))
+                        .truncate()
+                        .child(title.to_string()),
+                )
+                .children(subtitle.map(|s| {
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(s.to_string())
+                })),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(actions),
+        )
 }

@@ -83,10 +83,17 @@ elsewhere in this file: the D9.34 fallback works in a real headless session and
 not only in a mount namespace, and **"the GPU is missing" describes an instant,
 not a machine** — re-run the selftest before repeating either claim.
 
-What is *still* not proven is the pixels: `--selftest` proves a window opened and
-the root view rendered, not that anything looked right. On 2026-11-14 the desktop
-session was locked, so a screenshot showed the lock screen — say "renders", not
-"looks correct", unless somebody actually looked at an unlocked screen.
+**The pixels have now been looked at, once, on 2026-11-15** — see
+[`docs/ui.md`](docs/ui.md) §10.1 for the method and the captures. Four defects
+that `--selftest` passed were found by driving the real window with `wtype` and
+photographing it with `grim`, and fixed. That does not make "looks correct" a safe
+phrase: the pass covers eight screens at one window size (1896×1030, tiled, no
+other width tried) and **no clicks** — every interaction in it was a keystroke. Say what was
+captured, not that the layout is finished. And note the session's own trap, twice
+now: the box had no GPU at ~08:24 and again at ~09:36 (no `/dev/nvidia0`, no
+`/dev/dri`, `nvidia-smi` dead) while it *did* have one in between, so the pixel
+pass ran on the staged lavapipe ICD. `grim` blocking instead of failing is the
+symptom of a sleeping screen, not a broken capture.
 
 Cargo builds share `./target`. `Blocking waiting for file lock on build directory`
 is other people working, not a hang: wait it out. Do not invent a second target
@@ -345,6 +352,25 @@ them.
   plausible and unproven: the gate runs every test binary concurrently, and another
   agent's `swarmbot-brain` was holding port 8796 for the whole window. Still
   unexplained; the entry stays open rather than being renamed a flake.
+* **`client_contract`'s `the_blocking_client_drives_the_whole_api` flakes at a
+  measurable rate, and it is not a load problem.** Measured on 2026-11-15 while
+  testing an unrelated change: **1 failure in 30 runs on the baseline commit and
+  3 in 30 with that change applied** — the same assertion both times, so the rate
+  is pre-existing and the difference between those two samples is not
+  significant (Fisher p ≈ 0.3). The failure is always `brain.settle()` giving up:
+  `the swarm did not go quiet within 30s` with
+  `running_turns=["lead=trn_… llm_calls=0"]` before *and* after, and
+  `queued=["lead:2"]` drained to `queued=[]` in between. That is the D9.20 shape
+  again — a turn row created and then left `Running` without ever calling the
+  model — not the "still working" case the helper also covers. The test's own
+  setup is the interesting part: it `unregister`s the lead's runner, starts a
+  task, cancels it, then calls `ensure_runners()` and settles. **If this is
+  chased, start there**: a parked delivery for a cancelled task draining into a
+  freshly created runner is the one unusual thing in the fixture, and a turn that
+  never reaches its first LLM call is either waiting on something the old
+  runner's shutdown still holds, or started by a runner that then went away.
+  Do not call it a flake "under load" without these numbers — it reproduces on a
+  quiet machine, roughly once in 10–30 runs.
 * **A green `probe` is not a working turn, and the difference cost a day.**
   `probe` is spawn + `initialize` + `session/new`, so on 2026-11-14 all three ACP
   agents on this box reported `ok: true` while only **opencode** could answer a
@@ -408,8 +434,8 @@ them.
 ## State of the tree
 
 Check before you assume — it moves while people work. **All twelve crates are
-built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.547
-registered, 1.542 passed, 0 failed, 5 ignored** — three live tests (two behind `PROTO_LIVE_LLM`, one
+built and tested** (last `scripts/check.sh`: fmt + clippy `-D warnings` + **1.590
+registered, 1.585 passed, 0 failed, 5 ignored** — three live tests (two behind `PROTO_LIVE_LLM`, one
 behind `PROTO_LIVE_ACP`) and two doctests in `store/src/threaded.rs` marked
 `ignore` because a doctest has no runtime to await on): `contracts`,
 `store`, `llm`, `tools`, `core`, `client`, `node-protocol`, `brain`, `cli`, `node`,

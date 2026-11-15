@@ -3,6 +3,7 @@
 
 use std::sync::mpsc::Sender;
 
+use chrono::{DateTime, FixedOffset, Local};
 use gpui::{Entity, div, prelude::*, px, rgb};
 
 use crate::proto::Command;
@@ -242,15 +243,35 @@ fn routine_item(name: &str, sched: &str) -> gpui::Div {
 }
 
 fn format_schedule(schedule: &swarmbot_contracts::RoutineSchedule) -> String {
+    // `Local::now()` is read here and nowhere else, so the labelled function
+    // below stays pure and a test can pin both the zone and the wording.
+    format_schedule_at(schedule, Local::now().fixed_offset())
+}
+
+/// [`format_schedule`] against a supplied clock. Pure, so its assertions do not
+/// depend on the machine's time zone or on the day the suite runs.
+///
+/// A `Once` run time is rendered through [`crate::time::moment_label`], the same
+/// day-aware formatter the transcript uses. It used to be printed as
+/// `run_at.format("%B %-d at %-I:%M %p")` on a **UTC** value: "November 14 at
+/// 2:00 AM" for an instant the owner's clock calls 9:00 AM, with no year at all
+/// for a run a year out — two clocks in one app, and the wrong one here, since
+/// this line answers "when will it run?".
+fn format_schedule_at(
+    schedule: &swarmbot_contracts::RoutineSchedule,
+    now: DateTime<FixedOffset>,
+) -> String {
     match schedule {
         swarmbot_contracts::RoutineSchedule::Interval { every_secs } => {
             if *every_secs < 60 {
                 format!("Every {every_secs} seconds")
             } else if *every_secs < 3600 {
                 format!("Every {} minutes", every_secs / 60)
-            } else if *every_secs == 86400 {
-                "Every day at 9:00 AM".to_string()
             } else {
+                // A 86400-second interval used to print "Every day at 9:00 AM".
+                // An interval has no time of day — it fires 24 hours after the
+                // previous run, whenever that was — so naming 9:00 AM was a
+                // claim the schedule does not make.
                 format!("Every {} hours", every_secs / 3600)
             }
         }
@@ -258,7 +279,90 @@ fn format_schedule(schedule: &swarmbot_contracts::RoutineSchedule) -> String {
             format!("Cron: {expr}")
         }
         swarmbot_contracts::RoutineSchedule::Once { run_at } => {
-            format!("Once at {}", run_at.format("%B %-d at %-I:%M %p"))
+            format!("Once, {}", crate::time::moment_label(now, *run_at))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use swarmbot_contracts::RoutineSchedule;
+
+    /// A fixed +07:00 zone, written out so the assertions do not depend on the
+    /// machine's `TZ`.
+    fn zone() -> FixedOffset {
+        FixedOffset::east_opt(7 * 3600).expect("+07:00 is a valid offset")
+    }
+
+    fn now(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<FixedOffset> {
+        zone()
+            .with_ymd_and_hms(y, m, d, h, min, 0)
+            .single()
+            .expect("a real local time")
+    }
+
+    fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, h, min, 0)
+            .single()
+            .expect("a real UTC time")
+    }
+
+    /// A `Once` run time is stated in the viewer's zone and names its day. It used
+    /// to be printed straight off the UTC value (`%B %-d at %-I:%M %p`), so an
+    /// instant the owner's clock calls 9:00 AM read "2:00 AM", and a run in
+    /// another year carried no year at all.
+    #[test]
+    fn a_once_schedule_is_stated_in_the_viewers_zone_and_names_its_day() {
+        let local_noon = now(2026, 11, 14, 12, 0);
+        let schedule = |run_at| RoutineSchedule::Once { run_at };
+        assert_eq!(
+            format_schedule_at(&schedule(utc(2026, 11, 14, 2, 0)), local_noon),
+            "Once, Today 9:00 AM"
+        );
+        assert_eq!(
+            format_schedule_at(&schedule(utc(2026, 11, 13, 2, 0)), local_noon),
+            "Once, Yesterday 9:00 AM"
+        );
+        assert_eq!(
+            format_schedule_at(&schedule(utc(2026, 11, 3, 2, 0)), local_noon),
+            "Once, Nov 3, 9:00 AM"
+        );
+        // Another year keeps its year, which the old format dropped entirely.
+        assert_eq!(
+            format_schedule_at(&schedule(utc(2025, 11, 3, 2, 0)), local_noon),
+            "Once, Nov 3, 2025, 9:00 AM"
+        );
+    }
+
+    /// An interval has no time of day: 86400 seconds means "24 hours after the
+    /// previous run", not "at 9:00 AM". The card said the latter.
+    #[test]
+    fn an_interval_states_a_period_rather_than_a_clock_time() {
+        let text = format_schedule_at(
+            &RoutineSchedule::Interval { every_secs: 86400 },
+            now(2026, 11, 14, 12, 0),
+        );
+        assert_eq!(text, "Every 24 hours");
+        assert!(
+            !text.contains("AM") && !text.contains("PM"),
+            "an interval has no clock time, so it must not print one: {text}"
+        );
+        // The shorter units keep their wording.
+        assert_eq!(
+            format_schedule_at(
+                &RoutineSchedule::Interval { every_secs: 30 },
+                now(2026, 11, 14, 12, 0)
+            ),
+            "Every 30 seconds"
+        );
+        assert_eq!(
+            format_schedule_at(
+                &RoutineSchedule::Interval { every_secs: 600 },
+                now(2026, 11, 14, 12, 0)
+            ),
+            "Every 10 minutes"
+        );
     }
 }
